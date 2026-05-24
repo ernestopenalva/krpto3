@@ -1,0 +1,101 @@
+token_scanner:
+  allowed_chain_id: solana
+
+  min_liquidity_usd: 10000
+  min_volume_h1_usd: 10000
+  min_txns_h1: 100
+
+  min_price_change_m5: -10
+  max_price_change_m5: 20
+  min_price_change_h1: 0
+  max_price_change_h1: 200  # filtro de exaustão — tokens com h1 > 200% chegaram tarde (meow +346%, MvM +318%)
+
+  allowed_dexes:
+    - pumpswap
+    - raydium
+    - orca
+    - meteora
+
+  excluded_dexes:
+    - pumpfun
+
+  reject_obvious_rug_pull: true
+
+# ============================================================
+# Configuração exclusiva do KRPTO3 — Scanner Contínuo
+# ============================================================
+scanner_loop:
+  watchlist_max_age_minutes: 30     # tokens 'novo' mais antigos que isso são expirados
+
+jupiter:
+  api_key: "SUA_API_KEY_AQUI"
+  quote_url: "https://api.jup.ag/swap/v1/quote"
+  token_search_url: "https://api.jup.ag/tokens/v2/search"
+  sol_mint: "So11111111111111111111111111111111111111112"
+  buy_amount_lamports: 10000000
+  sell_amount_raw: 1000000
+  slippage_bps: 100
+  max_price_impact_pct: 5
+
+jupiter_filters:
+  max_top_holders_percentage: 20
+  min_organic_score: 30
+  min_holder_count: 300
+  min_num_traders_1h: 100
+  max_price_impact_pct: 5
+
+token_monitor_buy:
+  input_file: "data/token_scanner/final_monitoring_candidates.json"
+  output_dir: "data/token_monitor"
+
+  poll_interval_seconds: 5
+  max_monitoring_minutes: 15
+  max_monitored_tokens: 5
+
+  decision_window_minutes: 5
+  min_ticks_before_decision: 12
+
+  entry:
+    min_pullback_pct: 2.0
+    max_pullback_pct: 8.0
+    max_drawdown_discard_pct: 10.0
+    min_buy_pressure: 0.52
+    min_volume_keep_ratio: 0.40
+    breakout_margin_pct: 0.2
+    health_min_score: 0.60
+    health_min_volume_ratio: 0.35
+    health_min_buy_pressure: 0.48
+    health_max_liquidity_drop_pct: 35
+    health_recent_ticks: 6
+    pullback_recent_ticks: 24
+
+position_monitor:
+  enabled: true
+  mode: PAPER
+  input_file: "data/token_monitor/buy_signals.json"
+  output_dir: "data/position_monitor"
+
+  poll_interval_seconds: 2
+  max_open_positions: 2
+
+  stop_loss_pct: 5
+  breakeven_trigger_pct: 3
+  breakeven_profit_pct: 1
+  trailing_stop_pct: 4
+
+  profit_lock_steps:
+    - trigger_pct: 3
+      lock_pct: 1
+    - trigger_pct: 6
+      lock_pct: 3
+    - trigger_pct: 10
+      lock_pct: 5
+
+  collect_metrics:
+    volume_m5: true
+    liquidity_usd: true
+    buy_pressure: true
+
+position_sizing:
+  mode: fixed_fake_usd
+  amount_usd: 10

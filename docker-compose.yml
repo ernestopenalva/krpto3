@@ -1,0 +1,7 @@
+services:
+  krpto3-app:
+    build: .
+    container_name: krpto3-app
+    volumes:
+      - .:/app
+    command: python src/app.py

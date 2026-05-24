@@ -1,0 +1,12 @@
+__pycache__/ 
+*.pyc 
+*.txt 
+!requirements.txt
+*.log
+*.zip
+.vscode/
+data/ 
+logs/
+src/.vscode/
+_incoming_files_*/
+
