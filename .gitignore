@@ -1,12 +1,15 @@
-__pycache__/ 
-*.pyc 
-*.txt 
+__pycache__/
+*.pyc
+*.txt
 !requirements.txt
 *.log
 *.zip
+
 .vscode/
-data/ 
-logs/
 src/.vscode/
 _incoming_files_*/
+
+# Runtime gerado pelo KRPTO3
+logs/
+data/
 
