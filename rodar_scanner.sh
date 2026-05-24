@@ -1,7 +1,7 @@
 #!/bin/bash
 # KRPTO3 — Scanner Contínuo
 # Executa um ciclo por chamada e controla o intervalo fora do Python.
-# Execute em janela tmux separada da janela do monitor (rodar_bot.sh).
+# Execute em janela tmux separada da janela do monitor (rodar_monitor.sh).
 
 cd "$(dirname "$0")"
 
