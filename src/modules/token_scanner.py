@@ -107,13 +107,20 @@ WATCHLIST_PATH = Path("data/watchlist/watchlist.json")
 
 def load_watchlist() -> dict:
     """Carrega watchlist como dict keyed por token_address."""
-    entries = load_json(WATCHLIST_PATH, default=[])
-    return {e["token_address"]: e for e in entries}
+    payload = load_json(WATCHLIST_PATH, default={})
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return {
+            e["token_address"]: e
+            for e in payload
+            if isinstance(e, dict) and e.get("token_address")
+        }
+    return {}
 
 
 def save_watchlist(watchlist: dict) -> None:
-    entries = list(watchlist.values())
-    save_json(entries, WATCHLIST_PATH)
+    save_json(watchlist, WATCHLIST_PATH)
 
 
 def expire_old_entries(watchlist: dict, max_age_minutes: int) -> dict:
