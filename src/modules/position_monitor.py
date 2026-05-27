@@ -34,6 +34,7 @@ CONFIG_FILE = PROJECT_ROOT / "config" / "config.yaml"
 
 
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain_id}/{token_address}"
+DEXSCREENER_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs/{chain_id}/{pair_address}"
 
 LOG_PAPER_BUY = "PAPER BUY"
 LOG_PAPER_SELL = "PAPER SELL"
@@ -55,6 +56,7 @@ class OpenPosition:
     token_quantity_fake: float
     highest_price: float
     highest_price_time: str
+    pair_address: Optional[str] = None
     breakeven_activated: bool = False
     stop_price: float = 0.0
     trailing_stop_price: Optional[float] = None
@@ -278,6 +280,8 @@ class PositionMonitor:
             token_quantity_fake=self.fake_amount_usd / entry_price if entry_price > 0 else 0.0,
             highest_price=entry_price or 1.0,
             highest_price_time=signal.get("timestamp") or self._now_iso(),
+            pair_address=signal.get("pair_address") or signal.get("pairAddress"),
+            source_signal=signal,
         )
         tick = self.fetch_market_tick(probe)
         if tick is None:
@@ -326,6 +330,7 @@ class PositionMonitor:
             token_quantity_fake=token_quantity_fake,
             highest_price=entry_price,
             highest_price_time=entry_time,
+            pair_address=signal.get("pair_address") or signal.get("pairAddress"),
             stop_price=stop_price,
             source_signal=signal,
         )
@@ -399,6 +404,7 @@ class PositionMonitor:
                 token_quantity_fake=token_quantity_fake,
                 highest_price=entry_price,
                 highest_price_time=entry_time,
+                pair_address=signal.get("pair_address") or signal.get("pairAddress"),
                 stop_price=stop_price,
                 source_signal=signal,
             )
@@ -427,14 +433,24 @@ class PositionMonitor:
         return 0.0
 
     def fetch_market_tick(self, position: OpenPosition) -> Optional[Dict[str, Any]]:
-        url = DEXSCREENER_TOKEN_PAIRS_URL.format(
-            chain_id=position.chain_id,
-            token_address=position.token_address,
-        )
         try:
-            response = requests.get(url, timeout=15)
-            response.raise_for_status()
-            pairs = response.json()
+            if position.pair_address:
+                url = DEXSCREENER_PAIR_URL.format(
+                    chain_id=position.chain_id,
+                    pair_address=position.pair_address,
+                )
+                response = requests.get(url, timeout=15)
+                response.raise_for_status()
+                payload = response.json()
+                pairs = payload.get("pairs") or []
+            else:
+                url = DEXSCREENER_TOKEN_PAIRS_URL.format(
+                    chain_id=position.chain_id,
+                    token_address=position.token_address,
+                )
+                response = requests.get(url, timeout=15)
+                response.raise_for_status()
+                pairs = response.json()
         except requests.RequestException as exc:
             self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
             return None
@@ -443,7 +459,7 @@ class PositionMonitor:
             self._log(f"[{LOG_WARN}] Sem pares Dexscreener para {position.symbol}")
             return None
 
-        pair = self._choose_best_pair(pairs)
+        pair = pairs[0] if position.pair_address else self._choose_best_pair(pairs)
         price = self._safe_float(pair.get("priceUsd"))
         if price <= 0:
             self._log(f"[{LOG_WARN}] Preço inválido para {position.symbol}")

@@ -781,9 +781,9 @@ def monitor() -> None:
                     continue
 
                 register_buy_signal(candidate, tick, evaluation)
+                dispatch_position_monitor(candidate["token_address"])
                 update_watchlist_status(candidate["token_address"], "comprado", evaluation.get("reason"))
                 register_processed_token(candidate, "comprado", evaluation.get("reason"))
-                dispatch_position_monitor(candidate["token_address"])
                 candidate["signal_emitted"] = True
                 candidate["status"] = "signal_emitted"
 
