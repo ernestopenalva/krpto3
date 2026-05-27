@@ -1,11 +1,13 @@
 import json
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from pathlib import Path
 import yaml
 
 
@@ -20,12 +22,14 @@ def load_config():
 CONFIG = load_config()
 CFG = CONFIG.get("token_monitor_buy", {})
 ENTRY_CFG = CFG.get("entry", {})
+POSITION_CFG = CONFIG.get("position_monitor", {})
 
 
 # =========================
 # CONFIGURAÇÕES V1
 # =========================
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPUT_FILE = Path(CFG.get("input_file", "data/token_scanner/final_monitoring_candidates.json"))
 
 OUTPUT_DIR = Path(CFG.get("output_dir", "data/token_monitor"))
@@ -33,6 +37,10 @@ HISTORY_DIR = OUTPUT_DIR / "history"
 BUY_SIGNALS_FILE = OUTPUT_DIR / "buy_signals.json"
 STATUS_FILE = OUTPUT_DIR / "monitor_status.json"
 PROCESSED_TOKENS_FILE = OUTPUT_DIR / "processed_tokens.json"
+WATCHLIST_FILE = Path("data/watchlist/watchlist.json")
+OPEN_POSITIONS_FILE = Path(POSITION_CFG.get("output_dir", "data/position_monitor")) / "open_positions.json"
+POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor.py"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
 MAX_MONITORING_MINUTES = CFG.get("max_monitoring_minutes", 15)
@@ -81,6 +89,16 @@ def save_json(path: Path, data: Any) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+
+def save_json_atomic(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    os.replace(tmp, path)
+
 def load_processed_tokens() -> set[str]:
     rows = load_json(PROCESSED_TOKENS_FILE, default=[])
     return {item["token_address"] for item in rows if item.get("token_address")}
@@ -105,6 +123,61 @@ def register_processed_token(candidate: Dict[str, Any], status: str, reason: Opt
     })
 
     save_json(PROCESSED_TOKENS_FILE, rows)
+
+
+def load_watchlist() -> Dict[str, Any]:
+    payload = load_json(WATCHLIST_FILE, default={})
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return {
+            item["token_address"]: item
+            for item in payload
+            if isinstance(item, dict) and item.get("token_address")
+        }
+    return {}
+
+
+def update_watchlist_status(token_address: str, status: str, reason: Optional[str] = None) -> None:
+    watchlist = load_watchlist()
+    entry = watchlist.get(token_address)
+    if not entry:
+        return
+
+    entry["status"] = status
+
+    if status == "comprado":
+        entry["bought_at"] = now_iso()
+    elif status == "descartado_monitor":
+        entry["discarded_at"] = now_iso()
+        entry["discarded_reason"] = reason
+
+    save_json_atomic(WATCHLIST_FILE, watchlist)
+
+
+def can_open_position(max_positions: int) -> bool:
+    open_positions = load_json(OPEN_POSITIONS_FILE, default=[])
+    if not isinstance(open_positions, list):
+        return False
+    return len(open_positions) < max_positions
+
+
+def dispatch_position_monitor(token_address: str) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOGS_DIR / f"position_{datetime.now().strftime('%Y-%m-%d')}.txt"
+    with log_file.open("a", encoding="utf-8") as log_handle:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                str(POSITION_MONITOR_SCRIPT),
+                "--token",
+                token_address,
+            ],
+            cwd=PROJECT_ROOT,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
 
 def append_jsonl(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,8 +229,18 @@ def load_candidates() -> List[Dict[str, Any]]:
     candidates = []
 
     processed_tokens = load_processed_tokens()
+    watchlist = load_watchlist()
 
-    for item in raw_candidates[:MAX_MONITORED_TOKENS]:
+    new_candidates = []
+    for item in raw_candidates:
+        token_address = item.get("token_address")
+        watchlist_entry = watchlist.get(token_address, {})
+        if watchlist_entry.get("status") == "novo":
+            new_candidates.append((item, watchlist_entry.get("discovered_at_utc", "")))
+
+    new_candidates.sort(key=lambda row: row[1], reverse=True)
+
+    for item, _discovered_at in new_candidates[:1]:
         selected_pair = item.get("candidate", {}).get("selected_pair", {})
 
         token_address = item.get("token_address")
@@ -600,7 +683,7 @@ def register_buy_signal(candidate: Dict[str, Any], tick: Dict[str, Any], evaluat
     }
 
     signals.append(signal)
-    save_json(BUY_SIGNALS_FILE, signals)
+    save_json_atomic(BUY_SIGNALS_FILE, signals)
 
     signal_time = signal["timestamp"]
 
@@ -624,10 +707,10 @@ def monitor() -> None:
     candidates = load_candidates()
 
     if not candidates:
-        print("[INFO] Nenhum candidato encontrado.")
+        print("[INFO] Nenhum candidato novo encontrado.")
         return
 
-    print(f"[INFO] Monitorando {len(candidates)} candidato(s).")
+    print(f"[INFO] Monitorando 1 candidato por ciclo: {candidates[0]['symbol']}.")
     print("[INFO] Modo: PAPER / sem compra real.")
 
     started_at = time.time()
@@ -637,6 +720,14 @@ def monitor() -> None:
 
         if elapsed_minutes >= MAX_MONITORING_MINUTES:
             print("[INFO] Tempo máximo de monitoramento atingido.")
+            for candidate in candidates:
+                if candidate["status"] == "monitoring":
+                    reason = "tempo maximo de monitoramento atingido sem sinal"
+                    candidate["status"] = "discarded"
+                    candidate["discard_reason"] = reason
+                    update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
+                    register_processed_token(candidate, "descartado_monitor", reason)
+                    print(f"[DESCARTE] {candidate['symbol']}: {reason}")
             break
 
         for candidate in candidates:
@@ -670,13 +761,29 @@ def monitor() -> None:
             if evaluation.get("discard"):
                 candidate["status"] = "discarded"
                 candidate["discard_reason"] = evaluation.get("reason")
-                register_processed_token(candidate, "discarded", candidate["discard_reason"])
+                update_watchlist_status(candidate["token_address"], "descartado_monitor", candidate["discard_reason"])
+                register_processed_token(candidate, "descartado_monitor", candidate["discard_reason"])
                 print(f"[DESCARTE] {candidate['symbol']}: {candidate['discard_reason']}")
                 continue
 
             if evaluation.get("entry") and not candidate["signal_emitted"]:
+                max_open_positions = int(POSITION_CFG.get("max_open_positions", 2))
+                if not can_open_position(max_open_positions):
+                    reason = f"limite de posições abertas atingido ({max_open_positions})"
+                    candidate["status"] = "discarded"
+                    candidate["discard_reason"] = reason
+                    update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
+                    register_processed_token(candidate, "descartado_monitor", reason)
+                    print(
+                        f"[SINAL DESCARTADO] {candidate['symbol']} — "
+                        f"limite de posições abertas atingido ({max_open_positions})"
+                    )
+                    continue
+
                 register_buy_signal(candidate, tick, evaluation)
-                register_processed_token(candidate, "signal_emitted", evaluation.get("reason"))
+                update_watchlist_status(candidate["token_address"], "comprado", evaluation.get("reason"))
+                register_processed_token(candidate, "comprado", evaluation.get("reason"))
+                dispatch_position_monitor(candidate["token_address"])
                 candidate["signal_emitted"] = True
                 candidate["status"] = "signal_emitted"
 
@@ -693,6 +800,12 @@ def monitor() -> None:
             break
 
         time.sleep(POLL_INTERVAL_SECONDS)
+
+    save_json(STATUS_FILE, {
+        "updated_at": now_iso(),
+        "mode": "paper",
+        "candidates": candidates
+    })
 
     print("[INFO] Monitoramento encerrado.")
 

@@ -15,8 +15,11 @@ venda.
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +34,14 @@ CONFIG_FILE = PROJECT_ROOT / "config" / "config.yaml"
 
 
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain_id}/{token_address}"
+
+LOG_PAPER_BUY = "PAPER BUY"
+LOG_PAPER_SELL = "PAPER SELL"
+LOG_STALENESS = "STALENESS"
+LOG_PROFIT_LOCK = "PROFIT LOCK"
+LOG_MONITOR = "MONITOR"
+LOG_INFO = "INFO"
+LOG_WARN = "WARN"
 
 
 @dataclass
@@ -94,6 +105,7 @@ class PositionMonitor:
         self.breakeven_profit_pct = float(position_cfg.get("breakeven_profit_pct", 1.0))
         self.trailing_stop_pct = float(position_cfg.get("trailing_stop_pct", 6.0))
         self.profit_lock_steps = position_cfg.get("profit_lock_steps", [])
+        self.staleness_threshold_pct = float(position_cfg.get("staleness_threshold_pct", 2.0))
 
         self.fake_amount_usd = float(sizing_cfg.get("amount_usd", 10.0))
 
@@ -130,8 +142,30 @@ class PositionMonitor:
     @staticmethod
     def _save_json(path: Path, data: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as file:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        with tmp.open("w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    @contextmanager
+    def _open_positions_lock(self):
+        lock_path = self.open_positions_file.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                time.sleep(0.05)
+
+        try:
+            os.close(lock_fd)
+            yield
+        finally:
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     @staticmethod
     def _append_jsonl(path: Path, data: Dict[str, Any]) -> None:
@@ -195,6 +229,21 @@ class PositionMonitor:
             signals = signals.get("signals", [])
         return signals if isinstance(signals, list) else []
 
+    def _find_latest_signal_for_token(self, token_address: str) -> Optional[Dict[str, Any]]:
+        signals = self._load_buy_signals()
+        matching = [
+            signal
+            for signal in signals
+            if (
+                signal.get("token_address")
+                or signal.get("address")
+                or signal.get("base_token_address")
+            ) == token_address
+        ]
+        if not matching:
+            return None
+        return matching[-1]
+
     def _signal_key(self, signal: Dict[str, Any]) -> str:
         token_address = signal.get("token_address") or signal.get("address") or signal.get("base_token_address")
         signal_time = signal.get("timestamp") or signal.get("signal_time") or signal.get("entry_time") or ""
@@ -202,6 +251,106 @@ class PositionMonitor:
 
     def _position_exists(self, positions: List[OpenPosition], token_address: str) -> bool:
         return any(position.token_address == token_address for position in positions)
+
+    def _replace_open_position(self, token_address: str, position: Optional[OpenPosition]) -> None:
+        with self._open_positions_lock():
+            positions = self._load_open_positions()
+            positions = [item for item in positions if item.token_address != token_address]
+            if position is not None:
+                positions.append(position)
+            self._save_open_positions(positions)
+
+    def fetch_current_price(self, signal: Dict[str, Any]) -> Optional[float]:
+        token_address = signal.get("token_address") or signal.get("address") or signal.get("base_token_address")
+        if not token_address:
+            return None
+
+        entry_price = self._extract_entry_price(signal)
+        chain_id = signal.get("chain_id") or signal.get("chainId") or "solana"
+        symbol = signal.get("symbol") or signal.get("baseToken", {}).get("symbol") or token_address[:8]
+        probe = OpenPosition(
+            token_address=token_address,
+            chain_id=chain_id,
+            symbol=symbol,
+            entry_price=entry_price or 1.0,
+            entry_time=signal.get("timestamp") or self._now_iso(),
+            fake_amount_usd=self.fake_amount_usd,
+            token_quantity_fake=self.fake_amount_usd / entry_price if entry_price > 0 else 0.0,
+            highest_price=entry_price or 1.0,
+            highest_price_time=signal.get("timestamp") or self._now_iso(),
+        )
+        tick = self.fetch_market_tick(probe)
+        if tick is None:
+            return None
+        return self._safe_float(tick.get("price"))
+
+    def open_position_for_token(self, token_address: str) -> bool:
+        signal = self._find_latest_signal_for_token(token_address)
+        if signal is None:
+            self._log(f"[{LOG_WARN}] Sinal nao encontrado para {token_address}")
+            return False
+
+        entry_price = self._extract_entry_price(signal)
+        if entry_price <= 0:
+            self._log_ignored_signal(signal, "invalid_entry_price")
+            self._log(f"[{LOG_WARN}] Sinal ignorado para {token_address}: preco de entrada invalido")
+            return False
+
+        current_price = self.fetch_current_price(signal)
+        symbol = signal.get("symbol") or signal.get("baseToken", {}).get("symbol") or token_address[:8]
+        if current_price is None or current_price <= 0:
+            self._log_ignored_signal(signal, "current_price_unavailable")
+            self._log(f"[{LOG_WARN}] {symbol}: preco atual indisponivel antes da abertura")
+            return False
+
+        variation = (current_price - entry_price) / entry_price * 100
+        if variation < -self.staleness_threshold_pct:
+            self._log_ignored_signal(signal, "staleness_price_drop")
+            self._log(
+                f"[{LOG_STALENESS}] {symbol} descartado — preço caiu {variation:.2f}% "
+                f"desde o sinal ({entry_price} → {current_price})"
+            )
+            return False
+
+        chain_id = signal.get("chain_id") or signal.get("chainId") or "solana"
+        entry_time = signal.get("timestamp") or signal.get("signal_time") or signal.get("entry_time") or self._now_iso()
+        token_quantity_fake = self.fake_amount_usd / entry_price
+        stop_price = entry_price * (1 - self.stop_loss_pct / 100)
+        position = OpenPosition(
+            token_address=token_address,
+            chain_id=chain_id,
+            symbol=symbol,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            fake_amount_usd=self.fake_amount_usd,
+            token_quantity_fake=token_quantity_fake,
+            highest_price=entry_price,
+            highest_price_time=entry_time,
+            stop_price=stop_price,
+            source_signal=signal,
+        )
+
+        with self._open_positions_lock():
+            positions = self._load_open_positions()
+            closed_trades = self._load_closed_trades()
+            if self._position_exists(positions, token_address):
+                return True
+            if any(trade.get("token_address") == token_address for trade in closed_trades):
+                self._log_ignored_signal(signal, "already_closed")
+                return False
+            if len(positions) >= self.max_open_positions:
+                self._log_ignored_signal(signal, "max_open_positions_reached")
+                self._log(
+                    f"[{LOG_WARN}] {symbol}: limite de posições abertas atingido "
+                    f"({self.max_open_positions})"
+                )
+                return False
+
+            positions.append(position)
+            self._save_open_positions(positions)
+
+        self._log(f"[{LOG_PAPER_BUY}] posiÃ§Ã£o aberta: {symbol} @ {entry_price}")
+        return True
 
     def import_new_signals(self) -> None:
         """Transforma novos sinais de compra simulada em posições abertas."""
@@ -255,7 +404,7 @@ class PositionMonitor:
             )
             positions.append(position)
             open_addresses.add(token_address)
-            self._log(f"[PAPER BUY] posição aberta: {symbol} @ {entry_price}")
+            self._log(f"[{LOG_PAPER_BUY}] posição aberta: {symbol} @ {entry_price}")
 
         self._save_open_positions(positions)
 
@@ -287,17 +436,17 @@ class PositionMonitor:
             response.raise_for_status()
             pairs = response.json()
         except requests.RequestException as exc:
-            self._log(f"[ERRO] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
+            self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
             return None
 
         if not isinstance(pairs, list) or not pairs:
-            self._log(f"[WARN] Sem pares Dexscreener para {position.symbol}")
+            self._log(f"[{LOG_WARN}] Sem pares Dexscreener para {position.symbol}")
             return None
 
         pair = self._choose_best_pair(pairs)
         price = self._safe_float(pair.get("priceUsd"))
         if price <= 0:
-            self._log(f"[WARN] Preço inválido para {position.symbol}")
+            self._log(f"[{LOG_WARN}] Preço inválido para {position.symbol}")
             return None
 
         txns_m5 = pair.get("txns", {}).get("m5", {}) or {}
@@ -355,7 +504,7 @@ class PositionMonitor:
                 position.stop_price = new_stop_price
                 position.breakeven_activated = True
                 self._log(
-                    f"[PROFIT LOCK] {position.symbol}: "
+                    f"[{LOG_PROFIT_LOCK}] {position.symbol}: "
                     f"lucro={pnl_pct:.2f}% | stop ajustado para +{best_lock_pct:.2f}%",
                     timestamp=now,
                 )
@@ -419,7 +568,7 @@ class PositionMonitor:
 
     def run_once(self) -> None:
         if not self.enabled:
-            self._log("[INFO] Position Monitor desabilitado no config.yaml.")
+            self._log(f"[{LOG_INFO}] Position Monitor desabilitado no config.yaml.")
             return
 
         if self.mode != "PAPER":
@@ -429,7 +578,7 @@ class PositionMonitor:
         positions = self._load_open_positions()
 
         if not positions:
-            self._log("[INFO] Nenhuma posição aberta para monitorar.")
+            self._log(f"[{LOG_INFO}] Nenhuma posição aberta para monitorar.")
             return
 
         still_open: List[OpenPosition] = []
@@ -444,7 +593,7 @@ class PositionMonitor:
             if closed_trade:
                 self._save_closed_trade(closed_trade)
                 self._log(
-                    f"[PAPER SELL] {position.symbol} @ {closed_trade.exit_price} | "
+                    f"[{LOG_PAPER_SELL}] {position.symbol} @ {closed_trade.exit_price} | "
                     f"motivo={closed_trade.exit_reason} | pnl={closed_trade.pnl_pct:.2f}%"
                     f" | bp_persist={position.health_ticks_above_087}",
                     timestamp=closed_trade.exit_time,
@@ -452,7 +601,7 @@ class PositionMonitor:
             else:
                 still_open.append(position)
                 self._log(
-                    f"[MONITOR] {position.symbol} | price={tick['price']} | "
+                    f"[{LOG_MONITOR}] {position.symbol} | price={tick['price']} | "
                     f"pnl={((tick['price'] / position.entry_price) - 1) * 100:.2f}% | "
                     f"topo={position.highest_price} | stop={position.stop_price} | "
                     f"trailing={position.trailing_stop_price} | "
@@ -462,9 +611,68 @@ class PositionMonitor:
 
         self._save_open_positions(still_open)
 
+    def run_once_for_token(self, token_address: str) -> bool:
+        if not self.enabled:
+            self._log(f"[{LOG_INFO}] Position Monitor desabilitado no config.yaml.")
+            return False
+
+        if self.mode != "PAPER":
+            raise RuntimeError("Esta versão do position_monitor só deve rodar em modo PAPER.")
+
+        positions = self._load_open_positions()
+        position = next((item for item in positions if item.token_address == token_address), None)
+
+        if position is None:
+            opened = self.open_position_for_token(token_address)
+            if not opened:
+                return False
+            positions = self._load_open_positions()
+            position = next((item for item in positions if item.token_address == token_address), None)
+            if position is None:
+                return False
+
+        tick = self.fetch_market_tick(position)
+        if tick is None:
+            return True
+
+        self._update_health_persistence(position, tick)
+        closed_trade = self.evaluate_position(position, tick)
+        if closed_trade:
+            self._save_closed_trade(closed_trade)
+            self._replace_open_position(token_address, None)
+            self._log(
+                f"[{LOG_PAPER_SELL}] {position.symbol} @ {closed_trade.exit_price} | "
+                f"motivo={closed_trade.exit_reason} | pnl={closed_trade.pnl_pct:.2f}%"
+                f" | bp_persist={position.health_ticks_above_087}",
+                timestamp=closed_trade.exit_time,
+            )
+            return False
+
+        self._replace_open_position(token_address, position)
+        self._log(
+            f"[{LOG_MONITOR}] {position.symbol} | price={tick['price']} | "
+            f"pnl={((tick['price'] / position.entry_price) - 1) * 100:.2f}% | "
+            f"topo={position.highest_price} | stop={position.stop_price} | "
+            f"trailing={position.trailing_stop_price} | "
+            f"bp_persist={position.health_ticks_above_087}",
+            timestamp=tick.get("timestamp"),
+        )
+        return True
+
+    def run_loop_for_token(self, token_address: str) -> None:
+        print("=== Módulo 3: Position Monitor ===")
+        print(f"[{LOG_INFO}] Modo PAPER: nenhuma venda real será executada.")
+
+        while True:
+            keep_running = self.run_once_for_token(token_address)
+            if not keep_running:
+                self._log(f"[{LOG_INFO}] Position Monitor encerrado para {token_address}.")
+                break
+            time.sleep(self.poll_interval_seconds)
+
     def run_loop(self) -> None:
         print("=== Módulo 3: Position Monitor ===")
-        print("[INFO] Modo PAPER: nenhuma venda real será executada.")
+        print(f"[{LOG_INFO}] Modo PAPER: nenhuma venda real será executada.")
         while True:
             self.run_once()
             time.sleep(self.poll_interval_seconds)
@@ -474,18 +682,30 @@ def monitor_positions() -> None:
     monitor = PositionMonitor()
 
     print("=== Módulo 3: Position Monitor ===")
-    print("[INFO] Modo PAPER: nenhuma venda real será executada.")
+    print(f"[{LOG_INFO}] Modo PAPER: nenhuma venda real será executada.")
 
     while True:
         monitor.run_once()
 
         open_positions = monitor._load_open_positions()
         if not open_positions:
-            monitor._log("[INFO] Nenhuma posição aberta. Position Monitor encerrado.")
+            monitor._log(f"[{LOG_INFO}] Nenhuma posição aberta. Position Monitor encerrado.")
             break
 
         time.sleep(monitor.poll_interval_seconds)
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--token",
+        type=str,
+        required=True,
+        help="token_address da posição a gerenciar",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     monitor = PositionMonitor()
-    monitor.run_loop()
+    monitor.run_loop_for_token(args.token)

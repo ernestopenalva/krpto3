@@ -8,6 +8,9 @@ from statistics import mean, pstdev
 from typing import Optional
 
 
+DEFAULT_MAX_MONITORING_SECONDS = 15 * 60
+
+
 ENTRY_TICK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+"
     r"(?P<symbol>.+?)\s+\|\s+"
@@ -321,6 +324,7 @@ class LiquidityPoint:
 @dataclass
 class TradeMetrics:
     symbol: str
+    session_id: int = 0
     token_address: Optional[str] = None
     h1_at_capture: Optional[float] = None
     first_tick_at: Optional[str] = None
@@ -386,11 +390,13 @@ class TradeMetrics:
     liquidity_volatility_during_position: Optional[float] = None
     liquidity_flags: list[str] = field(default_factory=list)
     possible_liquidity_collapse: bool = False
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
 class TokenState:
     symbol: str
+    session_id: int = 0
     token_address: Optional[str] = None
     h1_at_capture: Optional[float] = None
     ticks: list[EntryTick] = field(default_factory=list)
@@ -408,7 +414,7 @@ class TokenState:
     entry_liquidity_points: list[LiquidityPoint] = field(default_factory=list)
     position_liquidity_points: list[LiquidityPoint] = field(default_factory=list)
 
-    def build_metrics(self) -> TradeMetrics:
+    def build_metrics(self, max_monitoring_seconds: int = DEFAULT_MAX_MONITORING_SECONDS) -> TradeMetrics:
         first_tick = self.ticks[0] if self.ticks else None
         signal_ticks = [tick for tick in self.ticks if not self.signal_at or tick.timestamp <= self.signal_at]
         if self.signal_at and signal_ticks:
@@ -435,9 +441,22 @@ class TokenState:
             (self.final_pnl is not None and self.final_pnl < -30)
             or (liquidity_drop_position is not None and liquidity_drop_position > 50)
         )
+        time_to_signal_seconds = seconds_between(first_tick.timestamp if first_tick else None, self.signal_at)
+        warnings = []
+        time_before_signal = fmt_duration(first_tick.timestamp if first_tick else None, self.signal_at)
+        if (
+            time_to_signal_seconds is not None
+            and max_monitoring_seconds > 0
+            and time_to_signal_seconds > max_monitoring_seconds
+        ):
+            warnings.append(
+                f"[AVISO] tempo_ate_sinal improvável para {self.symbol} — possível cross-sessão"
+            )
+            time_before_signal = "n/a"
 
         metrics = TradeMetrics(
             symbol=self.symbol,
+            session_id=self.session_id,
             token_address=self.token_address,
             h1_at_capture=self.h1_at_capture,
             first_tick_at=first_tick.timestamp if first_tick else None,
@@ -457,7 +476,7 @@ class TokenState:
             trailing_activated=self.trailing_activated or any(tick.trailing is not None for tick in self.position_ticks),
             max_price_after_entry=max_price_after_entry,
             ticks_before_signal=len(before_signal),
-            time_before_signal=fmt_duration(first_tick.timestamp if first_tick else None, self.signal_at),
+            time_before_signal=time_before_signal,
             price_change_before_signal=pct_change(first_tick.price if first_tick else None, self.signal_price),
             min_price_before_signal=min(prices) if prices else None,
             max_price_before_signal=max(prices) if prices else None,
@@ -503,6 +522,7 @@ class TokenState:
             liquidity_volatility_during_position=liquidity_volatility_pct(position_liquidity),
             liquidity_flags=liquidity_flags,
             possible_liquidity_collapse=possible_liquidity_collapse,
+            warnings=warnings,
         )
         return metrics
 
@@ -554,6 +574,20 @@ def infer_project_root(log_path: Path) -> Path:
     return log_path.parent
 
 
+def max_monitoring_seconds_for(log_path: Path) -> int:
+    project_root = infer_project_root(log_path)
+    config_path = project_root / "config" / "config.yaml"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return DEFAULT_MAX_MONITORING_SECONDS
+
+    match = re.search(r"^\s*max_monitoring_minutes:\s*(?P<minutes>\d+(?:\.\d+)?)\s*$", text, re.MULTILINE)
+    if not match:
+        return DEFAULT_MAX_MONITORING_SECONDS
+    return int(float(match.group("minutes")) * 60)
+
+
 def history_points_from_file(path: Path) -> list[dict]:
     rows = []
     try:
@@ -571,7 +605,11 @@ def history_points_from_file(path: Path) -> list[dict]:
     return rows
 
 
-def attach_history_liquidity(states_by_symbol: dict[str, TokenState], states_by_address: dict[str, TokenState], log_path: Path) -> None:
+def attach_history_liquidity(
+    states_by_symbol: dict[str, TokenState],
+    states_by_address: dict[str, TokenState],
+    log_path: Path,
+) -> None:
     project_root = infer_project_root(log_path)
     history_specs = (
         (project_root / "data" / "token_monitor" / "history", "entry"),
@@ -611,34 +649,89 @@ def attach_history_liquidity(states_by_symbol: dict[str, TokenState], states_by_
 
 
 def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
+    all_states: list[TokenState] = []
     states_by_symbol: dict[str, TokenState] = {}
     states_by_address: dict[str, TokenState] = {}
+    active_trade_by_symbol: dict[str, TokenState] = {}
+    current_session_states: dict[str, TokenState] = {}
     current_final_candidates: dict[str, tuple[Optional[float], Optional[str]]] = {}
     in_final_candidates = False
+    in_monitor_session = False
+    session_id = 0
+    max_monitoring_seconds = max_monitoring_seconds_for(log_path)
 
-    def state_for(symbol: str, address: Optional[str] = None) -> TokenState:
+    def apply_candidate_metadata(state: TokenState, normalized: str) -> None:
+        if normalized not in current_final_candidates:
+            return
+        h1, candidate_address = current_final_candidates[normalized]
+        if state.h1_at_capture is None:
+            state.h1_at_capture = h1
+        if candidate_address and not state.token_address:
+            state.token_address = candidate_address
+            states_by_address[candidate_address] = state
+
+    def create_state(symbol: str, address: Optional[str] = None) -> TokenState:
         normalized = normalize_symbol(symbol)
+        state = TokenState(symbol=symbol, session_id=session_id)
+        all_states.append(state)
+        states_by_symbol[normalized] = state
+        if address:
+            state.token_address = address
+            states_by_address[address] = state
+        apply_candidate_metadata(state, normalized)
+        return state
+
+    def state_for_current_session(symbol: str, address: Optional[str] = None) -> TokenState:
+        normalized = normalize_symbol(symbol)
+        if in_monitor_session:
+            state = current_session_states.get(normalized)
+            if state is None:
+                state = create_state(symbol, address)
+                current_session_states[normalized] = state
+            elif address and not state.token_address:
+                state.token_address = address
+                states_by_address[address] = state
+            apply_candidate_metadata(state, normalized)
+            return state
+
         if address and address in states_by_address:
             return states_by_address[address]
         if normalized in states_by_symbol:
             state = states_by_symbol[normalized]
-        else:
-            state = TokenState(symbol=symbol)
-            states_by_symbol[normalized] = state
-        if address:
-            state.token_address = address
-            states_by_address[address] = state
-        if normalized in current_final_candidates:
-            h1, candidate_address = current_final_candidates[normalized]
-            if state.h1_at_capture is None:
-                state.h1_at_capture = h1
-            if candidate_address and not state.token_address:
-                state.token_address = candidate_address
-                states_by_address[candidate_address] = state
-        return state
+            apply_candidate_metadata(state, normalized)
+            return state
+        return create_state(symbol, address)
+
+    def state_for_trade(symbol: str) -> TokenState:
+        normalized = normalize_symbol(symbol)
+        state = active_trade_by_symbol.get(normalized) or states_by_symbol.get(normalized)
+        if state is not None:
+            return state
+        return state_for_current_session(symbol)
+
+    def add_metric(metrics: dict[str, TradeMetrics], metric: TradeMetrics) -> None:
+        base_key = token_key(metric.symbol, metric.token_address)
+        key = base_key
+        if key in metrics:
+            key = f"{base_key}#session:{metric.session_id}"
+            counter = 2
+            while key in metrics:
+                key = f"{base_key}#session:{metric.session_id}:{counter}"
+                counter += 1
+        metrics[key] = metric
 
     for raw_line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw_line.rstrip("\n")
+
+        if line.strip() == "=== Módulo 2: Token Monitor Buy ===":
+            session_id += 1
+            current_session_states = {}
+            in_monitor_session = True
+            in_final_candidates = False
+            continue
+
+        if line.startswith("[INFO] Monitoramento encerrado.") or line.strip() == "=== Módulo 3: Position Monitor ===":
+            in_monitor_session = False
 
         if line.startswith("Candidatos finais:"):
             in_final_candidates = True
@@ -658,13 +751,13 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
                     safe_float(h1_match.group("h1")) if h1_match else None,
                     address_match.group("address") if address_match else None,
                 )
-                state_for(symbol, address_match.group("address") if address_match else None)
+                state_for_current_session(symbol, address_match.group("address") if address_match else None)
             continue
 
         entry_match = ENTRY_TICK_RE.match(line)
         if entry_match:
             symbol = entry_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_current_session(symbol)
             reason = entry_match.group("reason").strip()
             if state.entry_reason is None and reason_category(reason) == "pullback_valido":
                 state.entry_reason = reason
@@ -684,18 +777,20 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
         signal_match = BUY_SIGNAL_RE.match(line)
         if signal_match:
             symbol = signal_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_current_session(symbol)
             state.signal_at = signal_match.group("timestamp")
             state.signal_price = safe_float(signal_match.group("price"))
             if state.entry_reason is None and state.ticks:
                 state.entry_reason = state.ticks[-1].reason
+            active_trade_by_symbol[normalize_symbol(symbol)] = state
             continue
 
         paper_buy_match = PAPER_BUY_RE.match(line)
         if paper_buy_match:
             symbol = paper_buy_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_trade(symbol)
             state.opened_at = paper_buy_match.group("timestamp")
+            active_trade_by_symbol[normalize_symbol(symbol)] = state
             continue
 
         position_match = POSITION_TICK_RE.match(line)
@@ -711,7 +806,7 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
                 trailing=None if trailing_raw == "None" else safe_float(trailing_raw),
                 bp_persist=int(position_match.group("bp_persist")),
             )
-            state = state_for(symbol)
+            state = state_for_trade(symbol)
             state.position_ticks.append(tick)
             if tick.trailing is not None:
                 state.trailing_activated = True
@@ -719,13 +814,13 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
 
         profit_lock_match = PROFIT_LOCK_RE.match(line)
         if profit_lock_match:
-            state_for(profit_lock_match.group("symbol").strip()).breakeven_activated = True
+            state_for_trade(profit_lock_match.group("symbol").strip()).breakeven_activated = True
             continue
 
         sell_match = SELL_RE.match(line)
         if sell_match:
             symbol = sell_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_trade(symbol)
             state.sold_at = sell_match.group("timestamp") or state.sold_at
             state.exit_reason = sell_match.group("reason").strip()
             state.final_pnl = safe_float(sell_match.group("pnl"))
@@ -736,9 +831,9 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
     attach_history_liquidity(states_by_symbol, states_by_address, log_path)
 
     metrics: dict[str, TradeMetrics] = {}
-    for state in states_by_symbol.values():
-        metric = state.build_metrics()
-        metrics[token_key(metric.symbol, metric.token_address)] = metric
+    for state in all_states:
+        metric = state.build_metrics(max_monitoring_seconds=max_monitoring_seconds)
+        add_metric(metrics, metric)
     return metrics
 
 
@@ -756,6 +851,7 @@ def avg_time_to_signal(items: list[TradeMetrics]) -> str:
         seconds_between(item.first_tick_at, item.signal_at)
         for item in items
         if item.first_tick_at and item.signal_at
+        and not item.warnings
     ]
     clean = [value for value in seconds if value is not None and value >= 0]
     return fmt_seconds(mean(clean)) if clean else "n/a"
@@ -831,6 +927,15 @@ def write_advanced_report(
         "",
         "## Metricas Por Token/Sinal",
     ]
+
+    warnings = [warning for item in primary.values() for warning in item.warnings]
+    if warnings:
+        metric_section_index = lines.index("## Metricas Por Token/Sinal")
+        lines[metric_section_index:metric_section_index] = [
+            "## Avisos Do Analisador",
+            *[f"- {warning}" for warning in warnings],
+            "",
+        ]
 
     for item in sorted(primary.values(), key=lambda metric: metric.signal_at or metric.first_tick_at or ""):
         lines.append(
