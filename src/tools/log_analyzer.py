@@ -880,14 +880,39 @@ def find_matching_position_log(input_path: Path) -> Optional[Path]:
     return None
 
 
+def dates_referenced_by_log(input_path: Path) -> set[str]:
+    dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", input_path.name))
+    try:
+        text = input_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return dates
+    dates.update(re.findall(r"\d{4}-\d{2}-\d{2}", text))
+    return dates
+
+
 def find_matching_position_logs(input_paths: list[Path]) -> list[Path]:
     found: list[Path] = []
     seen: set[Path] = set()
     for input_path in input_paths:
-        match = find_matching_position_log(input_path)
-        if match and match not in seen:
-            found.append(match)
-            seen.add(match)
+        dates = dates_referenced_by_log(input_path)
+        if not dates:
+            match = find_matching_position_log(input_path)
+            if match and match not in seen:
+                found.append(match)
+                seen.add(match)
+            continue
+
+        for date in sorted(dates):
+            candidates = [
+                input_path.with_name(f"position_{date}.txt"),
+                PROJECT_ROOT / "logs" / "cloud" / f"position_{date}.txt",
+                PROJECT_ROOT / "logs" / f"position_{date}.txt",
+            ]
+            for candidate in candidates:
+                if candidate.exists() and candidate not in seen:
+                    found.append(candidate)
+                    seen.add(candidate)
+                    break
     return found
 
 
