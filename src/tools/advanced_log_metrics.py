@@ -54,6 +54,7 @@ TOKEN_ADDRESS_RE = re.compile(
 )
 HEALTH_RE = re.compile(r"health=([0-9.]+)")
 PULLBACK_RE = re.compile(r"pullback(?: fora da faixa)?[:=]\s*([0-9.]+)%", re.IGNORECASE)
+ANALYSIS_TOKEN_RE = re.compile(r"^-\s+(?P<symbol>.+?):\s+(?P<body>.*)$")
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -339,6 +340,7 @@ class TradeMetrics:
     bp_persist_exit: Optional[int] = None
     max_pnl: Optional[float] = None
     min_pnl: Optional[float] = None
+    pnl_giveback_from_max: Optional[float] = None
     position_ticks_count: int = 0
     breakeven_activated: bool = False
     trailing_activated: bool = False
@@ -471,6 +473,11 @@ class TokenState:
             bp_persist_exit=self.bp_persist_exit,
             max_pnl=max(pnl_values) if pnl_values else None,
             min_pnl=min(pnl_values) if pnl_values else None,
+            pnl_giveback_from_max=(
+                (max(pnl_values) - self.final_pnl)
+                if pnl_values and self.final_pnl is not None
+                else None
+            ),
             position_ticks_count=len(self.position_ticks),
             breakeven_activated=self.breakeven_activated or any(tick.stop > 0 and tick.trailing is not None for tick in self.position_ticks),
             trailing_activated=self.trailing_activated or any(tick.trailing is not None for tick in self.position_ticks),
@@ -649,6 +656,9 @@ def attach_history_liquidity(
 
 
 def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
+    if log_path.suffix.lower() == ".md":
+        return parse_analysis_metrics(log_path)
+
     all_states: list[TokenState] = []
     states_by_symbol: dict[str, TokenState] = {}
     states_by_address: dict[str, TokenState] = {}
@@ -837,9 +847,211 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
     return metrics
 
 
+def find_matching_metric(position: TradeMetrics, primary: dict[str, TradeMetrics]) -> Optional[TradeMetrics]:
+    same_symbol = [
+        item for item in primary.values()
+        if normalize_symbol(item.symbol) == normalize_symbol(position.symbol)
+    ]
+    if not same_symbol:
+        return None
+    if not position.opened_at:
+        return same_symbol[0]
+
+    opened_dt = parse_dt(position.opened_at)
+    if not opened_dt:
+        return same_symbol[0]
+
+    def distance(item: TradeMetrics) -> tuple[int, float]:
+        signal_dt = parse_dt(item.signal_at or "")
+        if not signal_dt:
+            return (1, float("inf"))
+        return (0 if signal_dt <= opened_dt else 1, abs((opened_dt - signal_dt).total_seconds()))
+
+    return sorted(same_symbol, key=distance)[0]
+
+
+def merge_position_metrics(primary: dict[str, TradeMetrics], position_metrics: dict[str, TradeMetrics]) -> None:
+    for position in position_metrics.values():
+        if not (position.opened_at or position.sold_at or position.position_ticks_count or position.final_pnl is not None):
+            continue
+        target = find_matching_metric(position, primary)
+        if target is None:
+            primary[token_key(position.symbol, position.token_address)] = position
+            continue
+
+        target.opened_at = position.opened_at or target.opened_at
+        target.sold_at = position.sold_at or target.sold_at
+        target.exit_reason = position.exit_reason or target.exit_reason
+        target.final_pnl = position.final_pnl if position.final_pnl is not None else target.final_pnl
+        target.bp_persist_exit = position.bp_persist_exit if position.bp_persist_exit is not None else target.bp_persist_exit
+        target.max_pnl = position.max_pnl if position.max_pnl is not None else target.max_pnl
+        target.min_pnl = position.min_pnl if position.min_pnl is not None else target.min_pnl
+        target.pnl_giveback_from_max = (
+            position.pnl_giveback_from_max
+            if position.pnl_giveback_from_max is not None
+            else target.pnl_giveback_from_max
+        )
+        target.position_ticks_count = position.position_ticks_count or target.position_ticks_count
+        target.breakeven_activated = target.breakeven_activated or position.breakeven_activated
+        target.trailing_activated = target.trailing_activated or position.trailing_activated
+        target.max_price_after_entry = position.max_price_after_entry or target.max_price_after_entry
+
+
+def merge_metric_sets(metric_sets: list[dict[str, TradeMetrics]]) -> dict[str, TradeMetrics]:
+    merged: dict[str, TradeMetrics] = {}
+    for metrics in metric_sets:
+        for key, metric in metrics.items():
+            target_key = key
+            if target_key in merged:
+                suffix = metric.signal_at or metric.opened_at or metric.first_tick_at or str(len(merged) + 1)
+                target_key = f"{key}#log:{suffix}"
+                counter = 2
+                while target_key in merged:
+                    target_key = f"{key}#log:{suffix}:{counter}"
+                    counter += 1
+            merged[target_key] = metric
+    return merged
+
+
+def ensure_path_list(value: Optional[Path | list[Path]]) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 def average(values: list[Optional[float]]) -> Optional[float]:
     clean = [value for value in values if value is not None]
     return mean(clean) if clean else None
+
+
+def parse_analysis_value(body: str, field_name: str) -> Optional[str]:
+    match = re.search(rf"(?:^|\|\s*){re.escape(field_name)}=([^|]+)", body)
+    return match.group(1).strip() if match else None
+
+
+def parse_analysis_float(body: str, field_name: str) -> Optional[float]:
+    value = parse_analysis_value(body, field_name)
+    if value is None or value == "n/a":
+        return None
+    if value.endswith("%"):
+        value = value[:-1]
+    return safe_float(value, default=0.0)
+
+
+def parse_analysis_bool(body: str, field_name: str) -> bool:
+    value = parse_analysis_value(body, field_name)
+    return str(value).strip().lower() == "true"
+
+
+def parse_analysis_metrics(path: Path) -> dict[str, TradeMetrics]:
+    metrics: dict[str, TradeMetrics] = {}
+    metrics_by_symbol: dict[str, list[TradeMetrics]] = {}
+    section_occurrences: dict[tuple[str, str], int] = {}
+    section = ""
+
+    def add_metric(symbol: str) -> TradeMetrics:
+        normalized = normalize_symbol(symbol)
+        items = metrics_by_symbol.setdefault(normalized, [])
+        metric = TradeMetrics(symbol=symbol, session_id=len(items) + 1)
+        items.append(metric)
+        key = token_key(symbol, None)
+        if key in metrics:
+            key = f"{key}#analysis:{len(items)}"
+        metrics[key] = metric
+        return metric
+
+    def get_metric(symbol: str, section_name: str) -> TradeMetrics:
+        normalized = normalize_symbol(symbol)
+        if section_name == "## Metricas Por Token/Sinal":
+            return add_metric(symbol)
+
+        occurrence_key = (section_name, normalized)
+        occurrence = section_occurrences.get(occurrence_key, 0)
+        section_occurrences[occurrence_key] = occurrence + 1
+        items = metrics_by_symbol.get(normalized)
+        if items and occurrence < len(items):
+            return items[occurrence]
+        if items:
+            return items[-1]
+        return add_metric(symbol)
+
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            section = line
+            continue
+        match = ANALYSIS_TOKEN_RE.match(line)
+        if not match:
+            continue
+        if section not in {
+            "## Metricas Por Token/Sinal",
+            "## Health Antes Do Sinal",
+            "## Buy Pressure Antes Do Sinal",
+            "## Metricas Da Posicao",
+        }:
+            continue
+
+        symbol = match.group("symbol").strip()
+        body = match.group("body")
+        metric = get_metric(symbol, section)
+
+        if section == "## Metricas Por Token/Sinal":
+            first_tick = parse_analysis_value(body, "primeiro_tick")
+            signal = parse_analysis_value(body, "sinal")
+            metric.first_tick_at = None if first_tick == "n/a" else first_tick
+            metric.signal_at = None if signal == "n/a" else signal
+            metric.time_before_signal = parse_analysis_value(body, "tempo_ate_sinal") or "n/a"
+            metric.ticks_before_signal = int(parse_analysis_float(body, "ticks_ate_sinal") or 0)
+            metric.h1_at_capture = parse_analysis_float(body, "h1_captura")
+            metric.first_price = parse_analysis_float(body, "preco_primeiro")
+            metric.signal_price = parse_analysis_float(body, "preco_sinal")
+            metric.price_change_before_signal = parse_analysis_float(body, "variacao")
+            metric.runup_before_signal = parse_analysis_float(body, "runup")
+            metric.drawdown_before_signal = parse_analysis_float(body, "drawdown")
+            metric.entry_reason = parse_analysis_value(body, "motivo_entrada")
+            continue
+
+        if section == "## Health Antes Do Sinal":
+            metric.health_max_before_signal = parse_analysis_float(body, "health_max")
+            metric.last_health_before_signal = parse_analysis_float(body, "ultimo_health")
+            metric.health_ge_075_count = int(parse_analysis_float(body, "health>=0.75") or 0)
+            metric.health_ge_087_count = int(parse_analysis_float(body, "health>=0.87") or 0)
+            metric.health_ge_087_max_seq = int(parse_analysis_float(body, "seq_health>=0.87") or 0)
+            metric.queda_forte_vivo_count = int(parse_analysis_float(body, "queda_forte_vivo") or 0)
+            metric.codex_nao_confirmou_count = int(parse_analysis_float(body, "codex_nao_confirmou") or 0)
+            metric.preco_ainda_caindo_count = int(parse_analysis_float(body, "preco_ainda_caindo") or 0)
+            metric.sem_recuperacao_count = int(parse_analysis_float(body, "sem_recuperacao_cascata") or 0)
+            continue
+
+        if section == "## Buy Pressure Antes Do Sinal":
+            metric.buy_pressure_avg = parse_analysis_float(body, "media")
+            metric.buy_pressure_max = parse_analysis_float(body, "max")
+            metric.buy_pressure_min = parse_analysis_float(body, "min")
+            metric.bp_ge_065_count = int(parse_analysis_float(body, "bp>=0.65") or 0)
+            metric.bp_ge_085_count = int(parse_analysis_float(body, "bp>=0.85") or 0)
+            metric.bp_ge_085_max_seq = int(parse_analysis_float(body, "seq_bp>=0.85") or 0)
+            continue
+
+        if section == "## Metricas Da Posicao":
+            opened = parse_analysis_value(body, "abertura")
+            sold = parse_analysis_value(body, "venda")
+            metric.opened_at = None if opened == "n/a" else opened
+            metric.sold_at = None if sold == "n/a" else sold
+            metric.exit_reason = parse_analysis_value(body, "saida")
+            metric.final_pnl = parse_analysis_float(body, "pnl_final")
+            metric.max_pnl = parse_analysis_float(body, "pnl_max")
+            metric.min_pnl = parse_analysis_float(body, "pnl_min")
+            metric.position_ticks_count = int(parse_analysis_float(body, "ticks_posicao") or 0)
+            metric.breakeven_activated = parse_analysis_bool(body, "breakeven")
+            metric.trailing_activated = parse_analysis_bool(body, "trailing")
+            metric.max_price_after_entry = parse_analysis_float(body, "maior_preco_pos_entrada")
+            if metric.max_pnl is not None and metric.final_pnl is not None:
+                metric.pnl_giveback_from_max = metric.max_pnl - metric.final_pnl
+            continue
+
+    return metrics
 
 
 def is_operated(item: TradeMetrics) -> bool:
@@ -899,14 +1111,21 @@ def match_shared_tokens(
 
 
 def write_advanced_report(
-    primary_log: Path,
+    primary_log: Path | list[Path],
     output_path: Path,
     primary_name: str,
-    compare_log: Optional[Path] = None,
+    compare_log: Optional[Path | list[Path]] = None,
     compare_name: str = "comparado",
+    position_log: Optional[Path | list[Path]] = None,
 ) -> None:
-    primary = parse_log_metrics(primary_log)
-    compare = parse_log_metrics(compare_log) if compare_log else {}
+    primary_logs = ensure_path_list(primary_log)
+    position_logs = ensure_path_list(position_log)
+    compare_logs = ensure_path_list(compare_log)
+
+    primary = merge_metric_sets([parse_log_metrics(log_path) for log_path in primary_logs])
+    for log_path in position_logs:
+        merge_position_metrics(primary, parse_log_metrics(log_path))
+    compare = merge_metric_sets([parse_log_metrics(log_path) for log_path in compare_logs]) if compare_logs else {}
     closed = [item for item in primary.values() if item.final_pnl is not None]
     winners = [item for item in closed if (item.final_pnl or 0) > 0]
     losers = [item for item in closed if (item.final_pnl or 0) <= 0]
@@ -916,7 +1135,8 @@ def write_advanced_report(
         "",
         "## Resumo Quantitativo Geral",
         f"- Bot analisado: {primary_name}",
-        f"- Log analisado: {primary_log}",
+        f"- Logs analisados: {', '.join(str(path) for path in primary_logs)}",
+        f"- Position logs: {', '.join(str(path) for path in position_logs) if position_logs else 'n/a'}",
         f"- Tokens com dados: {len(primary)}",
         f"- Trades fechados: {len(closed)}",
         f"- Winners/losers: {len(winners)}/{len(losers)}",
@@ -983,10 +1203,61 @@ def write_advanced_report(
                 f"- {item.symbol}: abertura={fmt_dt(item.opened_at)} | venda={fmt_dt(item.sold_at)} | "
                 f"duracao={fmt_duration(item.opened_at, item.sold_at)} | saida={item.exit_reason or 'n/a'} | "
                 f"pnl_final={fmt_pct(item.final_pnl)} | pnl_max={fmt_pct(item.max_pnl)} | pnl_min={fmt_pct(item.min_pnl)} | "
+                f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
                 f"ticks_posicao={item.position_ticks_count} | bp_persist_saida={item.bp_persist_exit if item.bp_persist_exit is not None else 'n/a'} | "
                 f"breakeven={item.breakeven_activated} | trailing={item.trailing_activated} | "
                 f"maior_preco_pos_entrada={fmt_num(item.max_price_after_entry, 10)}"
             )
+
+    lines.extend(["", "## Diagnostico Position: Topo Vs Saida"])
+    position_items = [
+        item for item in primary.values()
+        if item.opened_at or item.position_ticks_count or item.final_pnl is not None
+    ]
+    if position_items:
+        for item in sorted(position_items, key=lambda metric: metric.max_pnl if metric.max_pnl is not None else -999, reverse=True):
+            lines.append(
+                f"- {item.symbol}: pnl_max={fmt_pct(item.max_pnl)} | pnl_final={fmt_pct(item.final_pnl)} | "
+                f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | saida={item.exit_reason or 'n/a'} | "
+                f"duracao={fmt_duration(item.opened_at, item.sold_at)} | trailing={item.trailing_activated}"
+            )
+    else:
+        lines.append("- Nenhum dado de position encontrado. Use --position-log para logs desacoplados.")
+
+    lines.extend(["", "## Candidatos A Big Winner"])
+    big_winner_candidates = [
+        item for item in position_items
+        if item.max_pnl is not None and item.max_pnl >= 10
+    ]
+    if big_winner_candidates:
+        for item in sorted(big_winner_candidates, key=lambda metric: metric.max_pnl or 0, reverse=True)[:20]:
+            lines.append(
+                f"- {item.symbol}: pnl_max={fmt_pct(item.max_pnl)} | pnl_final={fmt_pct(item.final_pnl)} | "
+                f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
+                f"liq_signal={fmt_num(item.liquidity_at_signal, 2)} | liq_open={fmt_num(item.liquidity_at_position_open, 2)} | "
+                f"liq_growth_pre={fmt_pct(item.liquidity_growth_pct_before_signal)} | liq_growth_pos={fmt_pct(item.liquidity_growth_pct_during_position)} | "
+                f"bp_media={fmt_num(item.buy_pressure_avg, 2)} | health_max={fmt_num(item.health_max_before_signal, 2)} | "
+                f"runup_pre_sinal={fmt_pct(item.runup_before_signal)} | motivo_entrada={item.entry_reason or 'n/a'}"
+            )
+    else:
+        lines.append("- Nenhum token atingiu pnl_max >= 10% pelos dados de position disponíveis.")
+
+    lines.extend(["", "## Grupos Por Resultado"])
+    groups = (
+        ("BIG_WINNERS", [item for item in position_items if item.max_pnl is not None and item.max_pnl >= 10]),
+        ("WINNERS", [item for item in position_items if item.final_pnl is not None and item.final_pnl > 0 and (item.max_pnl or 0) < 10]),
+        ("LOSERS", [item for item in position_items if item.final_pnl is not None and item.final_pnl <= 0]),
+    )
+    for label, items in groups:
+        lines.append(f"### {label}")
+        lines.append(
+            f"- quantidade={len(items)} | pnl_final_medio={fmt_pct(average([item.final_pnl for item in items]))} | "
+            f"pnl_max_medio={fmt_pct(average([item.max_pnl for item in items]))} | "
+            f"devolucao_media={fmt_pct(average([item.pnl_giveback_from_max for item in items]))} | "
+            f"liquidez_entrada_media={fmt_num(average([item.liquidity_at_signal or item.liquidity_at_position_open for item in items]), 2)} | "
+            f"crescimento_liq_pre_medio={fmt_pct(average([item.liquidity_growth_pct_before_signal for item in items]))} | "
+            f"crescimento_liq_pos_medio={fmt_pct(average([item.liquidity_growth_pct_during_position for item in items]))}"
+        )
 
     lines.extend(["", "## Liquidez Estrutural Por Token"])
     for item in primary.values():
@@ -1091,6 +1362,7 @@ def write_advanced_report(
     for item in sorted(closed, key=lambda metric: metric.final_pnl or 0, reverse=True)[:10]:
         lines.append(
             f"- {item.symbol}: pnl={fmt_pct(item.final_pnl)} | saida={item.exit_reason or 'n/a'} | "
+            f"pnl_max={fmt_pct(item.max_pnl)} | devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
             f"h1={fmt_pct(item.h1_at_capture)} | liquidity_at_entry={fmt_num(item.liquidity_at_signal or item.liquidity_at_position_open, 2)}"
         )
 
@@ -1098,6 +1370,7 @@ def write_advanced_report(
     for item in sorted(closed, key=lambda metric: metric.final_pnl or 0)[:10]:
         lines.append(
             f"- {item.symbol}: pnl={fmt_pct(item.final_pnl)} | saida={item.exit_reason or 'n/a'} | "
+            f"pnl_max={fmt_pct(item.max_pnl)} | devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
             f"h1={fmt_pct(item.h1_at_capture)} | liquidity_at_entry={fmt_num(item.liquidity_at_signal or item.liquidity_at_position_open, 2)}"
         )
 

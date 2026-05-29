@@ -826,6 +826,27 @@ def find_latest_monitor_log() -> Path:
 
 def build_output_paths(input_path: Path, output_dir: Path) -> tuple[Path, Path]:
     stem = input_path.stem
+    if stem.endswith("_analysis"):
+        stem = stem[: -len("_analysis")]
+    return (
+        output_dir / f"{stem}_compact.md",
+        output_dir / f"{stem}_analysis.md",
+    )
+
+
+def build_multi_output_paths(input_paths: list[Path], output_dir: Path) -> tuple[Path, Path]:
+    if len(input_paths) == 1:
+        return build_output_paths(input_paths[0], output_dir)
+
+    dates = []
+    for path in input_paths:
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
+        if match:
+            dates.append(match.group(1))
+    if dates:
+        stem = f"monitor_{min(dates)}_to_{max(dates)}"
+    else:
+        stem = "monitor_multi"
     return (
         output_dir / f"{stem}_compact.md",
         output_dir / f"{stem}_analysis.md",
@@ -843,13 +864,40 @@ def resolve_input_path(path: Path) -> Path:
     return PROJECT_ROOT / path
 
 
+def find_matching_position_log(input_path: Path) -> Optional[Path]:
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", input_path.name)
+    if not match:
+        return None
+    date = match.group(1)
+    candidates = [
+        input_path.with_name(f"position_{date}.txt"),
+        PROJECT_ROOT / "logs" / "cloud" / f"position_{date}.txt",
+        PROJECT_ROOT / "logs" / f"position_{date}.txt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_matching_position_logs(input_paths: list[Path]) -> list[Path]:
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for input_path in input_paths:
+        match = find_matching_position_log(input_path)
+        if match and match not in seen:
+            found.append(match)
+            seen.add(match)
+    return found
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compacta e analisa logs do monitor KRPTO3.")
     parser.add_argument(
         "log_file",
-        nargs="?",
+        nargs="*",
         type=Path,
-        help="Arquivo de log bruto. Se omitido, usa o monitor_*.txt mais recente em logs/.",
+        help="Arquivo(s) de log bruto ou *_analysis.md. Se omitido, usa o monitor_*.txt mais recente em logs/.",
     )
     parser.add_argument(
         "--output-dir",
@@ -870,6 +918,13 @@ def main() -> None:
         help="Log de outro bot para gerar comparacao KRPTO2 vs KRPTO3.",
     )
     parser.add_argument(
+        "--position-log",
+        type=Path,
+        action="append",
+        default=None,
+        help="Log separado do Position Monitor. Pode repetir. Se omitido, tenta achar position_YYYY-MM-DD.txt.",
+    )
+    parser.add_argument(
         "--bot-name",
         default="KRPTO3",
         help="Nome do bot principal no relatorio.",
@@ -881,32 +936,52 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_path = args.log_file or find_latest_monitor_log()
-    input_path = resolve_input_path(input_path)
+    input_paths = [resolve_input_path(path) for path in args.log_file] if args.log_file else [find_latest_monitor_log()]
 
-    if not input_path.exists():
-        raise SystemExit(f"Log nao encontrado: {input_path}")
+    missing = [path for path in input_paths if not path.exists()]
+    if missing:
+        raise SystemExit(f"Log nao encontrado: {missing[0]}")
 
-    text = input_path.read_text(encoding="utf-8", errors="replace")
-    cycles = parse_log(text.splitlines())
-    compact_path, analysis_path = build_output_paths(input_path, args.output_dir)
+    compact_path, analysis_path = build_multi_output_paths(input_paths, args.output_dir)
 
-    write_compact_log(cycles, compact_path, max_events=args.max_events_per_token)
+    wrote_compact = False
+    raw_input_paths = [path for path in input_paths if path.suffix.lower() != ".md"]
+    if raw_input_paths:
+        all_lines: list[str] = []
+        for path in raw_input_paths:
+            all_lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            all_lines.append("===============================")
+        cycles = parse_log(all_lines)
+        write_compact_log(cycles, compact_path, max_events=args.max_events_per_token)
+        wrote_compact = True
+
     compare_path = resolve_input_path(args.compare_log) if args.compare_log else None
+    position_paths = [resolve_input_path(path) for path in args.position_log] if args.position_log else find_matching_position_logs(input_paths)
+    missing_positions = [path for path in position_paths if not path.exists()]
+    if missing_positions:
+        raise SystemExit(f"Position log nao encontrado: {missing_positions[0]}")
     write_advanced_report(
-        primary_log=input_path,
+        primary_log=input_paths,
         output_path=analysis_path,
         primary_name=args.bot_name,
         compare_log=compare_path,
         compare_name=args.compare_name,
+        position_log=position_paths,
     )
 
-    original_size = input_path.stat().st_size
-    compact_size = compact_path.stat().st_size
+    original_size = sum(path.stat().st_size for path in input_paths)
     analysis_size = analysis_path.stat().st_size
 
-    print(f"Log analisado: {input_path}")
-    print(f"Log compacto: {compact_path} ({compact_size} bytes; original {original_size} bytes)")
+    print("Logs analisados:")
+    for path in input_paths:
+        print(f"- {path}")
+    if position_paths:
+        print("Position logs:")
+        for path in position_paths:
+            print(f"- {path}")
+    if wrote_compact:
+        compact_size = compact_path.stat().st_size
+        print(f"Log compacto: {compact_path} ({compact_size} bytes; original total {original_size} bytes)")
     print(f"Analise: {analysis_path} ({analysis_size} bytes)")
 
 
