@@ -83,7 +83,7 @@ def normalize_reason(reason: str) -> str:
         return "historico_insuficiente"
     if "pullback fora da faixa" in lower:
         return "pullback_fora_da_faixa"
-    if "pullback" in lower and ("valido" in lower or "v" in lower):
+    if "pullback" in lower and ("valido" in lower or "válido" in lower or "vÃ¡lido" in lower):
         return "pullback_valido"
     if "codex" in lower and ("nao confirmou" in lower or "n\u00e3o confirmou" in lower or "nÃ£o confirmou" in lower):
         return "codex_nao_confirmou"
@@ -937,12 +937,6 @@ def main() -> None:
         help="Maximo de eventos-chave preservados por token no log compacto.",
     )
     parser.add_argument(
-        "--compare-log",
-        type=Path,
-        default=None,
-        help="Log de outro bot para gerar comparacao KRPTO2 vs KRPTO3.",
-    )
-    parser.add_argument(
         "--position-log",
         type=Path,
         action="append",
@@ -953,11 +947,6 @@ def main() -> None:
         "--bot-name",
         default="KRPTO3",
         help="Nome do bot principal no relatorio.",
-    )
-    parser.add_argument(
-        "--compare-name",
-        default="KRPTO2",
-        help="Nome do bot comparado no relatorio.",
     )
     args = parser.parse_args()
 
@@ -980,7 +969,6 @@ def main() -> None:
         write_compact_log(cycles, compact_path, max_events=args.max_events_per_token)
         wrote_compact = True
 
-    compare_path = resolve_input_path(args.compare_log) if args.compare_log else None
     position_paths = [resolve_input_path(path) for path in args.position_log] if args.position_log else find_matching_position_logs(input_paths)
     missing_positions = [path for path in position_paths if not path.exists()]
     if missing_positions:
@@ -989,8 +977,6 @@ def main() -> None:
         primary_log=input_paths,
         output_path=analysis_path,
         primary_name=args.bot_name,
-        compare_log=compare_path,
-        compare_name=args.compare_name,
         position_log=position_paths,
     )
 
