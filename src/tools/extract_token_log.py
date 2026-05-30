@@ -221,6 +221,37 @@ def find_latest_monitor_log() -> Path:
     return candidates[0]
 
 
+def dates_referenced_by_log(log_file: Path) -> set[str]:
+    dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", log_file.name))
+    try:
+        text = log_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return dates
+    dates.update(re.findall(r"\d{4}-\d{2}-\d{2}", text))
+    return dates
+
+
+def find_matching_position_logs(monitor_log: Path) -> list[Path]:
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    for date in sorted(dates_referenced_by_log(monitor_log)):
+        candidates = [
+            monitor_log.with_name(f"position_{date}.txt"),
+            PROJECT_ROOT / "logs" / "cloud" / f"position_{date}.txt",
+            PROJECT_ROOT / "logs" / f"position_{date}.txt",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    found.append(candidate)
+                    seen.add(resolved)
+                break
+
+    return found
+
+
 def default_output_dir_for(log_file: Path) -> Path:
     resolved = log_file.resolve()
 
@@ -249,8 +280,28 @@ def count_position_ticks(lines: list[str], token: str) -> int:
     return sum(1 for line in lines if is_target_symbol(POSITION_TICK_RE.match(line).group("symbol").strip() if POSITION_TICK_RE.match(line) else None, token))
 
 
+def extract_from_file(log_file: Path, token: str, only_monitored: bool) -> list[str]:
+    raw_text = log_file.read_text(encoding="utf-8", errors="replace")
+    return extract_token_lines(
+        raw_text.splitlines(),
+        token=token,
+        only_monitored=only_monitored,
+    )
+
+
+def append_source_section(result: list[str], title: str, lines: list[str]) -> None:
+    if not lines:
+        return
+
+    if result and result[-1].strip():
+        result.append("")
+    result.append(f"### Fonte: {title}")
+    result.append("")
+    result.extend(lines)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Extrai do log bruto do monitor todos os trechos relacionados a um token.")
+    parser = argparse.ArgumentParser(description="Extrai dos logs do monitor e do position todos os trechos relacionados a um token.")
     parser.add_argument(
         "first",
         help="Simbolo do token, ou arquivo de log se tambem informar o token depois.",
@@ -271,6 +322,13 @@ def main() -> None:
         action="store_true",
         help="Mantem foco nas linhas operacionais do monitor e remove mencoes soltas do token.",
     )
+    parser.add_argument(
+        "--position-log",
+        type=Path,
+        action="append",
+        default=None,
+        help="Log separado do Position Monitor. Pode repetir. Se omitido, tenta achar position_YYYY-MM-DD.txt.",
+    )
     args = parser.parse_args()
 
     if args.second:
@@ -285,15 +343,38 @@ def main() -> None:
     if not log_file.exists():
         raise SystemExit(f"Log nao encontrado: {log_file}")
 
+    position_logs = (
+        [resolve_input_path(path) for path in args.position_log]
+        if args.position_log
+        else find_matching_position_logs(log_file)
+    )
+    missing_position_logs = [path for path in position_logs if not path.exists()]
+    if missing_position_logs:
+        raise SystemExit(f"Position log nao encontrado: {missing_position_logs[0]}")
+
     output_dir = args.output_dir or default_output_dir_for(log_file)
 
-    raw_text = log_file.read_text(encoding="utf-8", errors="replace")
-    raw_lines = raw_text.splitlines()
-    extracted = extract_token_lines(
-        raw_lines,
+    monitor_lines = extract_from_file(
+        log_file,
         token=token,
         only_monitored=args.only_monitored,
     )
+    position_lines_by_file = [
+        (
+            position_log,
+            extract_from_file(
+                position_log,
+                token=token,
+                only_monitored=args.only_monitored,
+            ),
+        )
+        for position_log in position_logs
+    ]
+
+    extracted: list[str] = []
+    append_source_section(extracted, log_file.name, monitor_lines)
+    for position_log, position_lines in position_lines_by_file:
+        append_source_section(extracted, position_log.name, position_lines)
 
     if not extracted:
         raise SystemExit(f"Nenhum trecho encontrado para token: {token}")
@@ -307,6 +388,13 @@ def main() -> None:
     position_tick_count = count_position_ticks(extracted, token)
 
     print(f"Arquivo gerado: {output_path}")
+    print(f"Log do monitor: {log_file}")
+    if position_logs:
+        print("Logs do Position Monitor:")
+        for position_log in position_logs:
+            print(f"- {position_log}")
+    else:
+        print("Logs do Position Monitor: nenhum arquivo correspondente encontrado")
     print(f"Linhas extraidas: {len(extracted)}")
     print(f"Ticks do Token Monitor Buy: {entry_tick_count}")
     print(f"Ticks do Position Monitor: {position_tick_count}")

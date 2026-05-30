@@ -9,6 +9,9 @@ from typing import Optional
 
 
 DEFAULT_MAX_MONITORING_SECONDS = 15 * 60
+MOMENTUM_CANDIDATE_MIN_RUNUP_PCT = 30.0
+MOMENTUM_RUNUP_TRIGGERS = (10.0, 20.0, 30.0, 50.0)
+MOMENTUM_TP_TARGETS = (0.5, 1.0, 2.0, 3.0, 5.0)
 
 
 ENTRY_TICK_RE = re.compile(
@@ -393,6 +396,7 @@ class TradeMetrics:
     liquidity_flags: list[str] = field(default_factory=list)
     possible_liquidity_collapse: bool = False
     warnings: list[str] = field(default_factory=list)
+    monitor_ticks: list[EntryTick] = field(default_factory=list)
 
 
 @dataclass
@@ -430,6 +434,8 @@ class TokenState:
         pullbacks = [tick.pullback for tick in before_signal if tick.pullback is not None]
         reasons = " | ".join(tick.reason.lower() for tick in before_signal)
         pnl_values = [tick.pnl_pct for tick in self.position_ticks]
+        if self.final_pnl is not None:
+            pnl_values.append(self.final_pnl)
         max_price_after_entry = max((tick.price for tick in self.position_ticks if tick.price > 0), default=None)
         before_liquidity = liquidity_window(self.entry_liquidity_points, end=self.signal_at)
         position_liquidity = liquidity_window(
@@ -534,6 +540,7 @@ class TokenState:
             liquidity_flags=liquidity_flags,
             possible_liquidity_collapse=possible_liquidity_collapse,
             warnings=warnings,
+            monitor_ticks=list(self.ticks),
         )
         return metrics
 
@@ -1136,6 +1143,61 @@ def build_metric_labels(metrics: list[TradeMetrics]) -> dict[int, str]:
     return labels
 
 
+def max_runup_pct(ticks: list[EntryTick]) -> Optional[float]:
+    prices = [tick.price for tick in ticks if tick.price > 0]
+    if not prices:
+        return None
+    return pct_change(prices[0], max(prices))
+
+
+def max_drawdown_pct(ticks: list[EntryTick]) -> Optional[float]:
+    prices = [tick.price for tick in ticks if tick.price > 0]
+    if len(prices) < 2:
+        return None
+    peak = prices[0]
+    max_drawdown = 0.0
+    for price in prices:
+        peak = max(peak, price)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, ((peak - price) / peak) * 100)
+    return max_drawdown
+
+
+def first_momentum_entry(ticks: list[EntryTick], trigger_pct: float) -> Optional[tuple[int, EntryTick]]:
+    if not ticks or ticks[0].price <= 0:
+        return None
+    first_price = ticks[0].price
+    for index, tick in enumerate(ticks):
+        if pct_change(first_price, tick.price) is not None and pct_change(first_price, tick.price) >= trigger_pct:
+            return index, tick
+    return None
+
+
+def simulate_momentum_tp(
+    ticks: list[EntryTick],
+    entry_index: int,
+    tp_pct: float,
+) -> tuple[bool, Optional[int], Optional[float], Optional[float]]:
+    entry_tick = ticks[entry_index]
+    if entry_tick.price <= 0:
+        return False, None, None, None
+
+    observed_returns = [
+        pct_change(entry_tick.price, tick.price)
+        for tick in ticks[entry_index:]
+        if tick.price > 0
+    ]
+    clean_returns = [value for value in observed_returns if value is not None]
+    if not clean_returns:
+        return False, None, None, None
+
+    for tick in ticks[entry_index:]:
+        current_return = pct_change(entry_tick.price, tick.price)
+        if current_return is not None and current_return >= tp_pct:
+            return True, seconds_between(entry_tick.timestamp, tick.timestamp), max(clean_returns), clean_returns[-1]
+    return False, None, max(clean_returns), clean_returns[-1]
+
+
 def write_advanced_report(
     primary_log: Path | list[Path],
     output_path: Path,
@@ -1240,12 +1302,13 @@ def write_advanced_report(
         item for item in primary.values()
         if item.opened_at or item.position_ticks_count or item.final_pnl is not None
     ]
-    if position_items:
-        for item in sorted(position_items, key=lambda metric: metric.max_pnl if metric.max_pnl is not None else -999, reverse=True):
+    if closed:
+        lines.append("| Token | pnl_min | pnl_max | devolucao_do_topo | pnl_final | motivo |")
+        lines.append("|---|---:|---:|---:|---:|---|")
+        for item in sorted(closed, key=lambda metric: metric.max_pnl if metric.max_pnl is not None else -999, reverse=True):
             lines.append(
-                f"- {display_name(item)}: pnl_max={fmt_pct(item.max_pnl)} | pnl_final={fmt_pct(item.final_pnl)} | "
-                f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | saida={item.exit_reason or 'n/a'} | "
-                f"duracao={fmt_duration(item.opened_at, item.sold_at)} | trailing={item.trailing_activated}"
+                f"| {display_name(item)} | {fmt_pct(item.min_pnl)} | {fmt_pct(item.max_pnl)} | "
+                f"{fmt_pct(item.pnl_giveback_from_max)} | {fmt_pct(item.final_pnl)} | {item.exit_reason or 'n/a'} |"
             )
     else:
         lines.append("- Nenhum dado de position encontrado. Use --position-log para logs desacoplados.")
@@ -1278,6 +1341,7 @@ def write_advanced_report(
         lines.append(f"### {label}")
         lines.append(
             f"- quantidade={len(items)} | pnl_final_medio={fmt_pct(average([item.final_pnl for item in items]))} | "
+            f"pnl_min_medio={fmt_pct(average([item.min_pnl for item in items]))} | "
             f"pnl_max_medio={fmt_pct(average([item.max_pnl for item in items]))} | "
             f"devolucao_media={fmt_pct(average([item.pnl_giveback_from_max for item in items]))} | "
             f"liquidez_entrada_media={fmt_num(average([item.liquidity_at_signal or item.liquidity_at_position_open for item in items]), 2)} | "
@@ -1290,14 +1354,15 @@ def write_advanced_report(
         label: [item for item in closed if result_group(item) == label]
         for label in ("BIG_WINNER", "WINNER", "LOSER_RECUPERAVEL", "LOSER_IRRECUPERAVEL")
     }
-    lines.append("| Grupo | n | avg | median | % <20 ticks | % >60 ticks | % >100 ticks |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    lines.append("| Grupo | n | avg | median | pnl_min_avg | % <20 ticks | % >60 ticks | % >100 ticks |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     for label, items in grouped_closed.items():
         ticks = [item.ticks_before_signal for item in items if item.ticks_before_signal is not None]
         total = len(ticks)
         lines.append(
             f"| {label} | {len(items)} | {fmt_num(mean(ticks) if ticks else None, 2)} | "
             f"{fmt_num(median(ticks) if ticks else None, 2)} | "
+            f"{fmt_pct(average([item.min_pnl for item in items]))} | "
             f"{fmt_pct(pct_of(sum(1 for value in ticks if value < 20), total))} | "
             f"{fmt_pct(pct_of(sum(1 for value in ticks if value > 60), total))} | "
             f"{fmt_pct(pct_of(sum(1 for value in ticks if value > 100), total))} |"
@@ -1448,6 +1513,98 @@ def write_advanced_report(
         )
     if not early_items:
         lines.append("- Nenhum sinal claro de entrada precoce pelas regras de medicao.")
+
+    lines.extend(["", "## Analise Grail / Momentum Continuo"])
+    lines.append(
+        "- Simulacao retrospectiva isolada. Nao altera sinais reais, estrategia ou resultados registrados."
+    )
+    momentum_candidates = [
+        item for item in primary.values()
+        if item.monitor_ticks
+        and max_runup_pct(item.monitor_ticks) is not None
+        and (max_runup_pct(item.monitor_ticks) or 0) >= MOMENTUM_CANDIDATE_MIN_RUNUP_PCT
+    ]
+    momentum_candidates.sort(key=lambda item: max_runup_pct(item.monitor_ticks) or 0, reverse=True)
+
+    lines.extend(["", "### Parte 1 - Identificacao De Candidatos"])
+    lines.append(
+        f"- Criterio exploratorio atual: runup maximo monitorado >= {MOMENTUM_CANDIDATE_MIN_RUNUP_PCT:.0f}%."
+    )
+    if momentum_candidates:
+        lines.append("| Token | ticks | tempo_monitoramento | preco_primeiro_tick | preco_maximo | runup_pct | drawdown_max_pct | houve_sinal | resultado_final |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---|---:|")
+        for item in momentum_candidates:
+            prices = [tick.price for tick in item.monitor_ticks if tick.price > 0]
+            lines.append(
+                f"| {display_name(item)} | {len(item.monitor_ticks)} | "
+                f"{fmt_duration(item.monitor_ticks[0].timestamp, item.monitor_ticks[-1].timestamp)} | "
+                f"{fmt_num(prices[0] if prices else None, 10)} | {fmt_num(max(prices) if prices else None, 10)} | "
+                f"{fmt_pct(max_runup_pct(item.monitor_ticks))} | {fmt_pct(max_drawdown_pct(item.monitor_ticks))} | "
+                f"{'sim' if item.signal_at else 'nao'} | {fmt_pct(item.final_pnl)} |"
+            )
+    else:
+        lines.append("- Nenhum candidato encontrado nos ticks brutos disponiveis.")
+
+    lines.extend(["", "### Parte 2 - Simulacao De Entrada Por Momentum"])
+    lines.append("| Token | runup_trigger | tick_entrada | tempo_desde_primeiro_tick | preco_entrada_hipotetica |")
+    lines.append("|---|---:|---:|---:|---:|")
+    momentum_entries: list[tuple[TradeMetrics, float, int, EntryTick]] = []
+    for item in momentum_candidates:
+        for trigger in MOMENTUM_RUNUP_TRIGGERS:
+            entry = first_momentum_entry(item.monitor_ticks, trigger)
+            if entry is None:
+                continue
+            entry_index, entry_tick = entry
+            momentum_entries.append((item, trigger, entry_index, entry_tick))
+            lines.append(
+                f"| {display_name(item)} | {fmt_pct(trigger)} | {entry_index + 1} | "
+                f"{fmt_seconds(seconds_between(item.monitor_ticks[0].timestamp, entry_tick.timestamp))} | "
+                f"{fmt_num(entry_tick.price, 10)} |"
+            )
+    if not momentum_entries:
+        lines.append("| n/a | n/a | n/a | n/a | n/a |")
+
+    lines.extend(["", "### Parte 3 - Simulacao De Saida"])
+    lines.append("| Token | runup_trigger | TP | atingido | tempo_ate_TP | retorno_max_observado | retorno_final_observado |")
+    lines.append("|---|---:|---:|---|---:|---:|---:|")
+    momentum_results: list[tuple[float, float, bool, Optional[float]]] = []
+    for item, trigger, entry_index, _entry_tick in momentum_entries:
+        for tp in MOMENTUM_TP_TARGETS:
+            reached, seconds_to_tp, max_return, final_return = simulate_momentum_tp(item.monitor_ticks, entry_index, tp)
+            simulated_return = tp if reached else final_return
+            momentum_results.append((trigger, tp, reached, simulated_return))
+            lines.append(
+                f"| {display_name(item)} | {fmt_pct(trigger)} | {fmt_pct(tp)} | {'sim' if reached else 'nao'} | "
+                f"{fmt_seconds(seconds_to_tp)} | {fmt_pct(max_return)} | {fmt_pct(final_return)} |"
+            )
+    if not momentum_results:
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a |")
+
+    lines.extend(["", "### Parte 4 - Estatisticas Consolidadas"])
+    lines.append("| Runup Trigger | TP | Trades | Winrate TP | Retorno Medio Simulado |")
+    lines.append("|---:|---:|---:|---:|---:|")
+    for trigger in MOMENTUM_RUNUP_TRIGGERS:
+        for tp in MOMENTUM_TP_TARGETS:
+            results = [
+                (reached, simulated_return)
+                for result_trigger, result_tp, reached, simulated_return in momentum_results
+                if result_trigger == trigger and result_tp == tp
+            ]
+            lines.append(
+                f"| {fmt_pct(trigger)} | {fmt_pct(tp)} | {len(results)} | "
+                f"{fmt_pct(pct_of(sum(1 for reached, _return in results if reached), len(results)))} | "
+                f"{fmt_pct(average([simulated_return for _reached, simulated_return in results]))} |"
+            )
+
+    lines.extend(["", "### Campos Adicionais Para Evolucao"])
+    lines.append(
+        "- Os logs TXT atuais permitem simular preco, ticks e tempo. Para validar se a liquidez acompanha o momentum em cada tick, "
+        "preservar `liquidity_usd` no history JSONL do monitor ou incluir esse campo nas linhas TXT."
+    )
+    lines.append(
+        "- A simulacao encerra a observacao no ultimo tick disponivel do monitor. Para estudar a trajetoria apos uma entrada hipotetica "
+        "em tokens sem sinal real, seria necessario continuar registrando ticks apos o encerramento normal do monitor."
+    )
 
     lines.extend(["", "## Candidatos A Estudo Manual"])
     manual = sorted(
