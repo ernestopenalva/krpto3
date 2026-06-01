@@ -8,7 +8,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENTRY_TICK_RE = re.compile(r"^\[[^\]]+\]\s+(?P<symbol>.+?)\s+\|\s+price=")
 POSITION_TICK_RE = re.compile(r"^\[[^\]]+\]\s+\[MONITOR\]\s+(?P<symbol>.+?)\s+\|\s+price=")
 BUY_SIGNAL_RE = re.compile(r"^\[[^\]]+\]\s+\[SINAL\]\s+COMPRA SIMULADA:\s+(?P<symbol>.+?)\s+@")
-PAPER_BUY_RE = re.compile(r"^\[[^\]]+\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+(?P<symbol>.+?)\s+@")
+PAPER_BUY_RE = re.compile(
+    r"^\[[^\]]+\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
+    r"(?P<symbol>.+?)(?:\s+@|\s+\|)"
+)
 PROFIT_LOCK_RE = re.compile(r"^\[[^\]]+\]\s+\[PROFIT LOCK\]\s+(?P<symbol>.+?):")
 SELL_RE = re.compile(r"^\[[^\]]+\]\s+\[PAPER SELL\]\s+(?P<symbol>.+?)\s+@")
 

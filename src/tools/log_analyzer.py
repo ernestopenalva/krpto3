@@ -25,7 +25,11 @@ BUY_SIGNAL_RE = re.compile(
 )
 PAPER_BUY_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
-    r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?P<symbol>.+?)"
+    r"(?:\s+@\s+(?P<price>\S+)|"
+    r"\s+\|\s+signal_price=(?P<signal_price>\S+)\s+\|\s+"
+    r"execution_price=(?P<execution_price>\S+)\s+\|\s+"
+    r"open_slippage=(?P<open_slippage>[-+]?\d*\.?\d+)%)"
 )
 POSITION_TICK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[MONITOR\]\s+"
@@ -364,7 +368,7 @@ def parse_log(lines: Iterable[str]) -> list[CycleSummary]:
             signal = BuySignal(
                 timestamp=paper_buy_match.group("timestamp"),
                 symbol=paper_buy_match.group("symbol").strip(),
-                price=safe_float(paper_buy_match.group("price")),
+                price=safe_float(paper_buy_match.group("price") or paper_buy_match.group("signal_price")),
                 raw=line,
             )
             current.add_buy_signal(signal, paper=True)

@@ -1,8 +1,10 @@
 import json
+import math
 import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,6 +39,8 @@ HISTORY_DIR = OUTPUT_DIR / "history"
 BUY_SIGNALS_FILE = OUTPUT_DIR / "buy_signals.json"
 STATUS_FILE = OUTPUT_DIR / "monitor_status.json"
 PROCESSED_TOKENS_FILE = OUTPUT_DIR / "processed_tokens.json"
+SHADOW_WATCHLIST_FILE = OUTPUT_DIR / "shadow_watchlist.json"
+SHADOW_WATCHLIST_LOCK_FILE = OUTPUT_DIR / "shadow_watchlist.lock"
 WATCHLIST_FILE = Path("data/watchlist/watchlist.json")
 OPEN_POSITIONS_FILE = Path(POSITION_CFG.get("output_dir", "data/position_monitor")) / "open_positions.json"
 POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor.py"
@@ -45,6 +49,7 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
 MAX_MONITORING_MINUTES = CFG.get("max_monitoring_minutes", 15)
 MAX_MONITORED_TOKENS = CFG.get("max_monitored_tokens", 5)
+SHADOW_MONITOR_ENABLED = CFG.get("shadow_monitor_enabled", False)
 
 DECISION_WINDOW_MINUTES = CFG.get("decision_window_minutes", 5)
 MIN_TICKS_BEFORE_DECISION = CFG.get("min_ticks_before_decision", 4)
@@ -68,7 +73,6 @@ PULLBACK_RECENT_TICKS = ENTRY_CFG.get("pullback_recent_ticks", 24)
 # UTILITÁRIOS
 # =========================
 
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 def now_iso() -> str:
@@ -209,6 +213,27 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def is_valid_price(value: Any) -> bool:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(price) and price > 0
+
+
+def log_invalid_price_summary(invalid_price_ticks: Dict[str, int]) -> None:
+    total = sum(invalid_price_ticks.values())
+    print(
+        f"[INFO] invalid_price_ticks={total} | "
+        f"skipped_invalid_price_ticks={total}"
+    )
+    for token_address, count in sorted(invalid_price_ticks.items()):
+        print(
+            f"[INFO] invalid_price_token={token_address} | "
+            f"invalid_price_ticks={count} | skipped_invalid_price_ticks={count}"
+        )
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -216,6 +241,94 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+# =========================
+# EXPERIMENTO GRAIL
+# Funcionalidade temporária para coleta de dados.
+# Pode ser removida após conclusão do estudo.
+# =========================
+
+@contextmanager
+def shadow_watchlist_lock():
+    SHADOW_WATCHLIST_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + 0.5
+
+    while True:
+        try:
+            descriptor = os.open(SHADOW_WATCHLIST_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(descriptor)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - SHADOW_WATCHLIST_LOCK_FILE.stat().st_mtime > 30:
+                    SHADOW_WATCHLIST_LOCK_FILE.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.time() >= deadline:
+                raise TimeoutError("shadow watchlist ocupada")
+            time.sleep(0.01)
+
+    try:
+        yield
+    finally:
+        SHADOW_WATCHLIST_LOCK_FILE.unlink(missing_ok=True)
+
+
+def should_start_shadow_monitoring(reason: Optional[str]) -> bool:
+    if not reason:
+        return False
+
+    normalized_reason = reason.lower()
+    return (
+        "pullback fora da faixa" in normalized_reason
+        or "tempo maximo de monitoramento atingido sem sinal" in normalized_reason
+    )
+
+
+def add_to_shadow_watchlist(
+    candidate: Dict[str, Any],
+    tick: Optional[Dict[str, Any]],
+    reason: Optional[str],
+) -> None:
+    if not SHADOW_MONITOR_ENABLED or not tick or not should_start_shadow_monitoring(reason):
+        return
+
+    with shadow_watchlist_lock():
+        shadow_watchlist = load_json(SHADOW_WATCHLIST_FILE, default={})
+        if not isinstance(shadow_watchlist, dict):
+            shadow_watchlist = {}
+
+        token_address = candidate["token_address"]
+        if token_address in shadow_watchlist:
+            return
+
+        shadow_watchlist[token_address] = {
+            "token_address": token_address,
+            "symbol": candidate.get("symbol"),
+            "chain_id": candidate.get("chain_id"),
+            "pair_address": candidate.get("pair_address"),
+            "timestamp_descarte": tick["timestamp"],
+            "preco_descarte": tick["price_usd"],
+            "liquidity_descarte": tick["liquidity_usd"],
+            "buy_pressure_descarte": tick["buy_pressure"],
+            "motivo_descarte": reason,
+        }
+        save_json_atomic(SHADOW_WATCHLIST_FILE, shadow_watchlist)
+
+    print(f"[SHADOW] {candidate.get('symbol', token_address[:6])} adicionado ao monitoramento observacional.")
+
+
+def safely_add_to_shadow_watchlist(
+    candidate: Dict[str, Any],
+    tick: Optional[Dict[str, Any]],
+    reason: Optional[str],
+) -> None:
+    try:
+        add_to_shadow_watchlist(candidate, tick, reason)
+    except Exception as exc:
+        print(f"[SHADOW][ERRO] Falha ao adicionar token: {exc}")
 
 
 # =========================
@@ -281,8 +394,8 @@ def fetch_pair_snapshot(chain_id: str, pair_address: str) -> Optional[Dict[str, 
         response.raise_for_status()
         payload = response.json()
 
-        pairs = payload.get("pairs") or []
-        if not pairs:
+        pairs = payload.get("pairs") or [] if isinstance(payload, dict) else []
+        if not isinstance(pairs, list) or not pairs or not isinstance(pairs[0], dict):
             return None
 
         return pairs[0]
@@ -293,10 +406,10 @@ def fetch_pair_snapshot(chain_id: str, pair_address: str) -> Optional[Dict[str, 
 
 
 def build_tick(candidate: Dict[str, Any], pair: Dict[str, Any]) -> Dict[str, Any]:
-    txns_m5 = pair.get("txns", {}).get("m5", {})
-    volume_m5 = pair.get("volume", {}).get("m5")
-    liquidity_usd = pair.get("liquidity", {}).get("usd")
-    price_change_m5 = pair.get("priceChange", {}).get("m5")
+    txns_m5 = (pair.get("txns") or {}).get("m5") or {}
+    volume_m5 = (pair.get("volume") or {}).get("m5")
+    liquidity_usd = (pair.get("liquidity") or {}).get("usd")
+    price_change_m5 = (pair.get("priceChange") or {}).get("m5")
 
     buys = safe_int(txns_m5.get("buys"))
     sells = safe_int(txns_m5.get("sells"))
@@ -714,6 +827,8 @@ def monitor() -> None:
     print("[INFO] Modo: PAPER / sem compra real.")
 
     started_at = time.time()
+    latest_ticks = {}
+    invalid_price_ticks: Dict[str, int] = {}
 
     while True:
         elapsed_minutes = (time.time() - started_at) / 60
@@ -727,6 +842,7 @@ def monitor() -> None:
                     candidate["discard_reason"] = reason
                     update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
                     register_processed_token(candidate, "descartado_monitor", reason)
+                    safely_add_to_shadow_watchlist(candidate, latest_ticks.get(candidate["token_address"]), reason)
                     print(f"[DESCARTE] {candidate['symbol']}: {reason}")
             break
 
@@ -743,11 +859,27 @@ def monitor() -> None:
                 continue
 
             tick = build_tick(candidate, pair)
+            if not is_valid_price(tick.get("price_usd")):
+                token_address = candidate["token_address"]
+                invalid_price_ticks[token_address] = invalid_price_ticks.get(token_address, 0) + 1
+                print(
+                    f"[WARN] [INVALID PRICE] monitor token={candidate['symbol']} "
+                    f"token_address={token_address} price={tick.get('price_usd')!r} "
+                    f"invalid_price_ticks={invalid_price_ticks[token_address]} "
+                    f"skipped_invalid_price_ticks={invalid_price_ticks[token_address]}"
+                )
+                continue
+
+            latest_ticks[candidate["token_address"]] = tick
 
             history_file = HISTORY_DIR / f"{candidate['symbol']}_{candidate['token_address'][:8]}.jsonl"
             append_jsonl(history_file, tick)
 
-            history = read_jsonl(history_file)
+            history = [
+                item
+                for item in read_jsonl(history_file)
+                if is_valid_price(item.get("price_usd"))
+            ]
             evaluation = evaluate_entry_signal(history)
 
             print(
@@ -763,6 +895,7 @@ def monitor() -> None:
                 candidate["discard_reason"] = evaluation.get("reason")
                 update_watchlist_status(candidate["token_address"], "descartado_monitor", candidate["discard_reason"])
                 register_processed_token(candidate, "descartado_monitor", candidate["discard_reason"])
+                safely_add_to_shadow_watchlist(candidate, tick, candidate["discard_reason"])
                 print(f"[DESCARTE] {candidate['symbol']}: {candidate['discard_reason']}")
                 continue
 
@@ -790,6 +923,9 @@ def monitor() -> None:
         save_json(STATUS_FILE, {
             "updated_at": now_iso(),
             "mode": "paper",
+            "invalid_price_ticks": sum(invalid_price_ticks.values()),
+            "skipped_invalid_price_ticks": sum(invalid_price_ticks.values()),
+            "invalid_price_ticks_by_token": invalid_price_ticks,
             "candidates": candidates
         })
 
@@ -804,9 +940,13 @@ def monitor() -> None:
     save_json(STATUS_FILE, {
         "updated_at": now_iso(),
         "mode": "paper",
+        "invalid_price_ticks": sum(invalid_price_ticks.values()),
+        "skipped_invalid_price_ticks": sum(invalid_price_ticks.values()),
+        "invalid_price_ticks_by_token": invalid_price_ticks,
         "candidates": candidates
     })
 
+    log_invalid_price_summary(invalid_price_ticks)
     print("[INFO] Monitoramento encerrado.")
 
 

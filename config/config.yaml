@@ -51,9 +51,11 @@ token_monitor_buy:
   poll_interval_seconds: 5
   max_monitoring_minutes: 15
   max_monitored_tokens: 5
+  shadow_monitor_enabled: true
+  shadow_monitor_minutes: 60
 
   decision_window_minutes: 5
-  min_ticks_before_decision: 12
+  min_ticks_before_decision: 24
 
   entry:
     min_pullback_pct: 2.0

@@ -12,6 +12,7 @@ DEFAULT_MAX_MONITORING_SECONDS = 15 * 60
 MOMENTUM_CANDIDATE_MIN_RUNUP_PCT = 30.0
 MOMENTUM_RUNUP_TRIGGERS = (10.0, 20.0, 30.0, 50.0)
 MOMENTUM_TP_TARGETS = (0.5, 1.0, 2.0, 3.0, 5.0)
+SHADOW_REAL_GRAIL_MIN_RUNUP_PCT = 20.0
 
 
 ENTRY_TICK_RE = re.compile(
@@ -28,7 +29,11 @@ BUY_SIGNAL_RE = re.compile(
 )
 PAPER_BUY_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
-    r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?P<symbol>.+?)"
+    r"(?:\s+@\s+(?P<price>\S+)|"
+    r"\s+\|\s+signal_price=(?P<signal_price>\S+)\s+\|\s+"
+    r"execution_price=(?P<execution_price>\S+)\s+\|\s+"
+    r"open_slippage=(?P<open_slippage>[-+]?\d*\.?\d+)%)"
 )
 POSITION_TICK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[MONITOR\]\s+"
@@ -39,6 +44,9 @@ POSITION_TICK_RE = re.compile(
     r"stop=(?P<stop>\S+)\s+\|\s+"
     r"trailing=(?P<trailing>\S+)\s+\|\s+"
     r"bp_persist=(?P<bp_persist>\d+)"
+    r"(?:\s+\|\s+liq=(?P<liquidity>\S+)\s+\|\s+"
+    r"vol=(?P<volume>\S+)\s+\|\s+"
+    r"bp=(?P<buy_pressure>\S+))?"
 )
 PROFIT_LOCK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PROFIT LOCK\]\s+(?P<symbol>.+?):"
@@ -58,6 +66,7 @@ TOKEN_ADDRESS_RE = re.compile(
 HEALTH_RE = re.compile(r"health=([0-9.]+)")
 PULLBACK_RE = re.compile(r"pullback(?: fora da faixa)?[:=]\s*([0-9.]+)%", re.IGNORECASE)
 ANALYSIS_TOKEN_RE = re.compile(r"^-\s+(?P<symbol>.+?):\s+(?P<body>.*)$")
+INVALID_PRICE_RE = re.compile(r"\[INVALID PRICE\].*\b(?P<scope>monitor|position)\b", re.IGNORECASE)
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -67,6 +76,15 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def optional_float(value: object) -> Optional[float]:
+    try:
+        if value in (None, "None", "n/a"):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_dt(value: str) -> Optional[datetime]:
@@ -317,12 +335,33 @@ class PositionTick:
     trailing: Optional[float]
     bp_persist: int
     liquidity_usd: Optional[float] = None
+    volume_m5: Optional[float] = None
+    buy_pressure: Optional[float] = None
 
 
 @dataclass
 class LiquidityPoint:
     timestamp: str
     liquidity_usd: float
+
+
+@dataclass
+class ShadowResult:
+    token_address: str
+    symbol: str
+    timestamp_inicio: str
+    timestamp_fim: str
+    preco_descarte: float
+    preco_max_pos_descarte: float
+    preco_min_pos_descarte: float
+    runup_pos_descarte_pct: float
+    drawdown_pos_descarte_pct: float
+    liquidity_descarte: float
+    liquidity_max: float
+    liquidity_min: float
+    tempo_ate_topo: float
+    motivo_descarte: str
+    runup_ate_descarte_pct: Optional[float] = None
 
 
 @dataclass
@@ -335,6 +374,8 @@ class TradeMetrics:
     signal_at: Optional[str] = None
     first_price: Optional[float] = None
     signal_price: Optional[float] = None
+    execution_price: Optional[float] = None
+    open_slippage_pct: Optional[float] = None
     entry_reason: Optional[str] = None
     opened_at: Optional[str] = None
     sold_at: Optional[str] = None
@@ -397,6 +438,7 @@ class TradeMetrics:
     possible_liquidity_collapse: bool = False
     warnings: list[str] = field(default_factory=list)
     monitor_ticks: list[EntryTick] = field(default_factory=list)
+    position_ticks: list[PositionTick] = field(default_factory=list)
 
 
 @dataclass
@@ -409,6 +451,8 @@ class TokenState:
     position_ticks: list[PositionTick] = field(default_factory=list)
     signal_at: Optional[str] = None
     signal_price: Optional[float] = None
+    execution_price: Optional[float] = None
+    open_slippage_pct: Optional[float] = None
     entry_reason: Optional[str] = None
     opened_at: Optional[str] = None
     sold_at: Optional[str] = None
@@ -479,6 +523,8 @@ class TokenState:
             signal_at=self.signal_at,
             first_price=first_tick.price if first_tick else None,
             signal_price=self.signal_price,
+            execution_price=self.execution_price,
+            open_slippage_pct=self.open_slippage_pct,
             entry_reason=self.entry_reason,
             opened_at=self.opened_at,
             sold_at=self.sold_at,
@@ -541,6 +587,7 @@ class TokenState:
             possible_liquidity_collapse=possible_liquidity_collapse,
             warnings=warnings,
             monitor_ticks=list(self.ticks),
+            position_ticks=list(self.position_ticks),
         )
         return metrics
 
@@ -664,6 +711,68 @@ def attach_history_liquidity(
     for state in states_by_symbol.values():
         state.entry_liquidity_points.sort(key=lambda point: point.timestamp)
         state.position_liquidity_points.sort(key=lambda point: point.timestamp)
+
+
+def load_shadow_results(log_path: Path) -> tuple[list[ShadowResult], int]:
+    project_root = infer_project_root(log_path)
+    shadow_results_path = project_root / "data" / "token_monitor" / "shadow_results.jsonl"
+    shadow_watchlist_path = project_root / "data" / "token_monitor" / "shadow_watchlist.json"
+    monitor_history_dir = project_root / "data" / "token_monitor" / "history"
+
+    active_shadow_count = 0
+    try:
+        shadow_watchlist = json.loads(shadow_watchlist_path.read_text(encoding="utf-8"))
+        if isinstance(shadow_watchlist, dict):
+            active_shadow_count = len(shadow_watchlist)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    pre_discard_prices: dict[str, list[tuple[str, float]]] = {}
+    if monitor_history_dir.exists():
+        for history_path in monitor_history_dir.glob("*.jsonl"):
+            for row in history_points_from_file(history_path):
+                token_address = str(row.get("token_address") or "")
+                timestamp = str(row.get("timestamp") or "")
+                price = safe_float(row.get("price_usd"))
+                if token_address and timestamp and price > 0:
+                    pre_discard_prices.setdefault(token_address, []).append((timestamp, price))
+
+    deduplicated: dict[tuple[str, str], ShadowResult] = {}
+    for row in history_points_from_file(shadow_results_path):
+        token_address = str(row.get("token_address") or "")
+        timestamp_inicio = str(row.get("timestamp_inicio") or "")
+        if not token_address or not timestamp_inicio:
+            continue
+
+        prices = [
+            price
+            for timestamp, price in pre_discard_prices.get(token_address, [])
+            if timestamp <= timestamp_inicio
+        ]
+        discard_price = safe_float(row.get("preco_descarte"))
+        if discard_price > 0:
+            prices.append(discard_price)
+
+        result = ShadowResult(
+            token_address=token_address,
+            symbol=str(row.get("symbol") or token_address[:8]),
+            timestamp_inicio=timestamp_inicio,
+            timestamp_fim=str(row.get("timestamp_fim") or ""),
+            preco_descarte=discard_price,
+            preco_max_pos_descarte=safe_float(row.get("preco_max_pos_descarte")),
+            preco_min_pos_descarte=safe_float(row.get("preco_min_pos_descarte")),
+            runup_pos_descarte_pct=safe_float(row.get("runup_pos_descarte_pct")),
+            drawdown_pos_descarte_pct=safe_float(row.get("drawdown_pos_descarte_pct")),
+            liquidity_descarte=safe_float(row.get("liquidity_descarte")),
+            liquidity_max=safe_float(row.get("liquidity_max")),
+            liquidity_min=safe_float(row.get("liquidity_min")),
+            tempo_ate_topo=safe_float(row.get("tempo_ate_topo")),
+            motivo_descarte=str(row.get("motivo_descarte") or "n/a"),
+            runup_ate_descarte_pct=pct_change(prices[0], max(prices)) if prices else None,
+        )
+        deduplicated[(token_address, timestamp_inicio)] = result
+
+    return list(deduplicated.values()), active_shadow_count
 
 
 def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
@@ -811,6 +920,13 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
             symbol = paper_buy_match.group("symbol").strip()
             state = state_for_trade(symbol)
             state.opened_at = paper_buy_match.group("timestamp")
+            signal_price = optional_float(paper_buy_match.group("signal_price"))
+            execution_price = optional_float(paper_buy_match.group("execution_price"))
+            open_slippage_pct = optional_float(paper_buy_match.group("open_slippage"))
+            if signal_price is not None:
+                state.signal_price = signal_price
+            state.execution_price = execution_price
+            state.open_slippage_pct = open_slippage_pct
             active_trade_by_symbol[normalize_symbol(symbol)] = state
             continue
 
@@ -826,6 +942,9 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
                 stop=safe_float(position_match.group("stop")),
                 trailing=None if trailing_raw == "None" else safe_float(trailing_raw),
                 bp_persist=int(position_match.group("bp_persist")),
+                liquidity_usd=optional_float(position_match.group("liquidity")),
+                volume_m5=optional_float(position_match.group("volume")),
+                buy_pressure=optional_float(position_match.group("buy_pressure")),
             )
             state = state_for_trade(symbol)
             state.position_ticks.append(tick)
@@ -891,6 +1010,9 @@ def merge_position_metrics(primary: dict[str, TradeMetrics], position_metrics: d
             continue
 
         target.opened_at = position.opened_at or target.opened_at
+        target.signal_price = position.signal_price if position.signal_price is not None else target.signal_price
+        target.execution_price = position.execution_price if position.execution_price is not None else target.execution_price
+        target.open_slippage_pct = position.open_slippage_pct if position.open_slippage_pct is not None else target.open_slippage_pct
         target.sold_at = position.sold_at or target.sold_at
         target.exit_reason = position.exit_reason or target.exit_reason
         target.final_pnl = position.final_pnl if position.final_pnl is not None else target.final_pnl
@@ -906,6 +1028,7 @@ def merge_position_metrics(primary: dict[str, TradeMetrics], position_metrics: d
         target.breakeven_activated = target.breakeven_activated or position.breakeven_activated
         target.trailing_activated = target.trailing_activated or position.trailing_activated
         target.max_price_after_entry = position.max_price_after_entry or target.max_price_after_entry
+        target.position_ticks = position.position_ticks or target.position_ticks
 
 
 def merge_metric_sets(metric_sets: list[dict[str, TradeMetrics]]) -> dict[str, TradeMetrics]:
@@ -932,9 +1055,37 @@ def ensure_path_list(value: Optional[Path | list[Path]]) -> list[Path]:
     return [value]
 
 
+def count_invalid_price_ticks(log_paths: list[Path], scope: str) -> int:
+    total = 0
+    for path in log_paths:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        total += sum(
+            1
+            for line in lines
+            if (match := INVALID_PRICE_RE.search(line)) and match.group("scope").lower() == scope
+        )
+    return total
+
+
 def average(values: list[Optional[float]]) -> Optional[float]:
     clean = [value for value in values if value is not None]
     return mean(clean) if clean else None
+
+
+def first_five_position_metrics(item: TradeMetrics) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    ticks = [tick for tick in item.position_ticks if tick.liquidity_usd is not None][:5]
+    if len(ticks) < 5:
+        return None, None, None, None, None
+
+    liquidity_p0 = ticks[0].liquidity_usd
+    liquidity_p4 = ticks[4].liquidity_usd
+    liquidity_delta = pct_change(liquidity_p0, liquidity_p4)
+    volume_avg = average([tick.volume_m5 for tick in ticks])
+    buy_pressure_avg = average([tick.buy_pressure for tick in ticks])
+    return liquidity_p0, liquidity_p4, liquidity_delta, volume_avg, buy_pressure_avg
 
 
 def parse_analysis_value(body: str, field_name: str) -> Optional[str]:
@@ -1058,6 +1209,9 @@ def parse_analysis_metrics(path: Path) -> dict[str, TradeMetrics]:
             metric.breakeven_activated = parse_analysis_bool(body, "breakeven")
             metric.trailing_activated = parse_analysis_bool(body, "trailing")
             metric.max_price_after_entry = parse_analysis_float(body, "maior_preco_pos_entrada")
+            metric.signal_price = parse_analysis_float(body, "signal_price") or metric.signal_price
+            metric.execution_price = parse_analysis_float(body, "execution_price")
+            metric.open_slippage_pct = parse_analysis_float(body, "open_slippage_pct")
             if metric.max_pnl is not None and metric.max_pnl > 0 and metric.final_pnl is not None:
                 metric.pnl_giveback_from_max = metric.max_pnl - metric.final_pnl
             continue
@@ -1198,6 +1352,56 @@ def simulate_momentum_tp(
     return False, None, max(clean_returns), clean_returns[-1]
 
 
+def append_shadow_grail_analysis(lines: list[str], results: list[ShadowResult], active_count: int) -> None:
+    real_grails = [
+        item for item in results
+        if item.runup_pos_descarte_pct >= SHADOW_REAL_GRAIL_MIN_RUNUP_PCT
+    ]
+    false_grails = [
+        item for item in results
+        if item.runup_pos_descarte_pct < SHADOW_REAL_GRAIL_MIN_RUNUP_PCT
+    ]
+
+    lines.extend(["", "### Shadow Summary"])
+    lines.append(
+        f"- Total observados: {len(results)} | shadows ainda ativos: {active_count}"
+    )
+    lines.append(f"- Criterio exploratorio Grail real: runup pos-descarte >= {SHADOW_REAL_GRAIL_MIN_RUNUP_PCT:.0f}%.")
+    lines.append(f"- Runup > 20%: {sum(1 for item in results if item.runup_pos_descarte_pct > 20)}")
+    lines.append(f"- Runup > 50%: {sum(1 for item in results if item.runup_pos_descarte_pct > 50)}")
+    lines.append(f"- Runup > 100%: {sum(1 for item in results if item.runup_pos_descarte_pct > 100)}")
+    lines.append(f"- Runup > 200%: {sum(1 for item in results if item.runup_pos_descarte_pct > 200)}")
+    lines.append(f"- Colapso > 50%: {sum(1 for item in results if item.drawdown_pos_descarte_pct > 50)}")
+    lines.append(f"- Colapso > 90%: {sum(1 for item in results if item.drawdown_pos_descarte_pct > 90)}")
+
+    lines.extend(["", "### Top Shadow Winners"])
+    lines.append("| Token | runup_pos_descarte | drawdown_pos_descarte | liquidity_descarte | tempo_ate_topo | motivo_descarte |")
+    lines.append("|---|---:|---:|---:|---:|---|")
+    for item in sorted(results, key=lambda result: result.runup_pos_descarte_pct, reverse=True)[:15]:
+        lines.append(
+            f"| {item.symbol} | {fmt_pct(item.runup_pos_descarte_pct)} | "
+            f"{fmt_pct(item.drawdown_pos_descarte_pct)} | {fmt_num(item.liquidity_descarte, 2)} | "
+            f"{fmt_seconds(item.tempo_ate_topo)} | {item.motivo_descarte} |"
+        )
+    if not results:
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a |")
+
+    lines.extend(["", "### Grails Reais Vs Falsos Grails"])
+    lines.append(
+        "- `runup_ate_descarte` usa o primeiro preco observado no monitor principal ate o maior preco observado antes do descarte."
+    )
+    lines.append("| Grupo | n | runup_ate_descarte_avg | liquidity_descarte_avg | liquidity_max_pos_avg | liquidity_min_pos_avg | tempo_ate_topo_avg |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for label, items in (("GRAILS_REAIS", real_grails), ("FALSOS_GRAILS", false_grails)):
+        lines.append(
+            f"| {label} | {len(items)} | {fmt_pct(average([item.runup_ate_descarte_pct for item in items]))} | "
+            f"{fmt_num(average([item.liquidity_descarte for item in items]), 2)} | "
+            f"{fmt_num(average([item.liquidity_max for item in items]), 2)} | "
+            f"{fmt_num(average([item.liquidity_min for item in items]), 2)} | "
+            f"{fmt_seconds(average([item.tempo_ate_topo for item in items]))} |"
+        )
+
+
 def write_advanced_report(
     primary_log: Path | list[Path],
     output_path: Path,
@@ -1208,12 +1412,19 @@ def write_advanced_report(
     position_logs = ensure_path_list(position_log)
 
     primary = merge_metric_sets([parse_log_metrics(log_path) for log_path in primary_logs])
+    shadow_results, active_shadow_count = load_shadow_results(primary_logs[0])
     for log_path in position_logs:
         merge_position_metrics(primary, parse_log_metrics(log_path))
     closed = [item for item in primary.values() if item.final_pnl is not None]
     winners = [item for item in closed if (item.final_pnl or 0) > 0]
     losers = [item for item in closed if (item.final_pnl or 0) <= 0]
     labels = build_metric_labels(list(primary.values()))
+    invalid_monitor_ticks = count_invalid_price_ticks(primary_logs, "monitor")
+    invalid_position_ticks = count_invalid_price_ticks(position_logs, "position")
+    slippage_items = [
+        item for item in primary.values()
+        if item.open_slippage_pct is not None
+    ]
 
     def display_name(item: TradeMetrics) -> str:
         return labels.get(id(item), item.symbol)
@@ -1232,6 +1443,19 @@ def write_advanced_report(
         f"- Health max medio: {fmt_num(average([item.health_max_before_signal for item in primary.values()]), 2)}",
         f"- Buy pressure medio antes do sinal: {fmt_num(average([item.buy_pressure_avg for item in primary.values()]), 2)}",
         f"- Tempo ate sinal medio: {avg_time_to_signal(list(primary.values()))}",
+        "",
+        "=== AUDITORIA DE PREÇO ===",
+        f"- Ticks invalidos no monitor: {invalid_monitor_ticks}",
+        f"- Ticks invalidos no position: {invalid_position_ticks}",
+        f"- Media open_slippage_pct: {fmt_pct(average([item.open_slippage_pct for item in slippage_items]))}",
+        f"- Maior open_slippage_pct positivo: {fmt_pct(max((item.open_slippage_pct for item in slippage_items if (item.open_slippage_pct or 0) > 0), default=None))}",
+        f"- Maior open_slippage_pct negativo: {fmt_pct(min((item.open_slippage_pct for item in slippage_items if (item.open_slippage_pct or 0) < 0), default=None))}",
+        "- Top tokens por open_slippage_pct absoluto:",
+        *[
+            f"  - {display_name(item)}: open_slippage_pct={fmt_pct(item.open_slippage_pct)}"
+            for item in sorted(slippage_items, key=lambda metric: abs(metric.open_slippage_pct or 0), reverse=True)[:10]
+        ],
+        *([] if slippage_items else ["  - n/a"]),
         "",
         "## Metricas Por Token/Sinal",
     ]
@@ -1294,7 +1518,9 @@ def write_advanced_report(
                 f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
                 f"ticks_posicao={item.position_ticks_count} | bp_persist_saida={item.bp_persist_exit if item.bp_persist_exit is not None else 'n/a'} | "
                 f"breakeven={item.breakeven_activated} | trailing={item.trailing_activated} | "
-                f"maior_preco_pos_entrada={fmt_num(item.max_price_after_entry, 10)}"
+                f"maior_preco_pos_entrada={fmt_num(item.max_price_after_entry, 10)} | "
+                f"signal_price={fmt_num(item.signal_price, 10)} | execution_price={fmt_num(item.execution_price, 10)} | "
+                f"open_slippage_pct={fmt_pct(item.open_slippage_pct)}"
             )
 
     lines.extend(["", "## Diagnostico Position: Topo Vs Saida"])
@@ -1451,6 +1677,76 @@ def write_advanced_report(
             f"drenagem_liquidez_media={fmt_pct(average([item.liquidity_drop_pct_during_position for item in items]))}"
         )
 
+    lines.extend(["", "## Liquidez E Volume Nos Primeiros Ticks Da Posicao"])
+    first_ticks_metrics = {
+        id(item): first_five_position_metrics(item)
+        for item in closed
+    }
+    first_ticks_groups = (
+        ("BIG WINNERS", [item for item in closed if result_group(item) == "BIG_WINNER"]),
+        ("WINNERS", [item for item in closed if result_group(item) == "WINNER"]),
+        ("LOSERS RECUPERAVEIS", [item for item in closed if result_group(item) == "LOSER_RECUPERAVEL"]),
+        ("LOSERS IRRECUPERAVEIS", [item for item in closed if result_group(item) == "LOSER_IRRECUPERAVEL"]),
+    )
+    lines.append("| Grupo | liq_delta_avg | crescendo | drenando | vol_avg | bp_avg |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for label, items in first_ticks_groups:
+        metrics = [first_ticks_metrics[id(item)] for item in items]
+        deltas = [metric[2] for metric in metrics if metric[2] is not None]
+        lines.append(
+            f"| {label} | {fmt_pct(average(deltas))} | "
+            f"{sum(1 for delta in deltas if delta > 0)} | {sum(1 for delta in deltas if delta < 0)} | "
+            f"{fmt_num(average([metric[3] for metric in metrics]), 2)} | "
+            f"{fmt_num(average([metric[4] for metric in metrics]), 4)} |"
+        )
+
+    def append_first_ticks_table(title: str, items: list[TradeMetrics], reverse: bool) -> None:
+        lines.extend(["", f"### {title}"])
+        lines.append("| Token | liq_p0 | liq_p4 | liq_delta | vol_avg | bp_avg | pnl_final |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                first_ticks_metrics[id(item)][2] is None,
+                -(first_ticks_metrics[id(item)][2] or 0) if reverse else (first_ticks_metrics[id(item)][2] or 0),
+            ),
+        )
+        for item in ordered:
+            liquidity_p0, liquidity_p4, liquidity_delta, volume_avg, buy_pressure_avg = first_ticks_metrics[id(item)]
+            lines.append(
+                f"| {display_name(item)} | {fmt_num(liquidity_p0, 2)} | {fmt_num(liquidity_p4, 2)} | "
+                f"{fmt_pct(liquidity_delta)} | {fmt_num(volume_avg, 2)} | {fmt_num(buy_pressure_avg, 4)} | "
+                f"{fmt_pct(item.final_pnl)} |"
+            )
+
+    irrecoverable = [item for item in closed if result_group(item) == "LOSER_IRRECUPERAVEL"]
+    big_winners = [item for item in closed if result_group(item) == "BIG_WINNER"]
+    append_first_ticks_table("Losers Irrecuperaveis", irrecoverable, reverse=False)
+    append_first_ticks_table("Big Winners", big_winners, reverse=True)
+
+    winner_deltas = [
+        first_ticks_metrics[id(item)][2]
+        for item in closed
+        if result_group(item) in {"BIG_WINNER", "WINNER"}
+        and first_ticks_metrics[id(item)][2] is not None
+    ]
+    irrecoverable_deltas = [
+        first_ticks_metrics[id(item)][2]
+        for item in irrecoverable
+        if first_ticks_metrics[id(item)][2] is not None
+    ]
+    avg_winner_delta = average(winner_deltas)
+    avg_irrecoverable_delta = average(irrecoverable_deltas)
+    lines.extend(["", "### Conclusao Automatica"])
+    if (
+        avg_winner_delta is not None
+        and avg_irrecoverable_delta is not None
+        and avg_irrecoverable_delta < avg_winner_delta - 5
+    ):
+        lines.append("- Padrao confirmado: irrecuperaveis drenam liquidez mais rapido.")
+    else:
+        lines.append("- Padrao nao confirmado com a amostra atual.")
+
     collapse_events = [
         item for item in closed
         if item.possible_liquidity_collapse
@@ -1518,6 +1814,7 @@ def write_advanced_report(
     lines.append(
         "- Simulacao retrospectiva isolada. Nao altera sinais reais, estrategia ou resultados registrados."
     )
+    append_shadow_grail_analysis(lines, shadow_results, active_shadow_count)
     momentum_candidates = [
         item for item in primary.values()
         if item.monitor_ticks
@@ -1598,12 +1895,10 @@ def write_advanced_report(
 
     lines.extend(["", "### Campos Adicionais Para Evolucao"])
     lines.append(
-        "- Os logs TXT atuais permitem simular preco, ticks e tempo. Para validar se a liquidez acompanha o momentum em cada tick, "
-        "preservar `liquidity_usd` no history JSONL do monitor ou incluir esse campo nas linhas TXT."
+        "- O Shadow Monitor preserva preco, liquidez, volume e buy pressure apos o descarte sem interferir no fluxo principal."
     )
     lines.append(
-        "- A simulacao encerra a observacao no ultimo tick disponivel do monitor. Para estudar a trajetoria apos uma entrada hipotetica "
-        "em tokens sem sinal real, seria necessario continuar registrando ticks apos o encerramento normal do monitor."
+        "- As estatisticas Shadow consideram somente janelas concluidas. Tokens ainda ativos aparecem separados no resumo."
     )
 
     lines.extend(["", "## Candidatos A Estudo Manual"])

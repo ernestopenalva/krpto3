@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -57,6 +58,9 @@ class OpenPosition:
     highest_price: float
     highest_price_time: str
     pair_address: Optional[str] = None
+    signal_price: Optional[float] = None
+    execution_price: Optional[float] = None
+    open_slippage_pct: Optional[float] = None
     breakeven_activated: bool = False
     stop_price: float = 0.0
     trailing_stop_price: Optional[float] = None
@@ -85,6 +89,9 @@ class ClosedTrade:
     max_profit_pct: float
     exit_reason: str
     breakeven_activated: bool
+    signal_price: Optional[float] = None
+    execution_price: Optional[float] = None
+    open_slippage_pct: Optional[float] = None
     last_tick: Dict[str, Any] = field(default_factory=dict)
     source_signal: Dict[str, Any] = field(default_factory=dict)
 
@@ -108,6 +115,7 @@ class PositionMonitor:
         self.trailing_stop_pct = float(position_cfg.get("trailing_stop_pct", 6.0))
         self.profit_lock_steps = position_cfg.get("profit_lock_steps", [])
         self.staleness_threshold_pct = float(position_cfg.get("staleness_threshold_pct", 2.0))
+        self.collect_metrics = position_cfg.get("collect_metrics", {})
 
         self.fake_amount_usd = float(sizing_cfg.get("amount_usd", 10.0))
 
@@ -190,6 +198,30 @@ class PositionMonitor:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _optional_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_metric(value: Any) -> str:
+        return "n/a" if value is None else str(value)
+
+    def _metric_enabled(self, name: str) -> bool:
+        return bool(self.collect_metrics.get(name, True))
+
+    @staticmethod
+    def _is_valid_price(value: Any) -> bool:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(price) and price > 0
 
     def _load_open_positions(self) -> List[OpenPosition]:
         raw_positions = self._load_json(self.open_positions_file, [])
@@ -295,14 +327,14 @@ class PositionMonitor:
             return False
 
         entry_price = self._extract_entry_price(signal)
-        if entry_price <= 0:
+        if not self._is_valid_price(entry_price):
             self._log_ignored_signal(signal, "invalid_entry_price")
             self._log(f"[{LOG_WARN}] Sinal ignorado para {token_address}: preco de entrada invalido")
             return False
 
         current_price = self.fetch_current_price(signal)
         symbol = signal.get("symbol") or signal.get("baseToken", {}).get("symbol") or token_address[:8]
-        if current_price is None or current_price <= 0:
+        if not self._is_valid_price(current_price):
             self._log_ignored_signal(signal, "current_price_unavailable")
             self._log(f"[{LOG_WARN}] {symbol}: preco atual indisponivel antes da abertura")
             return False
@@ -320,6 +352,12 @@ class PositionMonitor:
         entry_time = signal.get("timestamp") or signal.get("signal_time") or signal.get("entry_time") or self._now_iso()
         token_quantity_fake = self.fake_amount_usd / entry_price
         stop_price = entry_price * (1 - self.stop_loss_pct / 100)
+        audited_signal = {
+            **signal,
+            "signal_price": entry_price,
+            "execution_price": current_price,
+            "open_slippage_pct": variation,
+        }
         position = OpenPosition(
             token_address=token_address,
             chain_id=chain_id,
@@ -331,8 +369,11 @@ class PositionMonitor:
             highest_price=entry_price,
             highest_price_time=entry_time,
             pair_address=signal.get("pair_address") or signal.get("pairAddress"),
+            signal_price=entry_price,
+            execution_price=current_price,
+            open_slippage_pct=variation,
             stop_price=stop_price,
-            source_signal=signal,
+            source_signal=audited_signal,
         )
 
         with self._open_positions_lock():
@@ -354,7 +395,11 @@ class PositionMonitor:
             positions.append(position)
             self._save_open_positions(positions)
 
-        self._log(f"[{LOG_PAPER_BUY}] posiÃ§Ã£o aberta: {symbol} @ {entry_price}")
+        self._log(
+            f"[{LOG_PAPER_BUY}] posição aberta: {symbol} | "
+            f"signal_price={entry_price} | execution_price={current_price} | "
+            f"open_slippage={variation:.2f}%"
+        )
         return True
 
     def import_new_signals(self) -> None:
@@ -384,7 +429,7 @@ class PositionMonitor:
                 continue
 
             entry_price = self._extract_entry_price(signal)
-            if entry_price <= 0:
+            if not self._is_valid_price(entry_price):
                 self._log_ignored_signal(signal, "invalid_entry_price")
                 continue
 
@@ -442,7 +487,7 @@ class PositionMonitor:
                 response = requests.get(url, timeout=15)
                 response.raise_for_status()
                 payload = response.json()
-                pairs = payload.get("pairs") or []
+                pairs = payload.get("pairs") or [] if isinstance(payload, dict) else []
             else:
                 url = DEXSCREENER_TOKEN_PAIRS_URL.format(
                     chain_id=position.chain_id,
@@ -455,29 +500,56 @@ class PositionMonitor:
             self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
             return None
 
-        if not isinstance(pairs, list) or not pairs:
+        if not isinstance(pairs, list) or not pairs or not all(isinstance(pair, dict) for pair in pairs):
             self._log(f"[{LOG_WARN}] Sem pares Dexscreener para {position.symbol}")
             return None
 
         pair = pairs[0] if position.pair_address else self._choose_best_pair(pairs)
-        price = self._safe_float(pair.get("priceUsd"))
-        if price <= 0:
+        raw_price = pair.get("priceUsd")
+        price = self._safe_float(raw_price)
+        if not self._is_valid_price(price):
+            self._log(
+                f"[{LOG_WARN}] [INVALID PRICE] position token={position.symbol} "
+                f"price={raw_price!r} skipped_invalid_price_ticks=1"
+            )
+            self._write_position_tick(
+                position,
+                {
+                    "timestamp": self._now_iso(),
+                    "symbol": position.symbol,
+                    "token_address": position.token_address,
+                    "price": raw_price,
+                    "pair_address": pair.get("pairAddress"),
+                },
+                audit_reason="invalid_market_price",
+            )
             self._log(f"[{LOG_WARN}] Preço inválido para {position.symbol}")
             return None
 
-        txns_m5 = pair.get("txns", {}).get("m5", {}) or {}
+        txns_m5 = (pair.get("txns") or {}).get("m5") or {}
         buys_m5 = self._safe_float(txns_m5.get("buys"))
         sells_m5 = self._safe_float(txns_m5.get("sells"))
         total_txns_m5 = buys_m5 + sells_m5
-        buy_pressure = buys_m5 / total_txns_m5 if total_txns_m5 > 0 else 0.0
+        has_txns_m5 = "buys" in txns_m5 or "sells" in txns_m5
+        buy_pressure = buys_m5 / total_txns_m5 if total_txns_m5 > 0 else (0.0 if has_txns_m5 else None)
+        if not self._metric_enabled("buy_pressure"):
+            buy_pressure = None
 
         tick = {
             "timestamp": self._now_iso(),
             "symbol": position.symbol,
             "token_address": position.token_address,
             "price": price,
-            "liquidity_usd": self._safe_float((pair.get("liquidity") or {}).get("usd")),
-            "volume_m5": self._safe_float((pair.get("volume") or {}).get("m5")),
+            "liquidity_usd": (
+                self._optional_float((pair.get("liquidity") or {}).get("usd"))
+                if self._metric_enabled("liquidity_usd")
+                else None
+            ),
+            "volume_m5": (
+                self._optional_float((pair.get("volume") or {}).get("m5"))
+                if self._metric_enabled("volume_m5")
+                else None
+            ),
             "volume_h1": self._safe_float((pair.get("volume") or {}).get("h1")),
             "price_change_m5": self._safe_float((pair.get("priceChange") or {}).get("m5")),
             "price_change_h1": self._safe_float((pair.get("priceChange") or {}).get("h1")),
@@ -494,7 +566,17 @@ class PositionMonitor:
         )
 
     def evaluate_position(self, position: OpenPosition, tick: Dict[str, Any]) -> Optional[ClosedTrade]:
-        current_price = self._safe_float(tick.get("price"))
+        raw_current_price = tick.get("price")
+        if not self._is_valid_price(raw_current_price):
+            self._log(
+                f"[{LOG_WARN}] [INVALID PRICE] position token={position.symbol} "
+                f"price={raw_current_price!r} skipped_invalid_price_ticks=1"
+            )
+            position.last_tick = tick
+            self._write_position_tick(position, tick, audit_reason="invalid_price")
+            return None
+
+        current_price = float(raw_current_price)
         now = tick.get("timestamp") or self._now_iso()
 
         if current_price > position.highest_price:
@@ -560,22 +642,43 @@ class PositionMonitor:
             max_profit_pct=max_profit_pct,
             exit_reason=exit_reason,
             breakeven_activated=position.breakeven_activated,
+            signal_price=position.signal_price or position.entry_price,
+            execution_price=position.execution_price,
+            open_slippage_pct=position.open_slippage_pct,
             last_tick=tick,
             source_signal=position.source_signal,
         )
 
-    def _write_position_tick(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
+    def _write_position_tick(
+        self,
+        position: OpenPosition,
+        tick: Dict[str, Any],
+        audit_reason: Optional[str] = None,
+    ) -> None:
         safe_symbol = "".join(ch for ch in position.symbol if ch.isalnum() or ch in ("-", "_"))[:20]
         file_name = f"{safe_symbol}_{position.token_address[:8]}.jsonl"
         path = self.history_dir / file_name
 
+        raw_price = tick.get("price")
+        pnl_pct = (
+            ((float(raw_price) / position.entry_price) - 1) * 100
+            if self._is_valid_price(raw_price)
+            else None
+        )
         enriched_tick = {
             **tick,
+            "audit_reason": audit_reason,
+            "liquidity_usd": tick.get("liquidity_usd"),
+            "volume_m5": tick.get("volume_m5"),
+            "buy_pressure": tick.get("buy_pressure"),
+            "signal_price": position.signal_price or position.entry_price,
+            "execution_price": position.execution_price,
+            "open_slippage_pct": position.open_slippage_pct,
             "entry_price": position.entry_price,
             "highest_price": position.highest_price,
             "stop_price": position.stop_price,
             "trailing_stop_price": position.trailing_stop_price,
-            "pnl_pct": ((self._safe_float(tick.get("price")) / position.entry_price) - 1) * 100,
+            "pnl_pct": pnl_pct,
             "breakeven_activated": position.breakeven_activated,
             # Instrumentação de persistência registrada por tick para análise posterior.
             "health_ticks_above_087": position.health_ticks_above_087,
@@ -621,7 +724,10 @@ class PositionMonitor:
                     f"pnl={((tick['price'] / position.entry_price) - 1) * 100:.2f}% | "
                     f"topo={position.highest_price} | stop={position.stop_price} | "
                     f"trailing={position.trailing_stop_price} | "
-                    f"bp_persist={position.health_ticks_above_087}",
+                    f"bp_persist={position.health_ticks_above_087} | "
+                    f"liq={self._format_metric(tick.get('liquidity_usd'))} | "
+                    f"vol={self._format_metric(tick.get('volume_m5'))} | "
+                    f"bp={self._format_metric(tick.get('buy_pressure'))}",
                     timestamp=tick.get("timestamp"),
                 )
 
@@ -670,7 +776,10 @@ class PositionMonitor:
             f"pnl={((tick['price'] / position.entry_price) - 1) * 100:.2f}% | "
             f"topo={position.highest_price} | stop={position.stop_price} | "
             f"trailing={position.trailing_stop_price} | "
-            f"bp_persist={position.health_ticks_above_087}",
+            f"bp_persist={position.health_ticks_above_087} | "
+            f"liq={self._format_metric(tick.get('liquidity_usd'))} | "
+            f"vol={self._format_metric(tick.get('volume_m5'))} | "
+            f"bp={self._format_metric(tick.get('buy_pressure'))}",
             timestamp=tick.get("timestamp"),
         )
         return True
