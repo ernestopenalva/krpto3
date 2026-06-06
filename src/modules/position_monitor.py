@@ -61,6 +61,11 @@ class OpenPosition:
     signal_price: Optional[float] = None
     execution_price: Optional[float] = None
     open_slippage_pct: Optional[float] = None
+    liquidity_open: Optional[float] = None
+    liquidity_peak: Optional[float] = None
+    liquidity_drain_ticks: int = 0
+    liquidity_drop_from_open_pct: Optional[float] = None
+    liquidity_drop_from_peak_pct: Optional[float] = None
     breakeven_activated: bool = False
     stop_price: float = 0.0
     trailing_stop_price: Optional[float] = None
@@ -92,6 +97,11 @@ class ClosedTrade:
     signal_price: Optional[float] = None
     execution_price: Optional[float] = None
     open_slippage_pct: Optional[float] = None
+    liquidity_open: Optional[float] = None
+    liquidity_peak: Optional[float] = None
+    liquidity_drop_from_open_pct: Optional[float] = None
+    liquidity_drop_from_peak_pct: Optional[float] = None
+    liquidity_drain_ticks: int = 0
     last_tick: Dict[str, Any] = field(default_factory=dict)
     source_signal: Dict[str, Any] = field(default_factory=dict)
 
@@ -116,6 +126,18 @@ class PositionMonitor:
         self.profit_lock_steps = position_cfg.get("profit_lock_steps", [])
         self.staleness_threshold_pct = float(position_cfg.get("staleness_threshold_pct", 2.0))
         self.collect_metrics = position_cfg.get("collect_metrics", {})
+        self.liquidity_exit_cfg = position_cfg.get("liquidity_exit", {})
+        self.liquidity_exit_enabled = bool(self.liquidity_exit_cfg.get("enabled", False))
+        self.liquidity_exit_drop_from_open_pct = float(
+            self.liquidity_exit_cfg.get("drop_from_open_pct", 8.0)
+        )
+        self.liquidity_exit_drop_from_peak_pct = float(
+            self.liquidity_exit_cfg.get("drop_from_peak_pct", 12.0)
+        )
+        self.liquidity_exit_window_ticks = int(self.liquidity_exit_cfg.get("window_ticks", 2))
+        self.liquidity_exit_max_pnl_for_exit_pct = float(
+            self.liquidity_exit_cfg.get("max_pnl_for_exit_pct", 3.0)
+        )
 
         self.fake_amount_usd = float(sizing_cfg.get("amount_usd", 10.0))
 
@@ -565,6 +587,44 @@ class PositionMonitor:
             key=lambda pair: self._safe_float((pair.get("liquidity") or {}).get("usd")),
         )
 
+    def _update_liquidity_exit_state(self, position: OpenPosition, tick: Dict[str, Any], pnl_pct: float) -> bool:
+        liquidity = self._optional_float(tick.get("liquidity_usd"))
+        if liquidity is None or liquidity <= 0:
+            return False
+
+        if position.liquidity_open is None or position.liquidity_open <= 0:
+            position.liquidity_open = liquidity
+
+        if position.liquidity_peak is None or liquidity > position.liquidity_peak:
+            position.liquidity_peak = liquidity
+
+        if position.liquidity_open and position.liquidity_open > 0:
+            position.liquidity_drop_from_open_pct = max(
+                0.0,
+                ((position.liquidity_open - liquidity) / position.liquidity_open) * 100,
+            )
+
+        if position.liquidity_peak and position.liquidity_peak > 0:
+            position.liquidity_drop_from_peak_pct = max(
+                0.0,
+                ((position.liquidity_peak - liquidity) / position.liquidity_peak) * 100,
+            )
+
+        draining = (
+            (position.liquidity_drop_from_open_pct or 0.0) >= self.liquidity_exit_drop_from_open_pct
+            or (position.liquidity_drop_from_peak_pct or 0.0) >= self.liquidity_exit_drop_from_peak_pct
+        )
+        if draining:
+            position.liquidity_drain_ticks += 1
+        else:
+            position.liquidity_drain_ticks = 0
+
+        return (
+            self.liquidity_exit_enabled
+            and position.liquidity_drain_ticks >= self.liquidity_exit_window_ticks
+            and pnl_pct <= self.liquidity_exit_max_pnl_for_exit_pct
+        )
+
     def evaluate_position(self, position: OpenPosition, tick: Dict[str, Any]) -> Optional[ClosedTrade]:
         raw_current_price = tick.get("price")
         if not self._is_valid_price(raw_current_price):
@@ -584,6 +644,7 @@ class PositionMonitor:
             position.highest_price_time = now
 
         pnl_pct = ((current_price / position.entry_price) - 1) * 100
+        should_liquidity_exit = self._update_liquidity_exit_state(position, tick, pnl_pct)
 
         best_lock_pct = None
 
@@ -616,6 +677,8 @@ class PositionMonitor:
             exit_reason = "BREAKEVEN_STOP" if position.breakeven_activated else "STOP_LOSS"
         elif position.trailing_stop_price is not None and current_price <= position.trailing_stop_price:
             exit_reason = "TRAILING_STOP"
+        elif should_liquidity_exit:
+            exit_reason = "LIQUIDITY_EXIT"
 
         position.last_tick = tick
         self._write_position_tick(position, tick)
@@ -645,6 +708,11 @@ class PositionMonitor:
             signal_price=position.signal_price or position.entry_price,
             execution_price=position.execution_price,
             open_slippage_pct=position.open_slippage_pct,
+            liquidity_open=position.liquidity_open,
+            liquidity_peak=position.liquidity_peak,
+            liquidity_drop_from_open_pct=position.liquidity_drop_from_open_pct,
+            liquidity_drop_from_peak_pct=position.liquidity_drop_from_peak_pct,
+            liquidity_drain_ticks=position.liquidity_drain_ticks,
             last_tick=tick,
             source_signal=position.source_signal,
         )
@@ -674,6 +742,11 @@ class PositionMonitor:
             "signal_price": position.signal_price or position.entry_price,
             "execution_price": position.execution_price,
             "open_slippage_pct": position.open_slippage_pct,
+            "liquidity_open": position.liquidity_open,
+            "liquidity_peak": position.liquidity_peak,
+            "liquidity_drop_from_open_pct": position.liquidity_drop_from_open_pct,
+            "liquidity_drop_from_peak_pct": position.liquidity_drop_from_peak_pct,
+            "liquidity_drain_ticks": position.liquidity_drain_ticks,
             "entry_price": position.entry_price,
             "highest_price": position.highest_price,
             "stop_price": position.stop_price,

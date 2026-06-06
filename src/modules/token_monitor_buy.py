@@ -24,6 +24,7 @@ def load_config():
 CONFIG = load_config()
 CFG = CONFIG.get("token_monitor_buy", {})
 ENTRY_CFG = CFG.get("entry", {})
+MOMENTUM_CFG = CFG.get("momentum_entry", {})
 POSITION_CFG = CONFIG.get("position_monitor", {})
 
 
@@ -67,6 +68,16 @@ HEALTH_MIN_BUY_PRESSURE = ENTRY_CFG.get("health_min_buy_pressure", 0.48)
 HEALTH_MAX_LIQUIDITY_DROP_PCT = ENTRY_CFG.get("health_max_liquidity_drop_pct", 35.0)
 HEALTH_RECENT_TICKS = ENTRY_CFG.get("health_recent_ticks", 6)
 PULLBACK_RECENT_TICKS = ENTRY_CFG.get("pullback_recent_ticks", 24)
+
+MOMENTUM_ENTRY_ENABLED = MOMENTUM_CFG.get("enabled", False)
+MOMENTUM_MIN_MOMENTUM_PCT = MOMENTUM_CFG.get("min_momentum_pct", 15.0)
+MOMENTUM_MAX_PULLBACK_FROM_PEAK_PCT = MOMENTUM_CFG.get("max_pullback_from_peak_pct", 3.0)
+MOMENTUM_MIN_LIQUIDITY_GROWTH_PCT = MOMENTUM_CFG.get("min_liquidity_growth_pct", 0.0)
+MOMENTUM_MAX_LIQUIDITY_DROP_PCT = MOMENTUM_CFG.get("max_liquidity_drop_pct", 5.0)
+MOMENTUM_HEALTH_MIN_SCORE = MOMENTUM_CFG.get("health_min_score", 0.60)
+MOMENTUM_MIN_BUY_PRESSURE = MOMENTUM_CFG.get("min_buy_pressure", 0.52)
+MOMENTUM_BLOCK_IF_PRICE_FALLING = MOMENTUM_CFG.get("block_if_price_falling", True)
+MOMENTUM_PRICE_FALLING_WINDOW_TICKS = MOMENTUM_CFG.get("price_falling_window_ticks", 3)
 
 
 # =========================
@@ -587,6 +598,84 @@ def compute_token_health_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not MOMENTUM_ENTRY_ENABLED:
+        return {"entry": False, "reason": "momentum_continuation desabilitado"}
+
+    if len(history) < MIN_TICKS_BEFORE_DECISION:
+        return {"entry": False, "reason": "histórico insuficiente para momentum_continuation"}
+
+    prices = [tick["price_usd"] for tick in history if tick.get("price_usd", 0) > 0]
+    if len(prices) < MIN_TICKS_BEFORE_DECISION:
+        return {"entry": False, "reason": "preços insuficientes para momentum_continuation"}
+
+    current = history[-1]
+    current_price = current["price_usd"]
+    first_price = prices[0]
+    peak_price = max(prices)
+
+    runup_since_first_tick_pct = ((current_price / first_price) - 1) * 100 if first_price > 0 else 0.0
+    pullback_from_peak_pct = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0.0
+
+    liquidities = [tick["liquidity_usd"] for tick in history if tick.get("liquidity_usd", 0) > 0]
+    first_liquidity = liquidities[0] if liquidities else 0.0
+    current_liquidity = current.get("liquidity_usd", 0.0)
+    peak_liquidity = max(liquidities) if liquidities else 0.0
+    if first_liquidity <= 0 or current_liquidity <= 0 or peak_liquidity <= 0:
+        return {"entry": False, "reason": "liquidez insuficiente para momentum_continuation"}
+
+    liquidity_growth_pct = (
+        ((current_liquidity / first_liquidity) - 1) * 100
+    )
+    liquidity_drop_pct = (
+        ((peak_liquidity - current_liquidity) / peak_liquidity) * 100
+    )
+
+    health = compute_token_health_score(history)
+    buy_pressure = current.get("buy_pressure", 0.0)
+
+    window_ticks = max(1, int(MOMENTUM_PRICE_FALLING_WINDOW_TICKS))
+    recent_prices = prices[-window_ticks:]
+    recent_avg_price = sum(recent_prices) / len(recent_prices) if recent_prices else current_price
+    price_falling_blocked = MOMENTUM_BLOCK_IF_PRICE_FALLING and current_price < recent_avg_price
+
+    metrics = {
+        "entry_reason": "MOMENTUM_CONTINUATION",
+        "motivo_entrada": "momentum_continuation",
+        "runup_since_first_tick_pct": runup_since_first_tick_pct,
+        "pullback_from_peak_pct": pullback_from_peak_pct,
+        "liquidity_growth_pct": liquidity_growth_pct,
+        "liquidity_drop_pct": liquidity_drop_pct,
+        "health_score": health.get("score", 0.0),
+        "buy_pressure": buy_pressure,
+        "price_falling_window_ticks": window_ticks,
+        "recent_avg_price": recent_avg_price,
+    }
+
+    if runup_since_first_tick_pct < MOMENTUM_MIN_MOMENTUM_PCT:
+        return {"entry": False, "reason": "momentum insuficiente", "metrics": metrics}
+    if pullback_from_peak_pct > MOMENTUM_MAX_PULLBACK_FROM_PEAK_PCT:
+        return {"entry": False, "reason": "momentum longe do topo", "metrics": metrics}
+    if not (
+        liquidity_growth_pct >= MOMENTUM_MIN_LIQUIDITY_GROWTH_PCT
+        or liquidity_drop_pct <= MOMENTUM_MAX_LIQUIDITY_DROP_PCT
+    ):
+        return {"entry": False, "reason": "liquidez drenando no momentum", "metrics": metrics}
+    if health.get("score", 0.0) < MOMENTUM_HEALTH_MIN_SCORE:
+        return {"entry": False, "reason": "health insuficiente para momentum", "metrics": metrics}
+    if buy_pressure < MOMENTUM_MIN_BUY_PRESSURE:
+        return {"entry": False, "reason": "buy pressure insuficiente para momentum", "metrics": metrics}
+    if price_falling_blocked:
+        return {"entry": False, "reason": "preço caindo na janela de momentum", "metrics": metrics}
+
+    return {
+        "entry": True,
+        "entry_reason": "MOMENTUM_CONTINUATION",
+        "reason": "momentum_continuation",
+        "metrics": metrics,
+    }
+
+
 def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(history) < MIN_TICKS_BEFORE_DECISION:
         return {
@@ -659,6 +748,9 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     if not pullback_ok:
+        momentum = evaluate_momentum_continuation(history)
+        if momentum.get("entry"):
+            return momentum
         return {
             "entry": False,
             "reason": (
@@ -763,7 +855,10 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "entry": True,
         "reason": "pullback válido + cenário ok + confirmação Codex",
+        "entry_reason": "PULLBACK_RECOVERY",
         "metrics": {
+            "entry_reason": "PULLBACK_RECOVERY",
+            "motivo_entrada": "pullback_recovery",
             "current_price": current_price,
             "recent_top": recent_top,
             "recent_bottom": recent_bottom,
@@ -790,6 +885,8 @@ def register_buy_signal(candidate: Dict[str, Any], tick: Dict[str, Any], evaluat
         "chain_id": candidate["chain_id"],
         "pair_address": candidate["pair_address"],
         "entry_price_usd": tick["price_usd"],
+        "entry_reason": evaluation.get("entry_reason") or evaluation.get("metrics", {}).get("entry_reason"),
+        "motivo_entrada": evaluation.get("metrics", {}).get("motivo_entrada"),
         "reason": evaluation["reason"],
         "metrics": evaluation.get("metrics", {}),
         "snapshot": tick
@@ -802,7 +899,8 @@ def register_buy_signal(candidate: Dict[str, Any], tick: Dict[str, Any], evaluat
 
     print(
         f"[{signal_time}] [SINAL] COMPRA SIMULADA: "
-        f"{candidate['symbol']} @ {tick['price_usd']}"
+        f"{candidate['symbol']} @ {tick['price_usd']} | "
+        f"entry_reason={signal.get('entry_reason') or 'n/a'}"
     )
 
 

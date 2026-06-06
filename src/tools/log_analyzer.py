@@ -22,6 +22,7 @@ ENTRY_TICK_RE = re.compile(
 BUY_SIGNAL_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[SINAL\]\s+COMPRA SIMULADA:\s+"
     r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?:\s+\|\s+entry_reason=(?P<entry_reason>\S+))?"
 )
 PAPER_BUY_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
@@ -146,6 +147,7 @@ class BuySignal:
     symbol: str
     price: float
     raw: str
+    entry_reason: Optional[str] = None
 
 
 @dataclass
@@ -359,6 +361,7 @@ def parse_log(lines: Iterable[str]) -> list[CycleSummary]:
                 symbol=buy_match.group("symbol").strip(),
                 price=safe_float(buy_match.group("price")),
                 raw=line,
+                entry_reason=buy_match.group("entry_reason"),
             )
             current.add_buy_signal(signal)
             continue
@@ -466,7 +469,10 @@ def write_compact_log(cycles: list[CycleSummary], output_path: Path, max_events:
         if cycle.buy_signals:
             lines.append("### Sinais De Compra Simulada")
             for signal in cycle.buy_signals:
-                lines.append(f"- {signal.timestamp} | {signal.symbol} @ {signal.price:g}")
+                lines.append(
+                    f"- {signal.timestamp} | {signal.symbol} @ {signal.price:g} | "
+                    f"entry_reason={signal.entry_reason or 'n/a'}"
+                )
             lines.append("")
 
         if cycle.paper_buys:

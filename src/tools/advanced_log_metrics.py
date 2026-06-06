@@ -1,6 +1,7 @@
 import json
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ ENTRY_TICK_RE = re.compile(
 BUY_SIGNAL_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[SINAL\]\s+COMPRA SIMULADA:\s+"
     r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?:\s+\|\s+entry_reason=(?P<entry_reason>\S+))?"
 )
 PAPER_BUY_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
@@ -910,7 +912,9 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
             state = state_for_current_session(symbol)
             state.signal_at = signal_match.group("timestamp")
             state.signal_price = safe_float(signal_match.group("price"))
-            if state.entry_reason is None and state.ticks:
+            if signal_match.group("entry_reason") and signal_match.group("entry_reason") != "n/a":
+                state.entry_reason = signal_match.group("entry_reason")
+            elif state.entry_reason is None and state.ticks:
                 state.entry_reason = state.ticks[-1].reason
             active_trade_by_symbol[normalize_symbol(symbol)] = state
             continue
@@ -1522,6 +1526,28 @@ def write_advanced_report(
                 f"signal_price={fmt_num(item.signal_price, 10)} | execution_price={fmt_num(item.execution_price, 10)} | "
                 f"open_slippage_pct={fmt_pct(item.open_slippage_pct)}"
             )
+
+    lines.extend(["", "## Entradas E Saidas Por Tipo"])
+    entry_reason_counts = Counter(item.entry_reason or "n/a" for item in primary.values() if item.signal_at)
+    exit_reason_counts = Counter(item.exit_reason or "n/a" for item in closed)
+    lines.append("### Entradas")
+    if entry_reason_counts:
+        for reason, count in entry_reason_counts.most_common():
+            items = [item for item in primary.values() if item.signal_at and (item.entry_reason or "n/a") == reason]
+            lines.append(
+                f"- {reason}: {count} | pnl_fechado_medio={fmt_pct(average([item.final_pnl for item in items]))}"
+            )
+    else:
+        lines.append("- n/a")
+    lines.append("### Saidas")
+    if exit_reason_counts:
+        for reason, count in exit_reason_counts.most_common():
+            items = [item for item in closed if (item.exit_reason or "n/a") == reason]
+            lines.append(
+                f"- {reason}: {count} | pnl_medio={fmt_pct(average([item.final_pnl for item in items]))}"
+            )
+    else:
+        lines.append("- n/a")
 
     lines.extend(["", "## Diagnostico Position: Topo Vs Saida"])
     position_items = [
