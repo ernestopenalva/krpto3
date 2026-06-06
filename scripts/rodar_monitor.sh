@@ -1,10 +1,10 @@
 #!/bin/bash
-# KRPTO3 — Monitor (token_monitor_buy + position_monitor)
+# KRPTO3 - Monitor (token_monitor_buy + position_monitor)
 # Roda em ciclos de 60s, lendo final_monitoring_candidates.json
-# que é alimentado pelo scanner contínuo (rodar_scanner.sh).
+# que e alimentado pelo scanner continuo (rodar_scanner.sh).
 # Execute em janela tmux separada da janela do scanner.
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 mkdir -p logs
 

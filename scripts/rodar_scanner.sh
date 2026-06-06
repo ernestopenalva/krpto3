@@ -1,13 +1,13 @@
 #!/bin/bash
-# KRPTO3 — Scanner Contínuo
+# KRPTO3 - Scanner continuo
 # Executa um ciclo por chamada e controla o intervalo fora do Python.
 # Execute em janela tmux separada da janela do monitor (rodar_monitor.sh).
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 mkdir -p logs
 
-echo "=== KRPTO3 Scanner Contínuo ==="
+echo "=== KRPTO3 Scanner Continuo ==="
 echo "Iniciando token_scanner.py em ciclos de 60s..."
 
 source venv/bin/activate

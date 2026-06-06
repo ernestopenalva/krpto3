@@ -51,8 +51,8 @@ token_monitor_buy:
   poll_interval_seconds: 5
   max_monitoring_minutes: 15
   max_monitored_tokens: 5
-  shadow_monitor_enabled: true
   shadow_monitor_minutes: 60
+  backoff_on_rate_limit_seconds: 10
 
   decision_window_minutes: 5
   min_ticks_before_decision: 12
@@ -88,8 +88,9 @@ position_monitor:
   input_file: "data/token_monitor/buy_signals.json"
   output_dir: "data/position_monitor"
 
-  poll_interval_seconds: 2
+  poll_interval_seconds: 1
   max_open_positions: 2
+  backoff_on_rate_limit_seconds: 1
   staleness_threshold_pct: 2.0  # descarta se preço caiu mais de X% desde o sinal
 
   liquidity_exit:
@@ -116,6 +117,12 @@ position_monitor:
     volume_m5: true
     liquidity_usd: true
     buy_pressure: true
+
+shadow_monitor:
+  enabled: false
+  poll_interval_seconds: 10
+  max_active_tokens: 5
+  backoff_on_rate_limit_seconds: 30
 
 position_sizing:
   mode: fixed_fake_usd

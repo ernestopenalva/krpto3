@@ -8,11 +8,12 @@ A cada chamada:
   3. Grava candidatos aprovados em final_monitoring_candidates.json
   4. Mantém watchlist.json com ciclo de vida e status de cada token
 
-O loop de execução fica fora do Python, em rodar_scanner.sh. Isso permite
+O loop de execução fica fora do Python, em scripts/rodar_scanner.sh. Isso permite
 rodar este módulo uma única vez durante testes.
 """
 
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,6 +30,8 @@ TOKEN_SCANNER_VERSION = "token-scanner-watchlist-v1-krpto3-2026-05-24"
 
 DEXSCREENER_LATEST_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain_id}/{token_address}"
+DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS = 10
+DEXSCREENER_RATE_LIMIT_COUNTS = {}
 
 SOLANA_BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
@@ -90,6 +93,17 @@ def is_valid_solana_address(address: str) -> bool:
     if len(address) < 32 or len(address) > 44:
         return False
     return all(char in SOLANA_BASE58_ALPHABET for char in address)
+
+
+def log_dexscreener_rate_limit(endpoint: str, token_address: str | None = None) -> None:
+    key = token_address or endpoint
+    DEXSCREENER_RATE_LIMIT_COUNTS[key] = DEXSCREENER_RATE_LIMIT_COUNTS.get(key, 0) + 1
+    token_part = f" token={token_address}" if token_address else ""
+    print(
+        f"[RATE_LIMIT] source=scanner{token_part} endpoint={endpoint} "
+        f"backoff={DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS}s "
+        f"count={DEXSCREENER_RATE_LIMIT_COUNTS[key]}"
+    )
 
 
 # ============================================================
@@ -193,9 +207,17 @@ def get_known_token_addresses(watchlist: dict) -> set:
 # ============================================================
 
 def fetch_latest_token_profiles():
-    response = requests.get(DEXSCREENER_LATEST_PROFILES_URL, timeout=20)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(DEXSCREENER_LATEST_PROFILES_URL, timeout=20)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            log_dexscreener_rate_limit(DEXSCREENER_LATEST_PROFILES_URL)
+            time.sleep(DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS)
+            return []
+        raise
 
 
 def filter_initial_tokens(tokens, scanner_config, known_addresses: set) -> list:
@@ -240,9 +262,17 @@ def fetch_token_pairs(chain_id, token_address):
         chain_id=chain_id,
         token_address=token_address,
     )
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            log_dexscreener_rate_limit(url, token_address)
+            time.sleep(DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS)
+            return []
+        raise
 
 
 def enrich_tokens_with_pairs(tokens) -> list:

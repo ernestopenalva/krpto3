@@ -44,6 +44,7 @@ LOG_PROFIT_LOCK = "PROFIT LOCK"
 LOG_MONITOR = "MONITOR"
 LOG_INFO = "INFO"
 LOG_WARN = "WARN"
+LOG_RATE_LIMIT = "RATE_LIMIT"
 
 
 @dataclass
@@ -118,6 +119,8 @@ class PositionMonitor:
         self.mode = str(position_cfg.get("mode", "PAPER")).upper()
         self.poll_interval_seconds = int(position_cfg.get("poll_interval_seconds", 15))
         self.max_open_positions = int(position_cfg.get("max_open_positions", 2))
+        self.rate_limit_backoff_seconds = int(position_cfg.get("backoff_on_rate_limit_seconds", 1))
+        self.rate_limit_counts: Dict[str, int] = {}
 
         self.stop_loss_pct = float(position_cfg.get("stop_loss_pct", 5.0))
         self.breakeven_trigger_pct = float(position_cfg.get("breakeven_trigger_pct", 3.0))
@@ -236,6 +239,16 @@ class PositionMonitor:
 
     def _metric_enabled(self, name: str) -> bool:
         return bool(self.collect_metrics.get(name, True))
+
+    def _log_rate_limit(self, position: OpenPosition, endpoint: str) -> None:
+        token_key = position.token_address
+        self.rate_limit_counts[token_key] = self.rate_limit_counts.get(token_key, 0) + 1
+        self._log(
+            f"[{LOG_RATE_LIMIT}] source=position_monitor token={position.symbol} "
+            f"token_address={position.token_address} endpoint={endpoint} "
+            f"backoff={self.rate_limit_backoff_seconds}s "
+            f"count={self.rate_limit_counts[token_key]}"
+        )
 
     @staticmethod
     def _is_valid_price(value: Any) -> bool:
@@ -500,6 +513,10 @@ class PositionMonitor:
         return 0.0
 
     def fetch_market_tick(self, position: OpenPosition) -> Optional[Dict[str, Any]]:
+        url = DEXSCREENER_TOKEN_PAIRS_URL.format(
+            chain_id=position.chain_id,
+            token_address=position.token_address,
+        )
         try:
             if position.pair_address:
                 url = DEXSCREENER_PAIR_URL.format(
@@ -511,13 +528,17 @@ class PositionMonitor:
                 payload = response.json()
                 pairs = payload.get("pairs") or [] if isinstance(payload, dict) else []
             else:
-                url = DEXSCREENER_TOKEN_PAIRS_URL.format(
-                    chain_id=position.chain_id,
-                    token_address=position.token_address,
-                )
                 response = requests.get(url, timeout=15)
                 response.raise_for_status()
                 pairs = response.json()
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 429:
+                self._log_rate_limit(position, url)
+                time.sleep(self.rate_limit_backoff_seconds)
+                return None
+            self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
+            return None
         except requests.RequestException as exc:
             self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
             return None

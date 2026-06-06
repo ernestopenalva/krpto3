@@ -1,8 +1,8 @@
 #!/bin/bash
-# KRPTO3 - Shadow Monitor temporário do Experimento Grail
+# KRPTO3 - Shadow Monitor temporario do Experimento Grail
 # Execute em janela tmux separada do scanner e do monitor principal.
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 mkdir -p logs
 

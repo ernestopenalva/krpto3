@@ -613,7 +613,7 @@ def write_analysis(cycles: list[CycleSummary], output_path: Path) -> None:
         "## Contexto",
         "- Projeto: bot de trading automatizado para criptoativos.",
         "- Prioridade: preservacao de capital e gestao de risco.",
-        "- Fonte: log bruto produzido pelo monitor (`rodar_monitor.sh` / `src/app.py`).",
+        "- Fonte: log bruto produzido pelo monitor (`scripts/rodar_monitor.sh` / `src/app.py`).",
         "",
         "## Resumo Quantitativo",
         f"- Ciclos analisados: {len(cycles)}",

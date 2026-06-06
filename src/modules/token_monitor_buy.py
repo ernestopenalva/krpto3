@@ -26,6 +26,7 @@ CFG = CONFIG.get("token_monitor_buy", {})
 ENTRY_CFG = CFG.get("entry", {})
 MOMENTUM_CFG = CFG.get("momentum_entry", {})
 POSITION_CFG = CONFIG.get("position_monitor", {})
+SHADOW_CFG = CONFIG.get("shadow_monitor", {})
 
 
 # =========================
@@ -50,7 +51,8 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
 MAX_MONITORING_MINUTES = CFG.get("max_monitoring_minutes", 15)
 MAX_MONITORED_TOKENS = CFG.get("max_monitored_tokens", 5)
-SHADOW_MONITOR_ENABLED = CFG.get("shadow_monitor_enabled", False)
+SHADOW_MONITOR_ENABLED = SHADOW_CFG.get("enabled", CFG.get("shadow_monitor_enabled", False))
+RATE_LIMIT_BACKOFF_SECONDS = CFG.get("backoff_on_rate_limit_seconds", 10)
 
 DECISION_WINDOW_MINUTES = CFG.get("decision_window_minutes", 5)
 MIN_TICKS_BEFORE_DECISION = CFG.get("min_ticks_before_decision", 4)
@@ -78,6 +80,7 @@ MOMENTUM_HEALTH_MIN_SCORE = MOMENTUM_CFG.get("health_min_score", 0.60)
 MOMENTUM_MIN_BUY_PRESSURE = MOMENTUM_CFG.get("min_buy_pressure", 0.52)
 MOMENTUM_BLOCK_IF_PRICE_FALLING = MOMENTUM_CFG.get("block_if_price_falling", True)
 MOMENTUM_PRICE_FALLING_WINDOW_TICKS = MOMENTUM_CFG.get("price_falling_window_ticks", 3)
+RATE_LIMIT_COUNTS: Dict[str, int] = {}
 
 
 # =========================
@@ -230,6 +233,16 @@ def is_valid_price(value: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(price) and price > 0
+
+
+def log_rate_limit(source: str, endpoint: str, backoff_seconds: int, token: Optional[str] = None) -> None:
+    key = token or source
+    RATE_LIMIT_COUNTS[key] = RATE_LIMIT_COUNTS.get(key, 0) + 1
+    token_part = f" token={token}" if token else ""
+    print(
+        f"[RATE_LIMIT] source={source}{token_part} endpoint={endpoint} "
+        f"backoff={backoff_seconds}s count={RATE_LIMIT_COUNTS[key]}"
+    )
 
 
 def log_invalid_price_summary(invalid_price_ticks: Dict[str, int]) -> None:
@@ -411,6 +424,20 @@ def fetch_pair_snapshot(chain_id: str, pair_address: str) -> Optional[Dict[str, 
 
         return pairs[0]
 
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            backoff_seconds = int(RATE_LIMIT_BACKOFF_SECONDS)
+            log_rate_limit(
+                source="token_monitor_buy",
+                endpoint=url,
+                backoff_seconds=backoff_seconds,
+                token=pair_address,
+            )
+            time.sleep(backoff_seconds)
+            return None
+        print(f"[ERRO] Falha ao consultar Dexscreener: {exc}")
+        return None
     except requests.RequestException as exc:
         print(f"[ERRO] Falha ao consultar Dexscreener: {exc}")
         return None

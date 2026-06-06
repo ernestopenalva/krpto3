@@ -28,6 +28,7 @@ def load_config() -> Dict[str, Any]:
 
 CONFIG = load_config()
 CFG = CONFIG.get("token_monitor_buy", {})
+SHADOW_CFG = CONFIG.get("shadow_monitor", {})
 
 OUTPUT_DIR = Path(CFG.get("output_dir", "data/token_monitor"))
 SHADOW_WATCHLIST_FILE = OUTPUT_DIR / "shadow_watchlist.json"
@@ -35,9 +36,12 @@ SHADOW_WATCHLIST_LOCK_FILE = OUTPUT_DIR / "shadow_watchlist.lock"
 SHADOW_HISTORY_DIR = OUTPUT_DIR / "shadow_history"
 SHADOW_RESULTS_FILE = OUTPUT_DIR / "shadow_results.jsonl"
 
-SHADOW_MONITOR_ENABLED = CFG.get("shadow_monitor_enabled", False)
+SHADOW_MONITOR_ENABLED = SHADOW_CFG.get("enabled", CFG.get("shadow_monitor_enabled", False))
 SHADOW_MONITOR_MINUTES = CFG.get("shadow_monitor_minutes", 60)
-POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
+POLL_INTERVAL_SECONDS = SHADOW_CFG.get("poll_interval_seconds", CFG.get("poll_interval_seconds", 15))
+MAX_ACTIVE_TOKENS = int(SHADOW_CFG.get("max_active_tokens", 5))
+RATE_LIMIT_BACKOFF_SECONDS = int(SHADOW_CFG.get("backoff_on_rate_limit_seconds", 30))
+RATE_LIMIT_COUNT = 0
 
 
 def now_iso() -> str:
@@ -137,12 +141,26 @@ def remove_completed_tokens(completed_tokens: List[str]) -> None:
 
 
 def fetch_pair_snapshot(chain_id: str, pair_address: str) -> Optional[Dict[str, Any]]:
+    global RATE_LIMIT_COUNT
+
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain_id}/{pair_address}"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         pairs = response.json().get("pairs") or []
         return pairs[0] if pairs else None
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            RATE_LIMIT_COUNT += 1
+            print(
+                f"[RATE_LIMIT] source=shadow_monitor token={pair_address} "
+                f"endpoint={url} backoff={RATE_LIMIT_BACKOFF_SECONDS}s count={RATE_LIMIT_COUNT}"
+            )
+            time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+            return None
+        print(f"[SHADOW][ERRO] Falha ao consultar Dexscreener: {exc}")
+        return None
     except requests.RequestException as exc:
         print(f"[SHADOW][ERRO] Falha ao consultar Dexscreener: {exc}")
         return None
@@ -207,7 +225,7 @@ def process_shadow_watchlist() -> None:
     completed_tokens = []
     now = datetime.now(ZoneInfo("America/Sao_Paulo"))
 
-    for token_address, entry in shadow_watchlist.items():
+    for token_address, entry in list(shadow_watchlist.items())[:MAX_ACTIVE_TOKENS]:
         try:
             history_file = SHADOW_HISTORY_DIR / f"{token_address}.jsonl"
             started_at = datetime.fromisoformat(entry["timestamp_descarte"])
