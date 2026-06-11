@@ -246,6 +246,20 @@ def reason_from_tick(tick: Optional[MarketTick]) -> Optional[str]:
     return str(reason) if reason else None
 
 
+def enrich_context_from_dex_tick(context: MarketContext, dex_tick: Optional[MarketTick]) -> MarketContext:
+    if dex_tick is None:
+        return context
+    return MarketContext(
+        token_address=context.token_address,
+        chain_id=context.chain_id,
+        symbol=context.symbol,
+        pair_address=context.pair_address or dex_tick.pair_address,
+        dex_id=context.dex_id or dex_tick.dex_id,
+        base_mint=context.base_mint or dex_tick.base_mint,
+        quote_mint=context.quote_mint or dex_tick.quote_mint,
+    )
+
+
 def resolve_rpc_url(cli_value: Optional[str]) -> str:
     rpc_url = (
         cli_value
@@ -301,8 +315,20 @@ def main() -> None:
         except MarketDataError as exc:
             dex_tick = None
             record["dex_error"] = str(exc)
+        enriched_context = enrich_context_from_dex_tick(context, dex_tick)
+        record.update(
+            {
+                "pair_address": enriched_context.pair_address,
+                "base_mint": enriched_context.base_mint,
+                "quote_mint": enriched_context.quote_mint,
+                "metadata_enriched_from_dex": (
+                    enriched_context.base_mint != context.base_mint
+                    or enriched_context.quote_mint != context.quote_mint
+                ),
+            }
+        )
         try:
-            onchain_tick = onchain_provider.get_pool_tick(context)
+            onchain_tick = onchain_provider.get_pool_tick(enriched_context)
         except MarketDataError as exc:
             onchain_tick = None
             record["onchain_error"] = str(exc)
