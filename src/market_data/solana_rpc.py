@@ -51,6 +51,11 @@ class SolanaRpcClient:
         value = result.get("value") if isinstance(result, dict) else None
         return value if isinstance(value, dict) else None
 
+    def get_token_account_balance(self, address: str) -> Optional[Dict[str, Any]]:
+        result = self.call("getTokenAccountBalance", [address])
+        value = result.get("value") if isinstance(result, dict) else None
+        return value if isinstance(value, dict) else None
+
     def get_token_accounts_by_owner(self, owner: str, token_program_id: str) -> List[Dict[str, Any]]:
         result = self.call(
             "getTokenAccountsByOwner",
