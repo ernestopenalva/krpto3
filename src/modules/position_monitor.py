@@ -88,6 +88,17 @@ class OpenPosition:
     trailing_stop_price: Optional[float] = None
     source_signal: Dict[str, Any] = field(default_factory=dict)
     last_tick: Dict[str, Any] = field(default_factory=dict)
+    shadow_highest_price: Optional[float] = None
+    shadow_highest_price_time: Optional[str] = None
+    shadow_stop_price: Optional[float] = None
+    shadow_trailing_stop_price: Optional[float] = None
+    shadow_breakeven_activated: bool = False
+    shadow_exit_reason: Optional[str] = None
+    shadow_exit_price: Optional[float] = None
+    shadow_exit_time: Optional[str] = None
+    shadow_pnl_pct: Optional[float] = None
+    shadow_max_profit_pct: Optional[float] = None
+    shadow_ticks: int = 0
     # Instrumentação de persistência do health score.
     # Conta ticks consecutivos com buy_pressure >= 0.87 durante o monitoramento da posição.
     # Não afeta nenhuma decisão de entrada ou saída; apenas observação.
@@ -121,6 +132,12 @@ class ClosedTrade:
     liquidity_drain_ticks: int = 0
     last_tick: Dict[str, Any] = field(default_factory=dict)
     source_signal: Dict[str, Any] = field(default_factory=dict)
+    shadow_exit_reason: Optional[str] = None
+    shadow_exit_price: Optional[float] = None
+    shadow_exit_time: Optional[str] = None
+    shadow_pnl_pct: Optional[float] = None
+    shadow_max_profit_pct: Optional[float] = None
+    shadow_would_exit_before_dex: Optional[bool] = None
 
 
 class PositionMonitor:
@@ -420,6 +437,126 @@ class PositionMonitor:
         )
         return audit
 
+    def _estimate_onchain_decision_price(self, tick: Dict[str, Any]) -> Optional[float]:
+        dex_native = self._optional_float(tick.get("dex_price_native"))
+        dex_usd = self._optional_float(tick.get("dex_price_usd") or tick.get("price_usd") or tick.get("price"))
+        onchain_native = self._optional_float(tick.get("onchain_price_native"))
+        if dex_native is None or dex_native <= 0 or dex_usd is None or dex_usd <= 0:
+            return None
+        if onchain_native is None or onchain_native <= 0:
+            return None
+        return onchain_native * (dex_usd / dex_native)
+
+    def _attach_shadow_decision_state(
+        self,
+        position: OpenPosition,
+        tick: Dict[str, Any],
+        status: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        tick.update(
+            {
+                "shadow_decision_status": status,
+                "shadow_decision_reason": reason,
+                "shadow_decision_source": "onchain_pumpswap",
+                "shadow_price": tick.get("shadow_price"),
+                "shadow_pnl_pct": position.shadow_pnl_pct,
+                "shadow_highest_price": position.shadow_highest_price,
+                "shadow_stop_price": position.shadow_stop_price,
+                "shadow_trailing_stop_price": position.shadow_trailing_stop_price,
+                "shadow_breakeven_activated": position.shadow_breakeven_activated,
+                "shadow_exit_reason": position.shadow_exit_reason,
+                "shadow_exit_price": position.shadow_exit_price,
+                "shadow_exit_time": position.shadow_exit_time,
+                "shadow_max_profit_pct": position.shadow_max_profit_pct,
+                "shadow_ticks": position.shadow_ticks,
+                "shadow_liquidity_exit_simulated": False,
+            }
+        )
+
+    def _update_shadow_decision(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
+        now = tick.get("timestamp") or self._now_iso()
+        if position.shadow_highest_price is None:
+            position.shadow_highest_price = position.entry_price
+            position.shadow_highest_price_time = position.entry_time
+        if position.shadow_stop_price is None or position.shadow_stop_price <= 0:
+            position.shadow_stop_price = position.entry_price * (1 - self.stop_loss_pct / 100)
+
+        onchain_status = tick.get("onchain_status")
+        if onchain_status != "ok":
+            self._attach_shadow_decision_state(
+                position,
+                tick,
+                "unavailable",
+                tick.get("onchain_reason") or onchain_status,
+            )
+            return
+
+        shadow_price = self._estimate_onchain_decision_price(tick)
+        tick["shadow_price"] = shadow_price
+        if not self._is_valid_price(shadow_price):
+            self._attach_shadow_decision_state(position, tick, "unavailable", "shadow_price_unavailable")
+            return
+
+        current_price = float(shadow_price)
+        position.shadow_ticks += 1
+
+        if position.shadow_exit_reason is not None:
+            self._attach_shadow_decision_state(position, tick, "already_exited")
+            return
+
+        if position.shadow_highest_price is None or current_price > position.shadow_highest_price:
+            position.shadow_highest_price = current_price
+            position.shadow_highest_price_time = now
+
+        pnl_pct = ((current_price / position.entry_price) - 1) * 100
+        position.shadow_pnl_pct = pnl_pct
+        position.shadow_max_profit_pct = (
+            ((position.shadow_highest_price / position.entry_price) - 1) * 100
+            if position.shadow_highest_price is not None and position.entry_price > 0
+            else None
+        )
+
+        best_lock_pct = None
+        for step in self.profit_lock_steps:
+            trigger_pct = self._safe_float(step.get("trigger_pct"))
+            lock_pct = self._safe_float(step.get("lock_pct"))
+            if pnl_pct >= trigger_pct:
+                if best_lock_pct is None or lock_pct > best_lock_pct:
+                    best_lock_pct = lock_pct
+
+        if best_lock_pct is not None:
+            new_stop_price = position.entry_price * (1 + best_lock_pct / 100)
+            if position.shadow_stop_price is None or new_stop_price > position.shadow_stop_price:
+                position.shadow_stop_price = new_stop_price
+                position.shadow_breakeven_activated = True
+
+        if position.shadow_breakeven_activated and position.shadow_highest_price is not None:
+            position.shadow_trailing_stop_price = position.shadow_highest_price * (
+                1 - self.trailing_stop_pct / 100
+            )
+
+        exit_reason = None
+        if position.shadow_stop_price is not None and current_price <= position.shadow_stop_price:
+            exit_reason = "BREAKEVEN_STOP" if position.shadow_breakeven_activated else "STOP_LOSS"
+        elif (
+            position.shadow_trailing_stop_price is not None
+            and current_price <= position.shadow_trailing_stop_price
+        ):
+            exit_reason = "TRAILING_STOP"
+
+        if exit_reason is not None:
+            position.shadow_exit_reason = exit_reason
+            position.shadow_exit_price = current_price
+            position.shadow_exit_time = now
+            position.shadow_pnl_pct = pnl_pct
+
+        self._attach_shadow_decision_state(
+            position,
+            tick,
+            "would_exit" if exit_reason is not None else "open",
+        )
+
     def _write_market_data_audit(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
         if not self.onchain_audit_write_global_file:
             return
@@ -441,6 +578,18 @@ class PositionMonitor:
             "onchain_reason": tick.get("onchain_reason"),
             "onchain_slot": tick.get("onchain_slot"),
             "onchain_timestamp": tick.get("onchain_timestamp"),
+            "shadow_decision_status": tick.get("shadow_decision_status"),
+            "shadow_decision_reason": tick.get("shadow_decision_reason"),
+            "shadow_price": tick.get("shadow_price"),
+            "shadow_pnl_pct": tick.get("shadow_pnl_pct"),
+            "shadow_stop_price": tick.get("shadow_stop_price"),
+            "shadow_trailing_stop_price": tick.get("shadow_trailing_stop_price"),
+            "shadow_breakeven_activated": tick.get("shadow_breakeven_activated"),
+            "shadow_exit_reason": tick.get("shadow_exit_reason"),
+            "shadow_exit_price": tick.get("shadow_exit_price"),
+            "shadow_exit_time": tick.get("shadow_exit_time"),
+            "shadow_max_profit_pct": tick.get("shadow_max_profit_pct"),
+            "shadow_ticks": tick.get("shadow_ticks"),
         }
         self._append_jsonl(self.market_data_audit_file, payload)
 
@@ -770,6 +919,7 @@ class PositionMonitor:
             tick["liquidity_usd"] = None
         if not self._metric_enabled("volume_m5"):
             tick["volume_m5"] = None
+        self._update_shadow_decision(position, tick)
         self._write_market_data_audit(position, tick)
         return tick
 
@@ -901,6 +1051,12 @@ class PositionMonitor:
             liquidity_drain_ticks=position.liquidity_drain_ticks,
             last_tick=tick,
             source_signal=position.source_signal,
+            shadow_exit_reason=position.shadow_exit_reason,
+            shadow_exit_price=position.shadow_exit_price,
+            shadow_exit_time=position.shadow_exit_time,
+            shadow_pnl_pct=position.shadow_pnl_pct,
+            shadow_max_profit_pct=position.shadow_max_profit_pct,
+            shadow_would_exit_before_dex=position.shadow_exit_time is not None,
         )
 
     def _write_position_tick(
@@ -939,6 +1095,19 @@ class PositionMonitor:
             "trailing_stop_price": position.trailing_stop_price,
             "pnl_pct": pnl_pct,
             "breakeven_activated": position.breakeven_activated,
+            "shadow_price": tick.get("shadow_price"),
+            "shadow_decision_status": tick.get("shadow_decision_status"),
+            "shadow_decision_reason": tick.get("shadow_decision_reason"),
+            "shadow_pnl_pct": position.shadow_pnl_pct,
+            "shadow_highest_price": position.shadow_highest_price,
+            "shadow_stop_price": position.shadow_stop_price,
+            "shadow_trailing_stop_price": position.shadow_trailing_stop_price,
+            "shadow_breakeven_activated": position.shadow_breakeven_activated,
+            "shadow_exit_reason": position.shadow_exit_reason,
+            "shadow_exit_price": position.shadow_exit_price,
+            "shadow_exit_time": position.shadow_exit_time,
+            "shadow_max_profit_pct": position.shadow_max_profit_pct,
+            "shadow_ticks": position.shadow_ticks,
             # Instrumentação de persistência registrada por tick para análise posterior.
             "health_ticks_above_087": position.health_ticks_above_087,
         }
