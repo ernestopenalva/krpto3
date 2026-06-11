@@ -118,6 +118,12 @@ position_monitor:
     liquidity_usd: true
     buy_pressure: true
 
+  onchain_audit:
+    enabled: true
+    provider: pumpswap
+    timeout_seconds: 15
+    write_global_file: true
+
 shadow_monitor:
   enabled: false
   poll_interval_seconds: 10

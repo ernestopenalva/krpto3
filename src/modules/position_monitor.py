@@ -38,10 +38,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.project_env import load_project_env
 from src.market_data.dexscreener_provider import DexscreenerProvider
+from src.market_data.pumpswap_provider import OnChainPumpSwapProvider
 from src.market_data.types import (
+    MarketDataError,
     MarketContext,
     MarketDataRateLimitError,
     MarketDataUnavailableError,
+    MarketTick,
 )
 
 load_project_env()
@@ -69,6 +72,9 @@ class OpenPosition:
     highest_price: float
     highest_price_time: str
     pair_address: Optional[str] = None
+    dex_id: Optional[str] = None
+    base_mint: Optional[str] = None
+    quote_mint: Optional[str] = None
     signal_price: Optional[float] = None
     execution_price: Optional[float] = None
     open_slippage_pct: Optional[float] = None
@@ -138,7 +144,15 @@ class PositionMonitor:
         self.trailing_stop_pct = float(position_cfg.get("trailing_stop_pct", 6.0))
         self.profit_lock_steps = position_cfg.get("profit_lock_steps", [])
         self.staleness_threshold_pct = float(position_cfg.get("staleness_threshold_pct", 2.0))
-        self.collect_metrics = position_cfg.get("collect_metrics", {})
+        self.collect_metrics = position_cfg.get("collect_metrics") or {}
+        self.onchain_audit_cfg = position_cfg.get("onchain_audit") or {}
+        self.onchain_audit_enabled = bool(self.onchain_audit_cfg.get("enabled", False))
+        self.onchain_audit_provider_name = str(
+            self.onchain_audit_cfg.get("provider", "pumpswap")
+        ).lower()
+        self.onchain_audit_write_global_file = bool(
+            self.onchain_audit_cfg.get("write_global_file", True)
+        )
         self.liquidity_exit_cfg = position_cfg.get("liquidity_exit", {})
         self.liquidity_exit_enabled = bool(self.liquidity_exit_cfg.get("enabled", False))
         self.liquidity_exit_drop_from_open_pct = float(
@@ -164,9 +178,11 @@ class PositionMonitor:
         self.open_positions_file = self.output_dir / "open_positions.json"
         self.closed_trades_file = self.output_dir / "closed_trades.json"
         self.ignored_signals_file = self.output_dir / "ignored_signals.json"
+        self.market_data_audit_file = self.output_dir / "market_data_audit.jsonl"
         self.history_dir = self.output_dir / "history"
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self.market_data_provider = DexscreenerProvider(timeout_seconds=15)
+        self.onchain_audit_provider = self._build_onchain_audit_provider()
 
     @staticmethod
     def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -244,6 +260,31 @@ class PositionMonitor:
         except (TypeError, ValueError):
             return None
 
+    def _build_onchain_audit_provider(self) -> Optional[OnChainPumpSwapProvider]:
+        if not self.onchain_audit_enabled:
+            return None
+        if self.onchain_audit_provider_name != "pumpswap":
+            self._log(
+                f"[{LOG_WARN}] Auditoria on-chain ignorada: provider "
+                f"{self.onchain_audit_provider_name!r} nao suportado."
+            )
+            return None
+
+        rpc_url = (
+            self.onchain_audit_cfg.get("rpc_url")
+            or os.getenv("KRPTO_SOLANA_RPC_URL")
+            or os.getenv("ALCHEMY_SOLANA_RPC_URL")
+        )
+        if not rpc_url:
+            self._log(
+                f"[{LOG_WARN}] Auditoria on-chain desabilitada: "
+                "KRPTO_SOLANA_RPC_URL/ALCHEMY_SOLANA_RPC_URL nao configurado."
+            )
+            return None
+
+        timeout_seconds = int(self.onchain_audit_cfg.get("timeout_seconds", 15))
+        return OnChainPumpSwapProvider(rpc_url=rpc_url, timeout_seconds=timeout_seconds)
+
     @staticmethod
     def _format_metric(value: Any) -> str:
         return "n/a" if value is None else str(value)
@@ -260,6 +301,148 @@ class PositionMonitor:
             f"backoff={self.rate_limit_backoff_seconds}s "
             f"count={self.rate_limit_counts[token_key]}"
         )
+
+    def _source_signal_value(self, position: OpenPosition, *keys: str) -> Any:
+        for key in keys:
+            if key in position.source_signal and position.source_signal.get(key) is not None:
+                return position.source_signal.get(key)
+        return None
+
+    def _context_from_position(
+        self,
+        position: OpenPosition,
+        market_tick: Optional[MarketTick] = None,
+    ) -> MarketContext:
+        return MarketContext(
+            token_address=position.token_address,
+            chain_id=position.chain_id,
+            symbol=position.symbol,
+            pair_address=(
+                (market_tick.pair_address if market_tick else None)
+                or position.pair_address
+                or self._source_signal_value(position, "pair_address", "pairAddress")
+            ),
+            dex_id=(
+                (market_tick.dex_id if market_tick else None)
+                or position.dex_id
+                or self._source_signal_value(position, "dex_id", "dexId")
+            ),
+            base_mint=(
+                (market_tick.base_mint if market_tick else None)
+                or position.base_mint
+                or self._source_signal_value(position, "base_mint", "baseMint")
+            ),
+            quote_mint=(
+                (market_tick.quote_mint if market_tick else None)
+                or position.quote_mint
+                or self._source_signal_value(position, "quote_mint", "quoteMint")
+            ),
+        )
+
+    def _build_onchain_audit(
+        self,
+        position: OpenPosition,
+        dex_market_tick: MarketTick,
+    ) -> Dict[str, Any]:
+        audit: Dict[str, Any] = {
+            "market_data_decision_source": self.market_data_provider.source,
+            "onchain_audit_enabled": self.onchain_audit_enabled,
+            "dex_price": dex_market_tick.price,
+            "dex_price_usd": dex_market_tick.price_usd,
+            "dex_price_native": dex_market_tick.price_native,
+            "dex_liquidity_usd": dex_market_tick.liquidity_usd,
+        }
+
+        if not self.onchain_audit_enabled:
+            return audit
+        if self.onchain_audit_provider is None:
+            audit.update(
+                {
+                    "onchain_status": "disabled",
+                    "onchain_reason": "provider_unavailable",
+                }
+            )
+            return audit
+
+        context = self._context_from_position(position, dex_market_tick)
+        if (context.chain_id or "").lower() != "solana" or (context.dex_id or "").lower() != "pumpswap":
+            audit.update(
+                {
+                    "onchain_status": "skipped",
+                    "onchain_reason": "unsupported_chain_or_dex",
+                    "onchain_dex_id": context.dex_id,
+                }
+            )
+            return audit
+
+        try:
+            onchain_tick = self.onchain_audit_provider.get_position_tick(context)
+        except MarketDataError as exc:
+            audit.update(
+                {
+                    "onchain_status": "error",
+                    "onchain_reason": str(exc),
+                }
+            )
+            return audit
+
+        if onchain_tick is None:
+            audit.update(
+                {
+                    "onchain_status": "unavailable",
+                    "onchain_reason": "empty_tick",
+                }
+            )
+            return audit
+
+        raw = onchain_tick.raw or {}
+        onchain_status = raw.get("status")
+        onchain_reason = raw.get("reason")
+        dex_native = dex_market_tick.price_native
+        onchain_native = onchain_tick.price_native
+        divergence_pct = None
+        if dex_native and onchain_native is not None:
+            divergence_pct = ((onchain_native / dex_native) - 1) * 100
+
+        audit.update(
+            {
+                "onchain_source": onchain_tick.source,
+                "onchain_status": onchain_status,
+                "onchain_reason": onchain_reason,
+                "onchain_timestamp": onchain_tick.timestamp,
+                "onchain_slot": raw.get("slot"),
+                "onchain_price_native": onchain_native,
+                "onchain_liquidity_native": raw.get("liquidity_native"),
+                "onchain_base_reserve": raw.get("base_reserve"),
+                "onchain_quote_reserve": raw.get("quote_reserve"),
+                "divergence_pct": divergence_pct,
+            }
+        )
+        return audit
+
+    def _write_market_data_audit(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
+        if not self.onchain_audit_write_global_file:
+            return
+        if "onchain_status" not in tick:
+            return
+        payload = {
+            "timestamp": tick.get("timestamp") or self._now_iso(),
+            "symbol": position.symbol,
+            "token_address": position.token_address,
+            "chain_id": position.chain_id,
+            "pair_address": tick.get("pair_address"),
+            "dex_id": tick.get("dex_id"),
+            "decision_price": tick.get("price"),
+            "market_data_decision_source": tick.get("market_data_decision_source"),
+            "dex_price_native": tick.get("dex_price_native"),
+            "onchain_price_native": tick.get("onchain_price_native"),
+            "divergence_pct": tick.get("divergence_pct"),
+            "onchain_status": tick.get("onchain_status"),
+            "onchain_reason": tick.get("onchain_reason"),
+            "onchain_slot": tick.get("onchain_slot"),
+            "onchain_timestamp": tick.get("onchain_timestamp"),
+        }
+        self._append_jsonl(self.market_data_audit_file, payload)
 
     @staticmethod
     def _is_valid_price(value: Any) -> bool:
@@ -359,6 +542,9 @@ class PositionMonitor:
             highest_price=entry_price or 1.0,
             highest_price_time=signal.get("timestamp") or self._now_iso(),
             pair_address=signal.get("pair_address") or signal.get("pairAddress"),
+            dex_id=signal.get("dex_id") or signal.get("dexId"),
+            base_mint=signal.get("base_mint") or signal.get("baseMint"),
+            quote_mint=signal.get("quote_mint") or signal.get("quoteMint"),
             source_signal=signal,
         )
         tick = self.fetch_market_tick(probe)
@@ -415,6 +601,9 @@ class PositionMonitor:
             highest_price=entry_price,
             highest_price_time=entry_time,
             pair_address=signal.get("pair_address") or signal.get("pairAddress"),
+            dex_id=signal.get("dex_id") or signal.get("dexId"),
+            base_mint=signal.get("base_mint") or signal.get("baseMint"),
+            quote_mint=signal.get("quote_mint") or signal.get("quoteMint"),
             signal_price=entry_price,
             execution_price=current_price,
             open_slippage_pct=variation,
@@ -496,6 +685,9 @@ class PositionMonitor:
                 highest_price=entry_price,
                 highest_price_time=entry_time,
                 pair_address=signal.get("pair_address") or signal.get("pairAddress"),
+                dex_id=signal.get("dex_id") or signal.get("dexId"),
+                base_mint=signal.get("base_mint") or signal.get("baseMint"),
+                quote_mint=signal.get("quote_mint") or signal.get("quoteMint"),
                 stop_price=stop_price,
                 source_signal=signal,
             )
@@ -524,12 +716,7 @@ class PositionMonitor:
         return 0.0
 
     def fetch_market_tick(self, position: OpenPosition) -> Optional[Dict[str, Any]]:
-        context = MarketContext(
-            token_address=position.token_address,
-            chain_id=position.chain_id,
-            symbol=position.symbol,
-            pair_address=position.pair_address,
-        )
+        context = self._context_from_position(position)
         try:
             market_tick = self.market_data_provider.get_position_tick(context)
         except MarketDataRateLimitError as exc:
@@ -545,6 +732,14 @@ class PositionMonitor:
             return None
 
         tick = market_tick.to_position_tick()
+        audit = self._build_onchain_audit(position, market_tick)
+        tick.update(audit)
+
+        position.pair_address = position.pair_address or tick.get("pair_address")
+        position.dex_id = position.dex_id or tick.get("dex_id")
+        position.base_mint = position.base_mint or tick.get("base_mint")
+        position.quote_mint = position.quote_mint or tick.get("quote_mint")
+
         raw_price = tick.get("price")
         if not self._is_valid_price(raw_price):
             self._log(
@@ -575,6 +770,7 @@ class PositionMonitor:
             tick["liquidity_usd"] = None
         if not self._metric_enabled("volume_m5"):
             tick["volume_m5"] = None
+        self._write_market_data_audit(position, tick)
         return tick
 
     def _update_liquidity_exit_state(self, position: OpenPosition, tick: Dict[str, Any], pnl_pct: float) -> bool:
