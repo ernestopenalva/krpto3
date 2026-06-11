@@ -3,12 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.project_env import load_project_env
+
+load_project_env()
+
 KNOWN_DEXES = ("pumpswap", "raydium", "meteora", "orca")
 
 

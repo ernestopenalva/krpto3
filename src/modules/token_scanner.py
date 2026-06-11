@@ -13,6 +13,7 @@ rodar este módulo uma única vez durante testes.
 """
 
 import json
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -20,6 +21,14 @@ from zoneinfo import ZoneInfo
 
 import requests
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.project_env import load_project_env
+
+load_project_env()
 
 
 # ============================================================
@@ -41,8 +50,7 @@ SOLANA_BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqr
 # ============================================================
 
 def load_config():
-    base_dir = Path(__file__).resolve().parents[2]
-    config_path = base_dir / "config" / "config.yaml"
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 

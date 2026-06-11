@@ -9,6 +9,7 @@ principal e não chama o position monitor.
 
 import json
 import os
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -19,9 +20,17 @@ from zoneinfo import ZoneInfo
 import requests
 import yaml
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.project_env import load_project_env
+
+load_project_env()
+
 
 def load_config() -> Dict[str, Any]:
-    config_path = Path(__file__).resolve().parents[2] / "config" / "config.yaml"
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
     with config_path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 

@@ -36,12 +36,15 @@ CONFIG_FILE = PROJECT_ROOT / "config" / "config.yaml"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.project_env import load_project_env
 from src.market_data.dexscreener_provider import DexscreenerProvider
 from src.market_data.types import (
     MarketContext,
     MarketDataRateLimitError,
     MarketDataUnavailableError,
 )
+
+load_project_env()
 
 
 LOG_PAPER_BUY = "PAPER BUY"

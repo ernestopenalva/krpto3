@@ -12,10 +12,17 @@ from typing import Any, Dict, List, Optional
 import requests
 import yaml
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.project_env import load_project_env
+
+load_project_env()
+
 
 def load_config():
-    base_dir = Path(__file__).resolve().parents[2]
-    config_path = base_dir / "config" / "config.yaml"
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
 
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -33,7 +40,6 @@ SHADOW_CFG = CONFIG.get("shadow_monitor", {})
 # CONFIGURAÇÕES V1
 # =========================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPUT_FILE = Path(CFG.get("input_file", "data/token_scanner/final_monitoring_candidates.json"))
 
 OUTPUT_DIR = Path(CFG.get("output_dir", "data/token_monitor"))
