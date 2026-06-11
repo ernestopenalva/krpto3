@@ -10,6 +10,9 @@ class MarketContext:
     chain_id: str
     symbol: str
     pair_address: Optional[str] = None
+    dex_id: Optional[str] = None
+    base_mint: Optional[str] = None
+    quote_mint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,7 @@ class MarketTick:
     token_address: str
     price: Any
     price_usd: Any
+    price_native: Optional[float] = None
     pair_address: Optional[str] = None
     dex_id: Optional[str] = None
     liquidity_usd: Optional[float] = None
@@ -42,6 +46,7 @@ class MarketTick:
             "token_address": self.token_address,
             "price": self.price,
             "price_usd": self.price_usd,
+            "price_native": self.price_native,
             "liquidity_usd": self.liquidity_usd,
             "volume_m5": self.volume_m5,
             "volume_h1": self.volume_h1,
@@ -69,4 +74,3 @@ class MarketDataRateLimitError(MarketDataError):
 
 class MarketDataUnavailableError(MarketDataError):
     pass
-

@@ -82,6 +82,7 @@ class DexscreenerProvider(MarketDataProvider):
             token_address=context.token_address,
             price=price,
             price_usd=price,
+            price_native=self._optional_float(pair.get("priceNative")),
             liquidity_usd=self._optional_float((pair.get("liquidity") or {}).get("usd")),
             volume_m5=self._optional_float((pair.get("volume") or {}).get("m5")),
             volume_h1=self._safe_float((pair.get("volume") or {}).get("h1")),
