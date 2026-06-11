@@ -40,6 +40,17 @@ class SolanaRpcClient:
         result = self.call("getSlot")
         return int(result) if result is not None else None
 
+    def get_account_info(self, address: str, encoding: str = "base64") -> Optional[Dict[str, Any]]:
+        result = self.call(
+            "getAccountInfo",
+            [
+                address,
+                {"encoding": encoding},
+            ],
+        )
+        value = result.get("value") if isinstance(result, dict) else None
+        return value if isinstance(value, dict) else None
+
     def get_token_accounts_by_owner(self, owner: str, token_program_id: str) -> List[Dict[str, Any]]:
         result = self.call(
             "getTokenAccountsByOwner",
