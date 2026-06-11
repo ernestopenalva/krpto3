@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import requests
 import sys
 import time
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from src.tools.pumpswap_dual_audit import (
 
 
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "market_data" / "pumpswap_staleness_audit.jsonl"
+DEXSCREENER_LATEST_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain_id}/{token_address}"
 
 
 @dataclass
@@ -41,9 +44,23 @@ class SourceState:
     max_same_seconds: float = 0.0
     changed_count: int = 0
     sample_count: int = 0
+    unavailable_count: int = 0
 
-    def update(self, value: Optional[float], observed_at: float) -> bool:
+    def update(self, value: Optional[float], observed_at: float, sampled: bool = True) -> bool:
+        if not sampled:
+            if self.last_changed_at is not None:
+                self.same_seconds = max(0.0, observed_at - self.last_changed_at)
+                self.max_same_seconds = max(self.max_same_seconds, self.same_seconds)
+            return False
+
         self.sample_count += 1
+        if value is None:
+            self.unavailable_count += 1
+            if self.last_changed_at is not None:
+                self.same_seconds = max(0.0, observed_at - self.last_changed_at)
+                self.max_same_seconds = max(self.max_same_seconds, self.same_seconds)
+            return False
+
         changed = value is not None and value != self.last_value
         if changed:
             self.last_value = value
@@ -69,6 +86,9 @@ class PoolState:
     context: MarketContext
     dex: SourceState
     onchain: SourceState
+    last_dex_tick: Optional[MarketTick] = None
+    last_dex_error: Optional[str] = None
+    next_dex_poll_at: float = 0.0
     ok_samples: int = 0
     unresolved_samples: int = 0
     max_abs_divergence_pct: Optional[float] = None
@@ -110,17 +130,87 @@ def fetch_onchain_tick(
         return None, str(exc)
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_latest_pumpswap_contexts(limit: int, min_liquidity_usd: float) -> list[MarketContext]:
+    response = requests.get(DEXSCREENER_LATEST_PROFILES_URL, timeout=20)
+    response.raise_for_status()
+    profiles = response.json()
+    contexts: list[MarketContext] = []
+    seen_pairs: set[str] = set()
+
+    for profile in profiles if isinstance(profiles, list) else []:
+        if profile.get("chainId") != "solana":
+            continue
+        token_address = profile.get("tokenAddress")
+        if not token_address:
+            continue
+        pairs_url = DEXSCREENER_TOKEN_PAIRS_URL.format(
+            chain_id="solana",
+            token_address=token_address,
+        )
+        try:
+            pairs_response = requests.get(pairs_url, timeout=20)
+            pairs_response.raise_for_status()
+            pairs = pairs_response.json()
+        except requests.RequestException:
+            continue
+
+        if not isinstance(pairs, list):
+            continue
+        pumpswap_pairs = [
+            pair
+            for pair in pairs
+            if isinstance(pair, dict)
+            and str(pair.get("dexId") or "").lower() == "pumpswap"
+            and safe_float((pair.get("liquidity") or {}).get("usd")) >= min_liquidity_usd
+        ]
+        pumpswap_pairs.sort(
+            key=lambda pair: safe_float((pair.get("liquidity") or {}).get("usd")),
+            reverse=True,
+        )
+        for pair in pumpswap_pairs:
+            pair_address = pair.get("pairAddress")
+            if not pair_address or pair_address in seen_pairs:
+                continue
+            base_token = pair.get("baseToken") or {}
+            quote_token = pair.get("quoteToken") or {}
+            contexts.append(
+                MarketContext(
+                    token_address=str(base_token.get("address") or token_address),
+                    chain_id="solana",
+                    symbol=str(base_token.get("symbol") or profile.get("symbol") or token_address[:8]),
+                    pair_address=str(pair_address),
+                    dex_id="pumpswap",
+                    base_mint=base_token.get("address"),
+                    quote_mint=quote_token.get("address"),
+                )
+            )
+            seen_pairs.add(str(pair_address))
+            if len(contexts) >= limit:
+                return contexts
+    return contexts
+
+
 def build_record(
     pool_state: PoolState,
     dex_tick: Optional[MarketTick],
     dex_error: Optional[str],
+    dex_polled: bool,
     onchain_tick: Optional[MarketTick],
     onchain_error: Optional[str],
     observed_at: float,
 ) -> Dict[str, Any]:
     dex_native = dex_tick.price_native if dex_tick else None
     onchain_native = onchain_tick.price_native if onchain_tick else None
-    dex_changed = pool_state.dex.update(dex_native, observed_at)
+    dex_changed = pool_state.dex.update(dex_native, observed_at, sampled=dex_polled)
     onchain_changed = pool_state.onchain.update(onchain_native, observed_at)
     divergence = pct_diff(onchain_native, dex_native)
     pool_state.max_abs_divergence_pct = update_max_abs(pool_state.max_abs_divergence_pct, divergence)
@@ -142,6 +232,7 @@ def build_record(
         "dex_native": dex_native,
         "onchain_native": onchain_native,
         "divergence_pct": divergence,
+        "dex_polled": dex_polled,
         "dex_changed": dex_changed,
         "onchain_changed": onchain_changed,
         "dex_same_seconds": pool_state.dex.same_seconds,
@@ -160,8 +251,11 @@ def print_summary(pool_states: Dict[str, PoolState]) -> None:
     print("\n# Resumo")
     for state in pool_states.values():
         print(
-            f"{state.context.symbol} | samples={state.dex.sample_count} | "
+            f"{state.context.symbol} | dex_polls={state.dex.sample_count} | "
+            f"onchain_samples={state.onchain.sample_count} | "
             f"dex_changes={state.dex.changed_count} | onchain_changes={state.onchain.changed_count} | "
+            f"dex_unavailable={state.dex.unavailable_count} | "
+            f"onchain_unavailable={state.onchain.unavailable_count} | "
             f"dex_max_same={state.dex.max_same_seconds:.1f}s | "
             f"onchain_max_same={state.onchain.max_same_seconds:.1f}s | "
             f"onchain_ok={state.ok_samples} | onchain_unresolved={state.unresolved_samples} | "
@@ -175,17 +269,37 @@ def main() -> None:
     parser.add_argument("--rpc-url", help="Endpoint RPC Solana/Alchemy.")
     parser.add_argument(
         "--source",
-        choices=("candidates", "watchlist", "signals", "trades", "all"),
+        choices=("candidates", "watchlist", "signals", "trades", "all", "latest"),
         default="signals",
     )
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--duration-seconds", type=int, default=300)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--min-liquidity-usd",
+        type=float,
+        default=10_000.0,
+        help="Liquidez minima usada somente com --source latest.",
+    )
+    parser.add_argument(
+        "--dex-interval-seconds",
+        type=float,
+        default=30.0,
+        help="Intervalo minimo entre consultas Dexscreener por pool.",
+    )
+    parser.add_argument(
+        "--skip-dex",
+        action="store_true",
+        help="Nao consulta Dexscreener durante o loop; mede apenas on-chain.",
+    )
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     args = parser.parse_args()
 
     rpc_url = resolve_rpc_url(args.rpc_url)
-    raw_contexts = unique_pumpswap_contexts(load_source_items(args.source), args.limit)
+    if args.source == "latest":
+        raw_contexts = fetch_latest_pumpswap_contexts(args.limit, args.min_liquidity_usd)
+    else:
+        raw_contexts = unique_pumpswap_contexts(load_source_items(args.source), args.limit)
     if not raw_contexts:
         print("Nenhuma pool PumpSwap encontrada para auditar.")
         return
@@ -196,18 +310,23 @@ def main() -> None:
 
     pool_states: Dict[str, PoolState] = {}
     for context in raw_contexts:
-        dex_tick, _error = fetch_dex_tick(dex_provider, context)
-        context = enrich_context_from_dex_tick(context, dex_tick)
+        dex_tick = None
+        if not args.skip_dex:
+            dex_tick, _error = fetch_dex_tick(dex_provider, context)
+            context = enrich_context_from_dex_tick(context, dex_tick)
         pool_states[str(context.pair_address)] = PoolState(
             context=context,
             dex=SourceState(),
             onchain=SourceState(),
+            last_dex_tick=dex_tick,
+            next_dex_poll_at=0.0,
         )
 
     print("# PumpSwap Staleness Audit")
     print(
         f"fonte={args.source} | pools={len(pool_states)} | "
         f"duration={args.duration_seconds}s | interval={args.interval_seconds}s | "
+        f"dex_interval={args.dex_interval_seconds}s | skip_dex={args.skip_dex} | "
         f"output={output_path}"
     )
 
@@ -223,16 +342,33 @@ def main() -> None:
 
         for state in pool_states.values():
             observed_at = time.time()
-            dex_tick, dex_error = fetch_dex_tick(dex_provider, state.context)
-            enriched_context = enrich_context_from_dex_tick(state.context, dex_tick)
-            if enriched_context != state.context:
-                state.context = enriched_context
+            dex_polled = False
+            dex_tick = state.last_dex_tick
+            dex_error = state.last_dex_error
+            if not args.skip_dex and observed_at >= state.next_dex_poll_at:
+                dex_polled = True
+                dex_tick, dex_error = fetch_dex_tick(dex_provider, state.context)
+                state.last_dex_tick = dex_tick
+                state.last_dex_error = dex_error
+                state.next_dex_poll_at = observed_at + args.dex_interval_seconds
+                enriched_context = enrich_context_from_dex_tick(state.context, dex_tick)
+                if enriched_context != state.context:
+                    state.context = enriched_context
             onchain_tick, onchain_error = fetch_onchain_tick(onchain_provider, state.context)
-            record = build_record(state, dex_tick, dex_error, onchain_tick, onchain_error, observed_at)
+            record = build_record(
+                state,
+                dex_tick,
+                dex_error,
+                dex_polled,
+                onchain_tick,
+                onchain_error,
+                observed_at,
+            )
             append_jsonl(output_path, record)
             print(
                 f"{record['timestamp']} | {record['symbol']} | "
-                f"dex={record['dex_native']} | onchain={record['onchain_native']} | "
+                f"dex={record['dex_native']} | dex_polled={record['dex_polled']} | "
+                f"onchain={record['onchain_native']} | "
                 f"div={record['divergence_pct'] if record['divergence_pct'] is not None else 'n/a'} | "
                 f"dex_same={record['dex_same_seconds']:.1f}s | "
                 f"onchain_same={record['onchain_same_seconds']:.1f}s | "
