@@ -19,6 +19,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -26,16 +27,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
 import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = PROJECT_ROOT / "config" / "config.yaml"
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain_id}/{token_address}"
-DEXSCREENER_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs/{chain_id}/{pair_address}"
+from src.market_data.dexscreener_provider import DexscreenerProvider
+from src.market_data.types import (
+    MarketContext,
+    MarketDataRateLimitError,
+    MarketDataUnavailableError,
+)
+
 
 LOG_PAPER_BUY = "PAPER BUY"
 LOG_PAPER_SELL = "PAPER SELL"
@@ -156,6 +163,7 @@ class PositionMonitor:
         self.ignored_signals_file = self.output_dir / "ignored_signals.json"
         self.history_dir = self.output_dir / "history"
         self.history_dir.mkdir(parents=True, exist_ok=True)
+        self.market_data_provider = DexscreenerProvider(timeout_seconds=15)
 
     @staticmethod
     def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -513,44 +521,29 @@ class PositionMonitor:
         return 0.0
 
     def fetch_market_tick(self, position: OpenPosition) -> Optional[Dict[str, Any]]:
-        url = DEXSCREENER_TOKEN_PAIRS_URL.format(
-            chain_id=position.chain_id,
+        context = MarketContext(
             token_address=position.token_address,
+            chain_id=position.chain_id,
+            symbol=position.symbol,
+            pair_address=position.pair_address,
         )
         try:
-            if position.pair_address:
-                url = DEXSCREENER_PAIR_URL.format(
-                    chain_id=position.chain_id,
-                    pair_address=position.pair_address,
-                )
-                response = requests.get(url, timeout=15)
-                response.raise_for_status()
-                payload = response.json()
-                pairs = payload.get("pairs") or [] if isinstance(payload, dict) else []
-            else:
-                response = requests.get(url, timeout=15)
-                response.raise_for_status()
-                pairs = response.json()
-        except requests.HTTPError as exc:
-            status_code = exc.response.status_code if exc.response is not None else None
-            if status_code == 429:
-                self._log_rate_limit(position, url)
-                time.sleep(self.rate_limit_backoff_seconds)
-                return None
-            self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
+            market_tick = self.market_data_provider.get_position_tick(context)
+        except MarketDataRateLimitError as exc:
+            self._log_rate_limit(position, exc.endpoint)
+            time.sleep(self.rate_limit_backoff_seconds)
             return None
-        except requests.RequestException as exc:
+        except MarketDataUnavailableError as exc:
             self._log(f"[{LOG_WARN}] Falha ao consultar Dexscreener para {position.symbol}: {exc}")
             return None
 
-        if not isinstance(pairs, list) or not pairs or not all(isinstance(pair, dict) for pair in pairs):
+        if market_tick is None:
             self._log(f"[{LOG_WARN}] Sem pares Dexscreener para {position.symbol}")
             return None
 
-        pair = pairs[0] if position.pair_address else self._choose_best_pair(pairs)
-        raw_price = pair.get("priceUsd")
-        price = self._safe_float(raw_price)
-        if not self._is_valid_price(price):
+        tick = market_tick.to_position_tick()
+        raw_price = tick.get("price")
+        if not self._is_valid_price(raw_price):
             self._log(
                 f"[{LOG_WARN}] [INVALID PRICE] position token={position.symbol} "
                 f"price={raw_price!r} skipped_invalid_price_ticks=1"
@@ -562,51 +555,24 @@ class PositionMonitor:
                     "symbol": position.symbol,
                     "token_address": position.token_address,
                     "price": raw_price,
-                    "pair_address": pair.get("pairAddress"),
+                    "pair_address": tick.get("pair_address"),
+                    "source": tick.get("source"),
+                    "dex_id": tick.get("dex_id"),
+                    "base_mint": tick.get("base_mint"),
+                    "quote_mint": tick.get("quote_mint"),
                 },
                 audit_reason="invalid_market_price",
             )
             self._log(f"[{LOG_WARN}] Preço inválido para {position.symbol}")
             return None
 
-        txns_m5 = (pair.get("txns") or {}).get("m5") or {}
-        buys_m5 = self._safe_float(txns_m5.get("buys"))
-        sells_m5 = self._safe_float(txns_m5.get("sells"))
-        total_txns_m5 = buys_m5 + sells_m5
-        has_txns_m5 = "buys" in txns_m5 or "sells" in txns_m5
-        buy_pressure = buys_m5 / total_txns_m5 if total_txns_m5 > 0 else (0.0 if has_txns_m5 else None)
         if not self._metric_enabled("buy_pressure"):
-            buy_pressure = None
-
-        tick = {
-            "timestamp": self._now_iso(),
-            "symbol": position.symbol,
-            "token_address": position.token_address,
-            "price": price,
-            "liquidity_usd": (
-                self._optional_float((pair.get("liquidity") or {}).get("usd"))
-                if self._metric_enabled("liquidity_usd")
-                else None
-            ),
-            "volume_m5": (
-                self._optional_float((pair.get("volume") or {}).get("m5"))
-                if self._metric_enabled("volume_m5")
-                else None
-            ),
-            "volume_h1": self._safe_float((pair.get("volume") or {}).get("h1")),
-            "price_change_m5": self._safe_float((pair.get("priceChange") or {}).get("m5")),
-            "price_change_h1": self._safe_float((pair.get("priceChange") or {}).get("h1")),
-            "buy_pressure": buy_pressure,
-            "dex_id": pair.get("dexId"),
-            "pair_address": pair.get("pairAddress"),
-        }
+            tick["buy_pressure"] = None
+        if not self._metric_enabled("liquidity_usd"):
+            tick["liquidity_usd"] = None
+        if not self._metric_enabled("volume_m5"):
+            tick["volume_m5"] = None
         return tick
-
-    def _choose_best_pair(self, pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return max(
-            pairs,
-            key=lambda pair: self._safe_float((pair.get("liquidity") or {}).get("usd")),
-        )
 
     def _update_liquidity_exit_state(self, position: OpenPosition, tick: Dict[str, Any], pnl_pct: float) -> bool:
         liquidity = self._optional_float(tick.get("liquidity_usd"))

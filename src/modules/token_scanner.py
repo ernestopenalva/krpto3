@@ -183,6 +183,11 @@ def add_to_watchlist(watchlist: dict, candidates: list) -> tuple[dict, int]:
         watchlist[token_address] = {
             "token_address": token_address,
             "symbol": candidate.get("symbol", token_address[:6]),
+            "dex_id": candidate.get("dex_id"),
+            "pair_address": candidate.get("pair_address"),
+            "base_mint": candidate.get("base_mint"),
+            "quote_mint": candidate.get("quote_mint"),
+            "liquidity_usd": candidate.get("liquidity_usd"),
             "discovered_at": now_iso(),
             "discovered_at_utc": now_utc().isoformat(),
             "status": "novo",
@@ -512,13 +517,29 @@ def get_final_filter_rejection_reasons(jupiter_validation, config):
     return reasons
 
 
+def build_pool_metadata(pair):
+    base_token = pair.get("baseToken") or {}
+    quote_token = pair.get("quoteToken") or {}
+    return {
+        "dex_id": pair.get("dexId"),
+        "pair_address": pair.get("pairAddress"),
+        "base_mint": base_token.get("address"),
+        "quote_mint": quote_token.get("address"),
+        "liquidity_usd": get_nested_number(pair, ["liquidity", "usd"]),
+    }
+
+
 def build_final_candidate(item):
     validation = item["jupiter_validation"]
     token_info = validation["token_info"]["data"]
+    selected_pair = item["candidate"].get("selected_pair", {})
+    pool_metadata = build_pool_metadata(selected_pair)
     return {
         "token_address": validation["token_address"],
         "symbol": token_info.get("symbol"),
         "name": token_info.get("name"),
+        **pool_metadata,
+        "pool_metadata": pool_metadata,
         "candidate": item["candidate"],
         "jupiter_validation_summary": {
             "approved_by_jupiter": validation.get("approved_by_jupiter"),
@@ -605,7 +626,15 @@ def run_scanner_cycle(config: dict, watchlist: dict) -> tuple[dict, list]:
             print(f"[Filtro Final] REPROVADO {symbol} | " + " | ".join(reasons))
             continue
 
-        print(f"[Filtro Final] APROVADO {symbol}")
+        pool_metadata = build_pool_metadata(candidate.get("selected_pair", {}))
+        print(
+            f"[Filtro Final] APROVADO {symbol} | "
+            f"dex_id={pool_metadata.get('dex_id')} | "
+            f"pair_address={pool_metadata.get('pair_address')} | "
+            f"base_mint={pool_metadata.get('base_mint')} | "
+            f"quote_mint={pool_metadata.get('quote_mint')} | "
+            f"liquidity_usd={pool_metadata.get('liquidity_usd')}"
+        )
         item = {"candidate": candidate, "jupiter_validation": validation}
         final_candidates.append(build_final_candidate(item))
 
