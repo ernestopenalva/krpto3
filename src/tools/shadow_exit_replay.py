@@ -53,6 +53,8 @@ class ReplayResult:
     delta_pnl_pct: Optional[float]
     replay_before_real_seconds: Optional[float]
     rows: int
+    detail_events: List[Dict[str, Any]]
+    detail_rows: List[Dict[str, Any]]
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -164,6 +166,20 @@ def build_grid(base: BaseRules) -> List[ReplayConfig]:
     return configs
 
 
+def build_selected_config(base: BaseRules, persist: Optional[int], be: Optional[str]) -> Optional[ReplayConfig]:
+    if persist is None and be is None:
+        return None
+    persistence = persist if persist is not None else 0
+    trigger_label = be or "current"
+    rules = rules_with_breakeven_trigger(base, trigger_label)
+    return ReplayConfig(
+        label=f"persist={persistence}s|be={trigger_label}",
+        persistence_seconds=persistence,
+        breakeven_trigger_label=trigger_label,
+        rules=rules,
+    )
+
+
 def row_matches_trade(row: Dict[str, Any], trade: Dict[str, Any]) -> bool:
     symbol = str(row.get("symbol") or "").strip().casefold()
     trade_symbol = str(trade.get("symbol") or "").strip().casefold()
@@ -236,6 +252,8 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
             delta_pnl_pct=None,
             replay_before_real_seconds=None,
             rows=0,
+            detail_events=[],
+            detail_rows=[],
         )
 
     entry_price = safe_float(rows[0].get("shadow_entry_price")) or safe_float(rows[0].get("shadow_price"))
@@ -254,6 +272,8 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
             delta_pnl_pct=None,
             replay_before_real_seconds=None,
             rows=len(rows),
+            detail_events=[],
+            detail_rows=[],
         )
 
     hard_stop_price = entry_price * (1 - config.rules.stop_loss_pct / 100)
@@ -268,6 +288,8 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
     exit_price = None
     exit_time = None
     exit_pnl = None
+    detail_events: List[Dict[str, Any]] = []
+    detail_rows: List[Dict[str, Any]] = []
 
     for row in rows:
         current_price = safe_float(row.get("shadow_price"))
@@ -275,10 +297,21 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
         if current_price is None or current_price <= 0 or timestamp is None:
             continue
 
+        pnl_pct = ((current_price / entry_price) - 1) * 100
         if current_price > highest_price:
             highest_price = current_price
+            detail_events.append(
+                {
+                    "event": "NEW_HIGH",
+                    "timestamp": row.get("timestamp"),
+                    "price": current_price,
+                    "pnl_pct": pnl_pct,
+                    "highest_price": highest_price,
+                    "stop_price": stop_price,
+                    "trailing_stop_price": trailing_stop_price,
+                }
+            )
 
-        pnl_pct = ((current_price / entry_price) - 1) * 100
         best_lock_pct = None
         for trigger_pct, lock_pct in config.rules.profit_lock_steps:
             if pnl_pct >= trigger_pct:
@@ -290,15 +323,49 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
             if new_stop_price > stop_price:
                 stop_price = new_stop_price
                 breakeven_activated = True
+                detail_events.append(
+                    {
+                        "event": "BREAKEVEN_ARMED",
+                        "timestamp": row.get("timestamp"),
+                        "price": current_price,
+                        "pnl_pct": pnl_pct,
+                        "lock_pct": best_lock_pct,
+                        "stop_price": stop_price,
+                        "highest_price": highest_price,
+                    }
+                )
 
         if breakeven_activated:
+            old_trailing = trailing_stop_price
             trailing_stop_price = highest_price * (1 - config.rules.trailing_stop_pct / 100)
+            if old_trailing is None or trailing_stop_price > old_trailing:
+                detail_events.append(
+                    {
+                        "event": "TRAILING_UPDATED",
+                        "timestamp": row.get("timestamp"),
+                        "price": current_price,
+                        "pnl_pct": pnl_pct,
+                        "trailing_stop_price": trailing_stop_price,
+                        "highest_price": highest_price,
+                    }
+                )
 
         if current_price <= hard_stop_price:
             exit_reason = "STOP_LOSS"
             exit_price = current_price
             exit_time = row.get("timestamp")
             exit_pnl = pnl_pct
+            detail_events.append(
+                {
+                    "event": "EXIT",
+                    "timestamp": exit_time,
+                    "reason": exit_reason,
+                    "price": exit_price,
+                    "pnl_pct": exit_pnl,
+                    "stop_price": stop_price,
+                    "trailing_stop_price": trailing_stop_price,
+                }
+            )
             break
 
         breakeven_condition = breakeven_activated and current_price <= stop_price
@@ -313,6 +380,20 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
             exit_price = current_price
             exit_time = row.get("timestamp")
             exit_pnl = pnl_pct
+            detail_events.append(
+                {
+                    "event": "EXIT",
+                    "timestamp": exit_time,
+                    "reason": exit_reason,
+                    "price": exit_price,
+                    "pnl_pct": exit_pnl,
+                    "condition_started_at": breakeven_condition_started_at.isoformat()
+                    if breakeven_condition_started_at
+                    else None,
+                    "stop_price": stop_price,
+                    "trailing_stop_price": trailing_stop_price,
+                }
+            )
             break
 
         trailing_condition = trailing_stop_price is not None and current_price <= trailing_stop_price
@@ -327,6 +408,20 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
             exit_price = current_price
             exit_time = row.get("timestamp")
             exit_pnl = pnl_pct
+            detail_events.append(
+                {
+                    "event": "EXIT",
+                    "timestamp": exit_time,
+                    "reason": exit_reason,
+                    "price": exit_price,
+                    "pnl_pct": exit_pnl,
+                    "condition_started_at": trailing_condition_started_at.isoformat()
+                    if trailing_condition_started_at
+                    else None,
+                    "stop_price": stop_price,
+                    "trailing_stop_price": trailing_stop_price,
+                }
+            )
             break
 
     if exit_reason is None:
@@ -343,6 +438,18 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
     before = None
     if real_dt is not None and replay_dt is not None:
         before = (real_dt - replay_dt).total_seconds()
+    if detail_events:
+        event_times = [parse_time(event.get("timestamp")) for event in detail_events]
+        event_times = [item for item in event_times if item is not None]
+        if event_times:
+            start = min(event_times)
+            end = max(event_times)
+            detail_rows = [
+                row
+                for row in rows
+                if (ts := parse_time(row.get("timestamp"))) is not None
+                and (start.timestamp() - 10) <= ts.timestamp() <= (end.timestamp() + 10)
+            ]
 
     return ReplayResult(
         symbol=symbol,
@@ -358,6 +465,8 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
         delta_pnl_pct=delta,
         replay_before_real_seconds=before,
         rows=len(rows),
+        detail_events=detail_events,
+        detail_rows=detail_rows,
     )
 
 
@@ -435,6 +544,49 @@ def print_result_line(result: ReplayResult) -> None:
         f"real_exit={result.real_exit_time or 'n/a'} | "
         f"replay_before={fmt_num(result.replay_before_real_seconds)}s"
     )
+
+
+def row_pnl(row: Dict[str, Any], entry_price: Optional[float]) -> Optional[float]:
+    price = safe_float(row.get("shadow_price"))
+    if price is None or entry_price is None or entry_price <= 0:
+        return None
+    return ((price / entry_price) - 1) * 100
+
+
+def print_detail(result: ReplayResult) -> None:
+    print(f"\n## Detail {result.symbol}")
+    print_result_line(result)
+    if not result.detail_events:
+        print("sem eventos detalhados")
+        return
+
+    print("\n### Eventos")
+    for event in result.detail_events:
+        print(
+            f"{event.get('timestamp')} | {event.get('event')} | "
+            f"reason={event.get('reason') or 'n/a'} | pnl={fmt_pct(event.get('pnl_pct'))} | "
+            f"price={fmt_num(event.get('price'))} | stop={fmt_num(event.get('stop_price'))} | "
+            f"trailing={fmt_num(event.get('trailing_stop_price'))} | "
+            f"highest={fmt_num(event.get('highest_price'))} | "
+            f"condition_started_at={event.get('condition_started_at') or 'n/a'}"
+        )
+
+    entry_price = None
+    for row in result.detail_rows:
+        entry_price = safe_float(row.get("shadow_entry_price")) or safe_float(row.get("shadow_price"))
+        if entry_price is not None:
+            break
+
+    print("\n### Linhas Em Torno Dos Eventos")
+    for row in result.detail_rows:
+        print(
+            f"{row.get('timestamp')} | shadow_price={fmt_num(row.get('shadow_price'))} | "
+            f"pnl_reanchored={fmt_pct(row_pnl(row, entry_price))} | "
+            f"dex_price={fmt_num(row.get('price') or row.get('decision_price'))} | "
+            f"div={fmt_pct(row.get('divergence_pct'))} | "
+            f"saved_shadow_status={row.get('shadow_decision_status') or 'n/a'} | "
+            f"saved_shadow_exit={row.get('shadow_exit_reason') or 'n/a'}"
+        )
 
 
 def filter_trades(trades: List[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -520,6 +672,9 @@ def main() -> None:
     parser.add_argument("--token", type=str, default=None)
     parser.add_argument("--only-stop-loss", action="store_true")
     parser.add_argument("--only-trailing", action="store_true")
+    parser.add_argument("--persist", type=int, default=None)
+    parser.add_argument("--be", type=str, default=None)
+    parser.add_argument("--detail", action="store_true")
     args = parser.parse_args()
 
     load_project_env()
@@ -530,8 +685,11 @@ def main() -> None:
     trades = filter_trades(trades, args)
     rows_by_trade = {id(trade): valid_shadow_rows(trade, args.history_dir) for trade in trades}
 
+    selected_config = build_selected_config(base_rules, args.persist, args.be)
+    configs = [selected_config] if selected_config is not None else build_grid(base_rules)
+
     config_results: List[tuple[ReplayConfig, List[ReplayResult], Dict[str, Any]]] = []
-    for config in build_grid(base_rules):
+    for config in configs:
         results = [replay_trade(trade, rows_by_trade[id(trade)], config) for trade in trades]
         simulated = [result for result in results if result.rows > 0]
         summary = summarize_config(simulated)
@@ -542,8 +700,12 @@ def main() -> None:
         return
 
     ranked = sorted(config_results, key=lambda item: candidate_rank(item[2]))
-    for config, results, summary in ranked[: min(3, len(ranked))]:
+    detail_count = len(ranked) if selected_config is not None else min(3, len(ranked))
+    for config, results, summary in ranked[:detail_count]:
         print_config_details(config, results, summary, args.limit)
+        if args.detail:
+            for result in results[: args.limit]:
+                print_detail(result)
 
 
 if __name__ == "__main__":
