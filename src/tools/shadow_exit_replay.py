@@ -34,6 +34,7 @@ class BaseRules:
 class ReplayConfig:
     label: str
     persistence_seconds: int
+    arm_persist_seconds: int
     breakeven_trigger_label: str
     rules: BaseRules
 
@@ -157,8 +158,9 @@ def build_grid(base: BaseRules) -> List[ReplayConfig]:
             rules = rules_with_breakeven_trigger(base, trigger_label)
             configs.append(
                 ReplayConfig(
-                    label=f"persist={persistence}s|be={trigger_label}",
+                    label=f"persist={persistence}s|be={trigger_label}|arm=0s",
                     persistence_seconds=persistence,
+                    arm_persist_seconds=0,
                     breakeven_trigger_label=trigger_label,
                     rules=rules,
                 )
@@ -166,15 +168,22 @@ def build_grid(base: BaseRules) -> List[ReplayConfig]:
     return configs
 
 
-def build_selected_config(base: BaseRules, persist: Optional[int], be: Optional[str]) -> Optional[ReplayConfig]:
-    if persist is None and be is None:
+def build_selected_config(
+    base: BaseRules,
+    persist: Optional[int],
+    be: Optional[str],
+    arm_persist: Optional[int],
+) -> Optional[ReplayConfig]:
+    if persist is None and be is None and arm_persist is None:
         return None
     persistence = persist if persist is not None else 0
+    arm_persistence = arm_persist if arm_persist is not None else 0
     trigger_label = be or "current"
     rules = rules_with_breakeven_trigger(base, trigger_label)
     return ReplayConfig(
-        label=f"persist={persistence}s|be={trigger_label}",
+        label=f"persist={persistence}s|be={trigger_label}|arm={arm_persistence}s",
         persistence_seconds=persistence,
+        arm_persist_seconds=arm_persistence,
         breakeven_trigger_label=trigger_label,
         rules=rules,
     )
@@ -281,6 +290,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
     highest_price = entry_price
     trailing_stop_price: Optional[float] = None
     breakeven_activated = False
+    arm_condition_started_at_by_lock: Dict[float, Optional[datetime]] = {}
     breakeven_condition_started_at: Optional[datetime] = None
     trailing_condition_started_at: Optional[datetime] = None
 
@@ -315,8 +325,35 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
         best_lock_pct = None
         for trigger_pct, lock_pct in config.rules.profit_lock_steps:
             if pnl_pct >= trigger_pct:
+                if lock_pct not in arm_condition_started_at_by_lock or arm_condition_started_at_by_lock[lock_pct] is None:
+                    arm_condition_started_at_by_lock[lock_pct] = timestamp
+                    detail_events.append(
+                        {
+                            "event": "BREAKEVEN_TRIGGER_STARTED",
+                            "timestamp": row.get("timestamp"),
+                            "price": current_price,
+                            "pnl_pct": pnl_pct,
+                            "trigger_pct": trigger_pct,
+                            "lock_pct": lock_pct,
+                            "arm_persist_seconds": config.arm_persist_seconds,
+                            "stop_price": stop_price,
+                            "highest_price": highest_price,
+                        }
+                    )
+                arm_started = arm_condition_started_at_by_lock.get(lock_pct)
+                arm_ready = (
+                    config.arm_persist_seconds <= 0
+                    or (
+                        arm_started is not None
+                        and (timestamp - arm_started).total_seconds() >= config.arm_persist_seconds
+                    )
+                )
+                if not arm_ready:
+                    continue
                 if best_lock_pct is None or lock_pct > best_lock_pct:
                     best_lock_pct = lock_pct
+            else:
+                arm_condition_started_at_by_lock[lock_pct] = None
 
         if best_lock_pct is not None:
             new_stop_price = entry_price * (1 + best_lock_pct / 100)
@@ -330,6 +367,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], config: Repl
                         "price": current_price,
                         "pnl_pct": pnl_pct,
                         "lock_pct": best_lock_pct,
+                        "arm_persist_seconds": config.arm_persist_seconds,
                         "stop_price": stop_price,
                         "highest_price": highest_price,
                     }
@@ -568,6 +606,8 @@ def print_detail(result: ReplayResult) -> None:
             f"price={fmt_num(event.get('price'))} | stop={fmt_num(event.get('stop_price'))} | "
             f"trailing={fmt_num(event.get('trailing_stop_price'))} | "
             f"highest={fmt_num(event.get('highest_price'))} | "
+            f"trigger={fmt_pct(event.get('trigger_pct'))} | lock={fmt_pct(event.get('lock_pct'))} | "
+            f"arm_persist={event.get('arm_persist_seconds') if event.get('arm_persist_seconds') is not None else 'n/a'}s | "
             f"condition_started_at={event.get('condition_started_at') or 'n/a'}"
         )
 
@@ -674,6 +714,7 @@ def main() -> None:
     parser.add_argument("--only-trailing", action="store_true")
     parser.add_argument("--persist", type=int, default=None)
     parser.add_argument("--be", type=str, default=None)
+    parser.add_argument("--arm-persist", type=int, default=None)
     parser.add_argument("--detail", action="store_true")
     args = parser.parse_args()
 
@@ -685,8 +726,14 @@ def main() -> None:
     trades = filter_trades(trades, args)
     rows_by_trade = {id(trade): valid_shadow_rows(trade, args.history_dir) for trade in trades}
 
-    selected_config = build_selected_config(base_rules, args.persist, args.be)
-    configs = [selected_config] if selected_config is not None else build_grid(base_rules)
+    selected_config = build_selected_config(base_rules, args.persist, args.be, args.arm_persist)
+    if selected_config is None:
+        configs = build_grid(base_rules)
+    elif args.arm_persist and args.arm_persist > 0:
+        baseline = build_selected_config(base_rules, args.persist, args.be, 0)
+        configs = [baseline, selected_config] if baseline is not None else [selected_config]
+    else:
+        configs = [selected_config]
 
     config_results: List[tuple[ReplayConfig, List[ReplayResult], Dict[str, Any]]] = []
     for config in configs:
