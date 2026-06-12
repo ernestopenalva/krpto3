@@ -88,6 +88,8 @@ class OpenPosition:
     trailing_stop_price: Optional[float] = None
     source_signal: Dict[str, Any] = field(default_factory=dict)
     last_tick: Dict[str, Any] = field(default_factory=dict)
+    shadow_entry_price: Optional[float] = None
+    shadow_entry_time: Optional[str] = None
     shadow_highest_price: Optional[float] = None
     shadow_highest_price_time: Optional[str] = None
     shadow_stop_price: Optional[float] = None
@@ -132,6 +134,8 @@ class ClosedTrade:
     liquidity_drain_ticks: int = 0
     last_tick: Dict[str, Any] = field(default_factory=dict)
     source_signal: Dict[str, Any] = field(default_factory=dict)
+    shadow_entry_price: Optional[float] = None
+    shadow_entry_time: Optional[str] = None
     shadow_exit_reason: Optional[str] = None
     shadow_exit_price: Optional[float] = None
     shadow_exit_time: Optional[str] = None
@@ -459,6 +463,8 @@ class PositionMonitor:
                 "shadow_decision_status": status,
                 "shadow_decision_reason": reason,
                 "shadow_decision_source": "onchain_pumpswap",
+                "shadow_entry_price": position.shadow_entry_price,
+                "shadow_entry_time": position.shadow_entry_time,
                 "shadow_price": tick.get("shadow_price"),
                 "shadow_pnl_pct": position.shadow_pnl_pct,
                 "shadow_highest_price": position.shadow_highest_price,
@@ -476,12 +482,6 @@ class PositionMonitor:
 
     def _update_shadow_decision(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
         now = tick.get("timestamp") or self._now_iso()
-        if position.shadow_highest_price is None:
-            position.shadow_highest_price = position.entry_price
-            position.shadow_highest_price_time = position.entry_time
-        if position.shadow_stop_price is None or position.shadow_stop_price <= 0:
-            position.shadow_stop_price = position.entry_price * (1 - self.stop_loss_pct / 100)
-
         onchain_status = tick.get("onchain_status")
         if onchain_status != "ok":
             self._attach_shadow_decision_state(
@@ -499,6 +499,16 @@ class PositionMonitor:
             return
 
         current_price = float(shadow_price)
+        if position.shadow_entry_price is None or position.shadow_entry_price <= 0:
+            position.shadow_entry_price = current_price
+            position.shadow_entry_time = now
+        if position.shadow_highest_price is None:
+            position.shadow_highest_price = position.shadow_entry_price
+            position.shadow_highest_price_time = position.shadow_entry_time
+        if position.shadow_stop_price is None or position.shadow_stop_price <= 0:
+            position.shadow_stop_price = position.shadow_entry_price * (1 - self.stop_loss_pct / 100)
+
+        shadow_entry_price = position.shadow_entry_price
         position.shadow_ticks += 1
 
         if position.shadow_exit_reason is not None:
@@ -509,11 +519,11 @@ class PositionMonitor:
             position.shadow_highest_price = current_price
             position.shadow_highest_price_time = now
 
-        pnl_pct = ((current_price / position.entry_price) - 1) * 100
+        pnl_pct = ((current_price / shadow_entry_price) - 1) * 100
         position.shadow_pnl_pct = pnl_pct
         position.shadow_max_profit_pct = (
-            ((position.shadow_highest_price / position.entry_price) - 1) * 100
-            if position.shadow_highest_price is not None and position.entry_price > 0
+            ((position.shadow_highest_price / shadow_entry_price) - 1) * 100
+            if position.shadow_highest_price is not None and shadow_entry_price > 0
             else None
         )
 
@@ -526,7 +536,7 @@ class PositionMonitor:
                     best_lock_pct = lock_pct
 
         if best_lock_pct is not None:
-            new_stop_price = position.entry_price * (1 + best_lock_pct / 100)
+            new_stop_price = shadow_entry_price * (1 + best_lock_pct / 100)
             if position.shadow_stop_price is None or new_stop_price > position.shadow_stop_price:
                 position.shadow_stop_price = new_stop_price
                 position.shadow_breakeven_activated = True
@@ -580,6 +590,8 @@ class PositionMonitor:
             "onchain_timestamp": tick.get("onchain_timestamp"),
             "shadow_decision_status": tick.get("shadow_decision_status"),
             "shadow_decision_reason": tick.get("shadow_decision_reason"),
+            "shadow_entry_price": tick.get("shadow_entry_price"),
+            "shadow_entry_time": tick.get("shadow_entry_time"),
             "shadow_price": tick.get("shadow_price"),
             "shadow_pnl_pct": tick.get("shadow_pnl_pct"),
             "shadow_stop_price": tick.get("shadow_stop_price"),
@@ -1051,6 +1063,8 @@ class PositionMonitor:
             liquidity_drain_ticks=position.liquidity_drain_ticks,
             last_tick=tick,
             source_signal=position.source_signal,
+            shadow_entry_price=position.shadow_entry_price,
+            shadow_entry_time=position.shadow_entry_time,
             shadow_exit_reason=position.shadow_exit_reason,
             shadow_exit_price=position.shadow_exit_price,
             shadow_exit_time=position.shadow_exit_time,
@@ -1098,6 +1112,8 @@ class PositionMonitor:
             "shadow_price": tick.get("shadow_price"),
             "shadow_decision_status": tick.get("shadow_decision_status"),
             "shadow_decision_reason": tick.get("shadow_decision_reason"),
+            "shadow_entry_price": position.shadow_entry_price,
+            "shadow_entry_time": position.shadow_entry_time,
             "shadow_pnl_pct": position.shadow_pnl_pct,
             "shadow_highest_price": position.shadow_highest_price,
             "shadow_stop_price": position.shadow_stop_price,

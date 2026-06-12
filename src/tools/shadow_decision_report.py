@@ -19,6 +19,7 @@ from src.project_env import load_project_env
 DEFAULT_AUDIT_FILE = PROJECT_ROOT / "data" / "position_monitor" / "market_data_audit.jsonl"
 DEFAULT_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
 DEFAULT_OPEN_POSITIONS_FILE = PROJECT_ROOT / "data" / "position_monitor" / "open_positions.json"
+DEFAULT_HISTORY_DIR = PROJECT_ROOT / "data" / "position_monitor" / "history"
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -85,6 +86,8 @@ def percentile(values: List[float], pct: float) -> Optional[float]:
 def trade_shadow_fields(trade: Dict[str, Any]) -> Dict[str, Any]:
     tick = trade.get("last_tick") or {}
     return {
+        "shadow_entry_price": trade.get("shadow_entry_price") or tick.get("shadow_entry_price"),
+        "shadow_entry_time": trade.get("shadow_entry_time") or tick.get("shadow_entry_time"),
         "shadow_exit_reason": trade.get("shadow_exit_reason") or tick.get("shadow_exit_reason"),
         "shadow_exit_price": trade.get("shadow_exit_price") or tick.get("shadow_exit_price"),
         "shadow_exit_time": trade.get("shadow_exit_time") or tick.get("shadow_exit_time"),
@@ -100,14 +103,111 @@ def trade_shadow_fields(trade: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def classify_trade_delta(trade: Dict[str, Any]) -> Dict[str, Any]:
+def row_matches_trade(row: Dict[str, Any], trade: Dict[str, Any]) -> bool:
+    symbol = str(row.get("symbol") or "").strip().casefold()
+    trade_symbol = str(trade.get("symbol") or "").strip().casefold()
+    token = str(row.get("token_address") or "").strip()
+    trade_token = str(trade.get("token_address") or "").strip()
+    return bool(
+        (symbol and trade_symbol and symbol == trade_symbol)
+        or (token and trade_token and token == trade_token)
+    )
+
+
+def history_rows_for_trade(trade: Dict[str, Any], history_dir: Path) -> List[Dict[str, Any]]:
+    if not history_dir.exists():
+        return []
+    token_prefix = str(trade.get("token_address") or "")[:8]
+    symbol = str(trade.get("symbol") or "").strip()
+    candidates = list(history_dir.glob(f"*_{token_prefix}.jsonl")) if token_prefix else []
+    if not candidates and symbol:
+        safe_symbol = "".join(ch for ch in symbol if ch.isalnum() or ch in ("-", "_"))[:20]
+        candidates = list(history_dir.glob(f"{safe_symbol}_*.jsonl"))
+
+    rows: List[Dict[str, Any]] = []
+    for path in candidates:
+        for row in load_jsonl(path):
+            if row_matches_trade(row, trade):
+                rows.append(row)
+    return sorted(rows, key=lambda row: parse_time(row.get("timestamp")) or datetime.min)
+
+
+def recompute_shadow_from_history(
+    trade: Dict[str, Any],
+    history_dir: Path,
+) -> Dict[str, Any]:
+    rows = history_rows_for_trade(trade, history_dir)
+    valid_rows = [row for row in rows if safe_float(row.get("shadow_price")) is not None]
+    if not valid_rows:
+        return {
+            "recomputed_shadow_entry_price": None,
+            "recomputed_shadow_entry_time": None,
+            "recomputed_shadow_exit_price": None,
+            "recomputed_shadow_exit_time": None,
+            "recomputed_shadow_exit_reason": None,
+            "recomputed_shadow_pnl_pct": None,
+            "recomputed_shadow_max_profit_pct": None,
+            "recomputed_shadow_rows": 0,
+        }
+
+    entry_row = valid_rows[0]
+    entry_price = safe_float(entry_row.get("shadow_entry_price")) or safe_float(entry_row.get("shadow_price"))
+    if entry_price is None or entry_price <= 0:
+        return {
+            "recomputed_shadow_entry_price": None,
+            "recomputed_shadow_entry_time": None,
+            "recomputed_shadow_exit_price": None,
+            "recomputed_shadow_exit_time": None,
+            "recomputed_shadow_exit_reason": None,
+            "recomputed_shadow_pnl_pct": None,
+            "recomputed_shadow_max_profit_pct": None,
+            "recomputed_shadow_rows": len(valid_rows),
+        }
+
+    exit_row = next(
+        (
+            row
+            for row in valid_rows
+            if row.get("shadow_decision_status") == "would_exit" or row.get("shadow_exit_reason")
+        ),
+        None,
+    )
+    if exit_row is None:
+        exit_row = valid_rows[-1]
+
+    exit_price = safe_float(exit_row.get("shadow_exit_price")) or safe_float(exit_row.get("shadow_price"))
+    exit_pnl = None if exit_price is None else ((exit_price / entry_price) - 1) * 100
+    max_profit = None
+    prices = [safe_float(row.get("shadow_price")) for row in valid_rows]
+    prices = [price for price in prices if price is not None]
+    if prices:
+        max_profit = ((max(prices) / entry_price) - 1) * 100
+
+    return {
+        "recomputed_shadow_entry_price": entry_price,
+        "recomputed_shadow_entry_time": entry_row.get("shadow_entry_time") or entry_row.get("timestamp"),
+        "recomputed_shadow_exit_price": exit_price,
+        "recomputed_shadow_exit_time": exit_row.get("shadow_exit_time") or exit_row.get("timestamp"),
+        "recomputed_shadow_exit_reason": exit_row.get("shadow_exit_reason"),
+        "recomputed_shadow_pnl_pct": exit_pnl,
+        "recomputed_shadow_max_profit_pct": max_profit,
+        "recomputed_shadow_rows": len(valid_rows),
+    }
+
+
+def classify_trade_delta(trade: Dict[str, Any], history_dir: Path) -> Dict[str, Any]:
     shadow = trade_shadow_fields(trade)
+    recomputed = recompute_shadow_from_history(trade, history_dir)
     real_pnl = safe_float(trade.get("pnl_pct"))
-    shadow_pnl = safe_float(shadow.get("shadow_pnl_pct"))
+    shadow_pnl = safe_float(recomputed.get("recomputed_shadow_pnl_pct"))
+    if shadow_pnl is None:
+        shadow_pnl = safe_float(shadow.get("shadow_pnl_pct"))
     delta = None if real_pnl is None or shadow_pnl is None else shadow_pnl - real_pnl
 
     real_exit = parse_time(trade.get("exit_time"))
-    shadow_exit = parse_time(shadow.get("shadow_exit_time"))
+    shadow_exit = parse_time(recomputed.get("recomputed_shadow_exit_time")) or parse_time(
+        shadow.get("shadow_exit_time")
+    )
     seconds_before = None
     if real_exit is not None and shadow_exit is not None:
         seconds_before = (real_exit - shadow_exit).total_seconds()
@@ -123,7 +223,9 @@ def classify_trade_delta(trade: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         **shadow,
+        **recomputed,
         "real_pnl_pct": real_pnl,
+        "shadow_pnl_pct_for_report": shadow_pnl,
         "delta_pnl_pct": delta,
         "seconds_before_real_exit": seconds_before,
         "verdict": verdict,
@@ -163,10 +265,10 @@ def summarize_audit(rows: List[Dict[str, Any]]) -> None:
         print(f"max: {max(divs):.4f}%")
 
 
-def summarize_closed_trades(trades: List[Dict[str, Any]], limit: int) -> None:
+def summarize_closed_trades(trades: List[Dict[str, Any]], limit: int, history_dir: Path) -> None:
     print("\n## Trades Fechados")
     print(f"total: {len(trades)}")
-    classified = [classify_trade_delta(trade) | {"trade": trade} for trade in trades]
+    classified = [classify_trade_delta(trade, history_dir) | {"trade": trade} for trade in trades]
     with_shadow = [item for item in classified if item["shadow_exit_reason"] or item["shadow_status"]]
     print(f"com_shadow: {len(with_shadow)}")
     print_distribution("Veredito PnL Shadow vs Real", Counter(item["verdict"] for item in with_shadow))
@@ -189,9 +291,11 @@ def summarize_closed_trades(trades: List[Dict[str, Any]], limit: int) -> None:
         print(
             f"{trade.get('symbol')} | real={trade.get('exit_reason')} "
             f"real_pnl={fmt_pct(trade.get('pnl_pct'))} | "
-            f"shadow={item['shadow_exit_reason']} shadow_pnl={fmt_pct(item['shadow_pnl_pct'])} | "
+            f"shadow={item['recomputed_shadow_exit_reason'] or item['shadow_exit_reason']} "
+            f"shadow_pnl={fmt_pct(item['shadow_pnl_pct_for_report'])} | "
             f"delta={fmt_pct(item['delta_pnl_pct'])} | "
             f"shadow_before={fmt_num(item['seconds_before_real_exit'])}s | "
+            f"entry_onchain={fmt_num(item['recomputed_shadow_entry_price'])} | "
             f"div={fmt_pct(item['divergence_pct'])} | verdict={item['verdict']}"
         )
 
@@ -201,7 +305,8 @@ def summarize_closed_trades(trades: List[Dict[str, Any]], limit: int) -> None:
         trade = item["trade"]
         print(
             f"{trade.get('symbol')} | real_pnl={fmt_pct(trade.get('pnl_pct'))} | "
-            f"shadow={item['shadow_exit_reason']} shadow_pnl={fmt_pct(item['shadow_pnl_pct'])} | "
+            f"shadow={item['recomputed_shadow_exit_reason'] or item['shadow_exit_reason']} "
+            f"shadow_pnl={fmt_pct(item['shadow_pnl_pct_for_report'])} | "
             f"delta={fmt_pct(item['delta_pnl_pct'])} | "
             f"shadow_before={fmt_num(item['seconds_before_real_exit'])}s"
         )
@@ -226,6 +331,7 @@ def main() -> None:
     parser.add_argument("--audit-file", type=Path, default=DEFAULT_AUDIT_FILE)
     parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_CLOSED_TRADES_FILE)
     parser.add_argument("--open-positions-file", type=Path, default=DEFAULT_OPEN_POSITIONS_FILE)
+    parser.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
 
@@ -239,7 +345,7 @@ def main() -> None:
         open_positions = []
 
     summarize_audit(audit_rows)
-    summarize_closed_trades(closed_trades, limit=args.limit)
+    summarize_closed_trades(closed_trades, limit=args.limit, history_dir=args.history_dir)
     summarize_open_positions(open_positions)
 
 

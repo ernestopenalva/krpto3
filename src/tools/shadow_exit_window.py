@@ -153,18 +153,24 @@ def print_window(token: str, seconds: int) -> None:
         if (ts := parse_time(row.get("timestamp"))) is not None and start <= ts <= end
     ]
 
-    base_shadow = safe_float(exit_row.get("shadow_price"))
+    first_valid_shadow = next((row for row in rows if safe_float(row.get("shadow_price")) is not None), None)
+    base_shadow = (
+        safe_float(exit_row.get("shadow_entry_price"))
+        or safe_float((first_valid_shadow or {}).get("shadow_entry_price"))
+        or safe_float((first_valid_shadow or {}).get("shadow_price"))
+    )
     base_dex = safe_float(exit_row.get("price") or exit_row.get("decision_price"))
     print(
         f"shadow_exit={exit_time.isoformat()} | "
         f"reason={exit_row.get('shadow_exit_reason') or 'n/a'} | "
+        f"entry_onchain={fmt_value(base_shadow)} | "
         f"shadow_price={fmt_value(exit_row.get('shadow_price'))} | "
-        f"shadow_pnl={fmt_pct(exit_row.get('shadow_pnl_pct'))}"
+        f"shadow_pnl={fmt_pct(relative_pct(exit_row.get('shadow_price'), base_shadow))}"
     )
     print(f"janela={seconds}s antes/depois | linhas={len(window)}")
     print(
         "t_rel | timestamp | dex_price | dex_rel | shadow_price | shadow_rel | "
-        "shadow_pnl | div | dex_native | onchain_native | shadow_status | shadow_exit"
+        "shadow_pnl_reanchored | saved_shadow_pnl | div | dex_native | onchain_native | shadow_status | shadow_exit"
     )
     for row in window:
         ts = parse_time(row.get("timestamp"))
@@ -176,6 +182,7 @@ def print_window(token: str, seconds: int) -> None:
             f"{t_rel:+.0f}s | {row.get('timestamp')} | "
             f"{fmt_value(dex_price)} | {fmt_pct(relative_pct(dex_price, base_dex))} | "
             f"{fmt_value(row.get('shadow_price'))} | {fmt_pct(relative_pct(row.get('shadow_price'), base_shadow))} | "
+            f"{fmt_pct(relative_pct(row.get('shadow_price'), base_shadow))} | "
             f"{fmt_pct(row.get('shadow_pnl_pct'))} | {fmt_pct(row.get('divergence_pct'))} | "
             f"{fmt_value(row.get('dex_price_native'))} | {fmt_value(row.get('onchain_price_native'))} | "
             f"{row.get('shadow_decision_status') or 'n/a'} | {row.get('shadow_exit_reason') or 'n/a'}"
