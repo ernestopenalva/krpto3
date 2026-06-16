@@ -217,12 +217,13 @@ def main() -> None:
     parser.add_argument("--runner-threshold-pct", type=float, default=15.0)
     parser.add_argument("--persist", type=int, default=0)
     parser.add_argument("--be", type=str, default="current")
+    parser.add_argument("--arm-persist", type=int, default=0)
     parser.add_argument("--limit", type=int, default=30)
     args = parser.parse_args()
 
     load_project_env()
     base_rules = load_base_rules(args.config_file)
-    replay_config = build_selected_config(base_rules, args.persist, args.be)
+    replay_config = build_selected_config(base_rules, args.persist, args.be, args.arm_persist)
     if replay_config is None:
         raise SystemExit("config de replay invalida")
 
