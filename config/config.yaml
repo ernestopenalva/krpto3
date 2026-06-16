@@ -123,6 +123,26 @@ position_monitor:
     provider: pumpswap
     timeout_seconds: 15
     write_global_file: true
+    candidates:
+      be5_baseline:
+        enabled: true
+        stop_loss_pct: 5
+        persist_stop_seconds: 5
+        breakeven_trigger_pct: 5
+        trailing_gap_pct: 12
+        persist_seconds: 3
+        arm_persist_seconds: 0
+        hard_instant_threshold_pct: 10
+
+      be7_candidate:
+        enabled: true
+        stop_loss_pct: 5
+        persist_stop_seconds: 5
+        breakeven_trigger_pct: 7
+        trailing_gap_pct: 12
+        persist_seconds: 3
+        arm_persist_seconds: 0
+        hard_instant_threshold_pct: 10
 
 shadow_monitor:
   enabled: false

@@ -60,6 +60,20 @@ LOG_WARN = "WARN"
 LOG_RATE_LIMIT = "RATE_LIMIT"
 
 
+@dataclass(frozen=True)
+class ShadowCandidateConfig:
+    name: str
+    enabled: bool
+    stop_loss_pct: float
+    persist_stop_seconds: int
+    breakeven_trigger_pct: float
+    trailing_gap_pct: float
+    persist_seconds: int
+    arm_persist_seconds: int
+    hard_instant_threshold_pct: float
+    profit_lock_steps: List[Dict[str, float]]
+
+
 @dataclass
 class OpenPosition:
     token_address: str
@@ -101,6 +115,7 @@ class OpenPosition:
     shadow_pnl_pct: Optional[float] = None
     shadow_max_profit_pct: Optional[float] = None
     shadow_ticks: int = 0
+    shadow_candidates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Instrumentação de persistência do health score.
     # Conta ticks consecutivos com buy_pressure >= 0.87 durante o monitoramento da posição.
     # Não afeta nenhuma decisão de entrada ou saída; apenas observação.
@@ -142,6 +157,7 @@ class ClosedTrade:
     shadow_pnl_pct: Optional[float] = None
     shadow_max_profit_pct: Optional[float] = None
     shadow_would_exit_before_dex: Optional[bool] = None
+    shadow_candidates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 class PositionMonitor:
@@ -174,6 +190,7 @@ class PositionMonitor:
         self.onchain_audit_write_global_file = bool(
             self.onchain_audit_cfg.get("write_global_file", True)
         )
+        self.shadow_candidate_configs = self._load_shadow_candidate_configs()
         self.liquidity_exit_cfg = position_cfg.get("liquidity_exit", {})
         self.liquidity_exit_enabled = bool(self.liquidity_exit_cfg.get("enabled", False))
         self.liquidity_exit_drop_from_open_pct = float(
@@ -305,6 +322,78 @@ class PositionMonitor:
 
         timeout_seconds = int(self.onchain_audit_cfg.get("timeout_seconds", 15))
         return OnChainPumpSwapProvider(rpc_url=rpc_url, timeout_seconds=timeout_seconds)
+
+    def _candidate_profit_lock_steps(self, candidate_cfg: Dict[str, Any]) -> List[Dict[str, float]]:
+        explicit_steps = candidate_cfg.get("profit_lock_steps")
+        if isinstance(explicit_steps, list) and explicit_steps:
+            steps_source = explicit_steps
+        else:
+            trigger = self._optional_float(candidate_cfg.get("breakeven_trigger_pct"))
+            base_steps = self.profit_lock_steps if isinstance(self.profit_lock_steps, list) else []
+            first_lock = 1.0
+            higher_steps: List[Dict[str, float]] = []
+            for step in base_steps:
+                step_trigger = self._optional_float((step or {}).get("trigger_pct"))
+                lock = self._optional_float((step or {}).get("lock_pct"))
+                if step_trigger is None or lock is None:
+                    continue
+                if step_trigger <= trigger and lock <= first_lock:
+                    first_lock = lock
+                elif step_trigger > trigger:
+                    higher_steps.append({"trigger_pct": step_trigger, "lock_pct": lock})
+            steps_source = [{"trigger_pct": trigger, "lock_pct": first_lock}, *higher_steps]
+
+        steps: List[Dict[str, float]] = []
+        for step in steps_source:
+            trigger = self._optional_float((step or {}).get("trigger_pct"))
+            lock = self._optional_float((step or {}).get("lock_pct"))
+            if trigger is not None and lock is not None:
+                steps.append({"trigger_pct": trigger, "lock_pct": lock})
+        return sorted(steps, key=lambda item: item["trigger_pct"])
+
+    def _load_shadow_candidate_configs(self) -> List[ShadowCandidateConfig]:
+        raw_candidates = self.onchain_audit_cfg.get("candidates")
+        if not isinstance(raw_candidates, dict) or not raw_candidates:
+            raw_candidates = {
+                "legacy_shadow": {
+                    "enabled": True,
+                    "stop_loss_pct": self.stop_loss_pct,
+                    "persist_stop_seconds": 0,
+                    "breakeven_trigger_pct": self.breakeven_trigger_pct,
+                    "trailing_gap_pct": self.trailing_stop_pct,
+                    "persist_seconds": 0,
+                    "arm_persist_seconds": 0,
+                    "hard_instant_threshold_pct": self.stop_loss_pct * 2,
+                }
+            }
+
+        configs: List[ShadowCandidateConfig] = []
+        for name, candidate_cfg in raw_candidates.items():
+            if not isinstance(candidate_cfg, dict):
+                continue
+            enabled = bool(candidate_cfg.get("enabled", True))
+            stop_loss_pct = self._optional_float(candidate_cfg.get("stop_loss_pct"))
+            breakeven_trigger_pct = self._optional_float(candidate_cfg.get("breakeven_trigger_pct"))
+            trailing_gap_pct = self._optional_float(candidate_cfg.get("trailing_gap_pct"))
+            if stop_loss_pct is None or breakeven_trigger_pct is None or trailing_gap_pct is None:
+                continue
+            configs.append(
+                ShadowCandidateConfig(
+                    name=str(name),
+                    enabled=enabled,
+                    stop_loss_pct=stop_loss_pct,
+                    persist_stop_seconds=int(candidate_cfg.get("persist_stop_seconds", 0)),
+                    breakeven_trigger_pct=breakeven_trigger_pct,
+                    trailing_gap_pct=trailing_gap_pct,
+                    persist_seconds=int(candidate_cfg.get("persist_seconds", 0)),
+                    arm_persist_seconds=int(candidate_cfg.get("arm_persist_seconds", 0)),
+                    hard_instant_threshold_pct=float(
+                        candidate_cfg.get("hard_instant_threshold_pct", stop_loss_pct * 2)
+                    ),
+                    profit_lock_steps=self._candidate_profit_lock_steps(candidate_cfg),
+                )
+            )
+        return [config for config in configs if config.enabled]
 
     @staticmethod
     def _format_metric(value: Any) -> str:
@@ -477,8 +566,204 @@ class PositionMonitor:
                 "shadow_max_profit_pct": position.shadow_max_profit_pct,
                 "shadow_ticks": position.shadow_ticks,
                 "shadow_liquidity_exit_simulated": False,
+                "shadow_candidates": position.shadow_candidates,
             }
         )
+
+    @staticmethod
+    def _persist_ready(
+        condition: bool,
+        now: str,
+        started_at: Optional[str],
+        persist_seconds: int,
+    ) -> tuple[Optional[str], bool]:
+        if not condition:
+            return None, False
+        if started_at is None:
+            started_at = now
+        if persist_seconds <= 0:
+            return started_at, True
+        try:
+            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return started_at, False
+        return started_at, (now_dt - start_dt).total_seconds() >= persist_seconds
+
+    def _initial_shadow_candidate_state(
+        self,
+        config: ShadowCandidateConfig,
+        entry_price: float,
+        now: str,
+    ) -> Dict[str, Any]:
+        return {
+            "config_name": config.name,
+            "decision_source": "onchain_pumpswap",
+            "entry_price": entry_price,
+            "entry_time": now,
+            "highest_price": entry_price,
+            "highest_price_time": now,
+            "stop_price": entry_price * (1 - config.stop_loss_pct / 100),
+            "trailing_stop_price": None,
+            "breakeven_activated": False,
+            "exit_reason": None,
+            "exit_price": None,
+            "exit_time": None,
+            "pnl_pct": 0.0,
+            "max_profit_pct": 0.0,
+            "ticks": 0,
+            "hard_instant": False,
+            "stop_condition_started_at": None,
+            "breakeven_condition_started_at": None,
+            "trailing_condition_started_at": None,
+            "arm_condition_started_at_by_lock": {},
+            "config": {
+                "stop_loss_pct": config.stop_loss_pct,
+                "persist_stop_seconds": config.persist_stop_seconds,
+                "breakeven_trigger_pct": config.breakeven_trigger_pct,
+                "trailing_gap_pct": config.trailing_gap_pct,
+                "persist_seconds": config.persist_seconds,
+                "arm_persist_seconds": config.arm_persist_seconds,
+                "hard_instant_threshold_pct": config.hard_instant_threshold_pct,
+                "profit_lock_steps": config.profit_lock_steps,
+            },
+        }
+
+    def _update_shadow_candidate(
+        self,
+        state: Dict[str, Any],
+        config: ShadowCandidateConfig,
+        current_price: float,
+        now: str,
+    ) -> str:
+        entry_price = self._optional_float(state.get("entry_price"))
+        if entry_price is None or entry_price <= 0:
+            return "unavailable"
+
+        state["ticks"] = int(state.get("ticks") or 0) + 1
+        if state.get("exit_reason") is not None:
+            return "already_exited"
+
+        state["pnl_pct"] = ((current_price / entry_price) - 1) * 100
+
+        highest_price = self._optional_float(state.get("highest_price"))
+        if highest_price is None or current_price > highest_price:
+            state["highest_price"] = current_price
+            state["highest_price_time"] = now
+            highest_price = current_price
+
+        state["max_profit_pct"] = ((highest_price / entry_price) - 1) * 100 if highest_price else None
+
+        hard_instant_price = entry_price * (1 - config.hard_instant_threshold_pct / 100)
+        if current_price <= hard_instant_price:
+            state["exit_reason"] = "STOP_LOSS"
+            state["exit_price"] = current_price
+            state["exit_time"] = now
+            state["hard_instant"] = True
+            return "would_exit"
+
+        hard_stop_price = entry_price * (1 - config.stop_loss_pct / 100)
+        stop_started_at, stop_ready = self._persist_ready(
+            current_price <= hard_stop_price,
+            now,
+            state.get("stop_condition_started_at"),
+            config.persist_stop_seconds,
+        )
+        state["stop_condition_started_at"] = stop_started_at
+        if stop_ready:
+            state["exit_reason"] = "STOP_LOSS"
+            state["exit_price"] = current_price
+            state["exit_time"] = now
+            return "would_exit"
+
+        best_lock_pct = None
+        arm_started_by_lock = state.get("arm_condition_started_at_by_lock")
+        if not isinstance(arm_started_by_lock, dict):
+            arm_started_by_lock = {}
+            state["arm_condition_started_at_by_lock"] = arm_started_by_lock
+        pnl_pct = float(state["pnl_pct"])
+        for step in config.profit_lock_steps:
+            trigger_pct = self._optional_float(step.get("trigger_pct"))
+            lock_pct = self._optional_float(step.get("lock_pct"))
+            if trigger_pct is None or lock_pct is None:
+                continue
+            lock_key = str(lock_pct)
+            if pnl_pct >= trigger_pct:
+                if arm_started_by_lock.get(lock_key) is None:
+                    arm_started_by_lock[lock_key] = now
+                _started, arm_ready = self._persist_ready(
+                    True,
+                    now,
+                    arm_started_by_lock.get(lock_key),
+                    config.arm_persist_seconds,
+                )
+                if arm_ready and (best_lock_pct is None or lock_pct > best_lock_pct):
+                    best_lock_pct = lock_pct
+            else:
+                arm_started_by_lock[lock_key] = None
+
+        if best_lock_pct is not None:
+            new_stop_price = entry_price * (1 + best_lock_pct / 100)
+            current_stop = self._optional_float(state.get("stop_price"))
+            if current_stop is None or new_stop_price > current_stop:
+                state["stop_price"] = new_stop_price
+                state["breakeven_activated"] = True
+
+        if state.get("breakeven_activated") and highest_price is not None:
+            trailing_stop_price = highest_price * (1 - config.trailing_gap_pct / 100)
+            current_trailing = self._optional_float(state.get("trailing_stop_price"))
+            if current_trailing is None or trailing_stop_price > current_trailing:
+                state["trailing_stop_price"] = trailing_stop_price
+
+        stop_price = self._optional_float(state.get("stop_price"))
+        breakeven_condition = bool(state.get("breakeven_activated")) and (
+            stop_price is not None and current_price <= stop_price
+        )
+        be_started_at, be_ready = self._persist_ready(
+            breakeven_condition,
+            now,
+            state.get("breakeven_condition_started_at"),
+            config.persist_seconds,
+        )
+        state["breakeven_condition_started_at"] = be_started_at
+        if be_ready:
+            state["exit_reason"] = "BREAKEVEN_STOP"
+            state["exit_price"] = current_price
+            state["exit_time"] = now
+            return "would_exit"
+
+        trailing_stop_price = self._optional_float(state.get("trailing_stop_price"))
+        trailing_condition = trailing_stop_price is not None and current_price <= trailing_stop_price
+        trailing_started_at, trailing_ready = self._persist_ready(
+            trailing_condition,
+            now,
+            state.get("trailing_condition_started_at"),
+            config.persist_seconds,
+        )
+        state["trailing_condition_started_at"] = trailing_started_at
+        if trailing_ready:
+            state["exit_reason"] = "TRAILING_STOP"
+            state["exit_price"] = current_price
+            state["exit_time"] = now
+            return "would_exit"
+
+        return "open"
+
+    def _sync_legacy_shadow_from_candidate(self, position: OpenPosition, candidate_name: str) -> None:
+        state = position.shadow_candidates.get(candidate_name) or {}
+        position.shadow_entry_price = state.get("entry_price")
+        position.shadow_entry_time = state.get("entry_time")
+        position.shadow_highest_price = state.get("highest_price")
+        position.shadow_highest_price_time = state.get("highest_price_time")
+        position.shadow_stop_price = state.get("stop_price")
+        position.shadow_trailing_stop_price = state.get("trailing_stop_price")
+        position.shadow_breakeven_activated = bool(state.get("breakeven_activated"))
+        position.shadow_exit_reason = state.get("exit_reason")
+        position.shadow_exit_price = state.get("exit_price")
+        position.shadow_exit_time = state.get("exit_time")
+        position.shadow_pnl_pct = state.get("pnl_pct")
+        position.shadow_max_profit_pct = state.get("max_profit_pct")
+        position.shadow_ticks = int(state.get("ticks") or 0)
 
     def _update_shadow_decision(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
         now = tick.get("timestamp") or self._now_iso()
@@ -499,73 +784,30 @@ class PositionMonitor:
             return
 
         current_price = float(shadow_price)
-        if position.shadow_entry_price is None or position.shadow_entry_price <= 0:
-            position.shadow_entry_price = current_price
-            position.shadow_entry_time = now
-        if position.shadow_highest_price is None:
-            position.shadow_highest_price = position.shadow_entry_price
-            position.shadow_highest_price_time = position.shadow_entry_time
-        if position.shadow_stop_price is None or position.shadow_stop_price <= 0:
-            position.shadow_stop_price = position.shadow_entry_price * (1 - self.stop_loss_pct / 100)
+        candidate_statuses: Dict[str, str] = {}
+        candidate_reason = None
+        for config in self.shadow_candidate_configs:
+            state = position.shadow_candidates.get(config.name)
+            if not isinstance(state, dict):
+                state = self._initial_shadow_candidate_state(config, current_price, now)
+                position.shadow_candidates[config.name] = state
+            candidate_statuses[config.name] = self._update_shadow_candidate(state, config, current_price, now)
 
-        shadow_entry_price = position.shadow_entry_price
-        position.shadow_ticks += 1
-
-        if position.shadow_exit_reason is not None:
-            self._attach_shadow_decision_state(position, tick, "already_exited")
-            return
-
-        if position.shadow_highest_price is None or current_price > position.shadow_highest_price:
-            position.shadow_highest_price = current_price
-            position.shadow_highest_price_time = now
-
-        pnl_pct = ((current_price / shadow_entry_price) - 1) * 100
-        position.shadow_pnl_pct = pnl_pct
-        position.shadow_max_profit_pct = (
-            ((position.shadow_highest_price / shadow_entry_price) - 1) * 100
-            if position.shadow_highest_price is not None and shadow_entry_price > 0
-            else None
-        )
-
-        best_lock_pct = None
-        for step in self.profit_lock_steps:
-            trigger_pct = self._safe_float(step.get("trigger_pct"))
-            lock_pct = self._safe_float(step.get("lock_pct"))
-            if pnl_pct >= trigger_pct:
-                if best_lock_pct is None or lock_pct > best_lock_pct:
-                    best_lock_pct = lock_pct
-
-        if best_lock_pct is not None:
-            new_stop_price = shadow_entry_price * (1 + best_lock_pct / 100)
-            if position.shadow_stop_price is None or new_stop_price > position.shadow_stop_price:
-                position.shadow_stop_price = new_stop_price
-                position.shadow_breakeven_activated = True
-
-        if position.shadow_breakeven_activated and position.shadow_highest_price is not None:
-            position.shadow_trailing_stop_price = position.shadow_highest_price * (
-                1 - self.trailing_stop_pct / 100
-            )
-
-        exit_reason = None
-        if position.shadow_stop_price is not None and current_price <= position.shadow_stop_price:
-            exit_reason = "BREAKEVEN_STOP" if position.shadow_breakeven_activated else "STOP_LOSS"
-        elif (
-            position.shadow_trailing_stop_price is not None
-            and current_price <= position.shadow_trailing_stop_price
-        ):
-            exit_reason = "TRAILING_STOP"
-
-        if exit_reason is not None:
-            position.shadow_exit_reason = exit_reason
-            position.shadow_exit_price = current_price
-            position.shadow_exit_time = now
-            position.shadow_pnl_pct = pnl_pct
+        if self.shadow_candidate_configs:
+            primary_name = self.shadow_candidate_configs[0].name
+            self._sync_legacy_shadow_from_candidate(position, primary_name)
+            primary_status = candidate_statuses.get(primary_name, "open")
+        else:
+            primary_status = "unavailable"
+            candidate_reason = "no_shadow_candidates_configured"
 
         self._attach_shadow_decision_state(
             position,
             tick,
-            "would_exit" if exit_reason is not None else "open",
+            primary_status,
+            candidate_reason,
         )
+        tick["shadow_candidate_statuses"] = candidate_statuses
 
     def _write_market_data_audit(self, position: OpenPosition, tick: Dict[str, Any]) -> None:
         if not self.onchain_audit_write_global_file:
@@ -602,7 +844,22 @@ class PositionMonitor:
             "shadow_exit_time": tick.get("shadow_exit_time"),
             "shadow_max_profit_pct": tick.get("shadow_max_profit_pct"),
             "shadow_ticks": tick.get("shadow_ticks"),
+            "shadow_candidates": tick.get("shadow_candidates") or position.shadow_candidates,
         }
+        for name, state in (position.shadow_candidates or {}).items():
+            prefix = f"shadow_{name}"
+            payload.update(
+                {
+                    f"{prefix}_exit_reason": state.get("exit_reason"),
+                    f"{prefix}_pnl_pct": state.get("pnl_pct"),
+                    f"{prefix}_exit_price": state.get("exit_price"),
+                    f"{prefix}_exit_time": state.get("exit_time"),
+                    f"{prefix}_max_profit_pct": state.get("max_profit_pct"),
+                    f"{prefix}_stop_price": state.get("stop_price"),
+                    f"{prefix}_trailing_stop_price": state.get("trailing_stop_price"),
+                    f"{prefix}_ticks": state.get("ticks"),
+                }
+            )
         self._append_jsonl(self.market_data_audit_file, payload)
 
     @staticmethod
@@ -1071,6 +1328,7 @@ class PositionMonitor:
             shadow_pnl_pct=position.shadow_pnl_pct,
             shadow_max_profit_pct=position.shadow_max_profit_pct,
             shadow_would_exit_before_dex=position.shadow_exit_time is not None,
+            shadow_candidates=position.shadow_candidates,
         )
 
     def _write_position_tick(
@@ -1124,9 +1382,24 @@ class PositionMonitor:
             "shadow_exit_time": position.shadow_exit_time,
             "shadow_max_profit_pct": position.shadow_max_profit_pct,
             "shadow_ticks": position.shadow_ticks,
+            "shadow_candidates": position.shadow_candidates,
             # Instrumentação de persistência registrada por tick para análise posterior.
             "health_ticks_above_087": position.health_ticks_above_087,
         }
+        for name, state in (position.shadow_candidates or {}).items():
+            prefix = f"shadow_{name}"
+            enriched_tick.update(
+                {
+                    f"{prefix}_exit_reason": state.get("exit_reason"),
+                    f"{prefix}_pnl_pct": state.get("pnl_pct"),
+                    f"{prefix}_exit_price": state.get("exit_price"),
+                    f"{prefix}_exit_time": state.get("exit_time"),
+                    f"{prefix}_max_profit_pct": state.get("max_profit_pct"),
+                    f"{prefix}_stop_price": state.get("stop_price"),
+                    f"{prefix}_trailing_stop_price": state.get("trailing_stop_price"),
+                    f"{prefix}_ticks": state.get("ticks"),
+                }
+            )
         self._append_jsonl(path, enriched_tick)
 
     def run_once(self) -> None:
