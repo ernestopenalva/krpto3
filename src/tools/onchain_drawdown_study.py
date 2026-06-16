@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -266,6 +267,13 @@ def main() -> None:
 
     print("\n## Runners Mortos Cedo Pelo Replay")
     killed = [item for item in runners if item.replay_killed_early]
+    killed_reasons = Counter(item.replay_exit_reason or "OPEN" for item in killed)
+    print(f"total={len(killed)}")
+    print(f"BREAKEVEN_STOP={killed_reasons.get('BREAKEVEN_STOP', 0)}")
+    print(f"TRAILING_STOP={killed_reasons.get('TRAILING_STOP', 0)}")
+    for reason, count in sorted(killed_reasons.items()):
+        if reason not in {"BREAKEVEN_STOP", "TRAILING_STOP"}:
+            print(f"{reason}={count}")
     for item in sorted(killed, key=lambda item: item.max_pnl_onchain or 0.0, reverse=True):
         print_result(item)
 
