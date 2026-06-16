@@ -66,6 +66,7 @@ class SmoothReplayResult:
     seconds_to_new_high: Optional[float]
     hard_stop_instant: bool
     smooth_active_at_exit: bool
+    entry_abs_divergence_pct: Optional[float]
 
 
 def load_trades(path: Path) -> List[Dict[str, Any]]:
@@ -90,6 +91,13 @@ def row_pnl(row: Dict[str, Any], entry_price: float) -> Optional[float]:
     if price is None or price <= 0 or entry_price <= 0:
         return None
     return ((price / entry_price) - 1) * 100
+
+
+def entry_abs_divergence(rows: List[Dict[str, Any]]) -> Optional[float]:
+    if not rows:
+        return None
+    value = safe_float(rows[0].get("divergence_pct"))
+    return None if value is None else abs(value)
 
 
 def with_rules(config: ReplayConfig, stop_loss_pct: float, trailing_gap_pct: float) -> ReplayConfig:
@@ -136,6 +144,7 @@ def replay_trade_smooth(
     config: ReplayConfig,
     spec: SmoothSpec,
     stop_persist_seconds: int,
+    hard_instant_threshold_pct: float,
     warmup_seconds: int,
     runner_threshold_pct: float,
     kill_margin_pct: float,
@@ -162,6 +171,7 @@ def replay_trade_smooth(
         seconds_to_new_high=None,
         hard_stop_instant=False,
         smooth_active_at_exit=False,
+        entry_abs_divergence_pct=entry_abs_divergence(rows),
     )
     if not rows:
         return empty
@@ -172,7 +182,7 @@ def replay_trade_smooth(
         return empty
 
     hard_stop_price = entry_price * (1 - config.rules.stop_loss_pct / 100)
-    instant_crash_price = entry_price * (1 - (config.rules.stop_loss_pct * 2) / 100)
+    instant_crash_price = entry_price * (1 - hard_instant_threshold_pct / 100)
     stop_price = hard_stop_price
     highest_smooth_price = entry_price
     trailing_stop_price: Optional[float] = None
@@ -357,6 +367,7 @@ def replay_trade_smooth(
         seconds_to_new_high=seconds_to_new_high,
         hard_stop_instant=hard_stop_instant,
         smooth_active_at_exit=smooth_active_at_exit,
+        entry_abs_divergence_pct=entry_abs_divergence(rows),
     )
 
 
@@ -394,6 +405,34 @@ def summarize(label: str, results: List[SmoothReplayResult]) -> Dict[str, Any]:
     }
 
 
+def filter_entry_divergence(
+    trades: List[Dict[str, Any]],
+    rows_by_trade: Dict[int, List[Dict[str, Any]]],
+    max_entry_divergence_pct: Optional[float],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if max_entry_divergence_pct is None or max_entry_divergence_pct <= 0:
+        return trades, []
+
+    kept: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+    for trade in trades:
+        rows = rows_by_trade[id(trade)]
+        div = entry_abs_divergence(rows)
+        if div is not None and div > max_entry_divergence_pct:
+            excluded.append(
+                {
+                    "symbol": trade.get("symbol"),
+                    "token_address": trade.get("token_address"),
+                    "entry_abs_divergence_pct": div,
+                    "exit_reason": trade.get("exit_reason"),
+                    "pnl_pct": safe_float(trade.get("pnl_pct")),
+                }
+            )
+        else:
+            kept.append(trade)
+    return kept, excluded
+
+
 def print_summary(summary: Dict[str, Any]) -> None:
     print(
         f"{summary['label']} | trades={summary['trades']} | "
@@ -407,7 +446,11 @@ def print_summary(summary: Dict[str, Any]) -> None:
     )
 
 
-def print_references(summary: Dict[str, Any], baseline: Optional[Dict[str, Any]]) -> None:
+def print_references(
+    summary: Dict[str, Any],
+    baseline: Optional[Dict[str, Any]],
+    excluded_by_symbol: Dict[str, Dict[str, Any]],
+) -> None:
     by_symbol = {item.symbol.casefold(): item for item in summary["results"]}
     baseline_by_symbol = {}
     if baseline is not None:
@@ -417,6 +460,13 @@ def print_references(summary: Dict[str, Any], baseline: Optional[Dict[str, Any]]
     for token in sorted(REFERENCE_TOKENS, key=str.casefold):
         item = by_symbol.get(token.casefold())
         if item is None:
+            excluded = excluded_by_symbol.get(token.casefold())
+            if excluded is not None:
+                print(
+                    f"{token} | excluido_entry_div={fmt_pct(excluded.get('entry_abs_divergence_pct'))} | "
+                    f"real={excluded.get('exit_reason') or 'n/a'} real_pnl={fmt_pct(excluded.get('pnl_pct'))}"
+                )
+                continue
             print(f"{token} | sem_shadow_ou_fora_da_amostra")
             continue
         base_item = baseline_by_symbol.get(token.casefold())
@@ -436,6 +486,7 @@ def print_references(summary: Dict[str, Any], baseline: Optional[Dict[str, Any]]
             f"delta_vs_v2={fmt_pct(delta_vs_v2)} | max={fmt_pct(item.replay_max_profit_pct)} | "
             f"future_max={fmt_pct(item.max_future_pnl_pct)} | runner={item.runner} killed={item.runner_killed} | "
             f"time_to_new_high={fmt_num(item.seconds_to_new_high)}s | smooth_exit={item.smooth_active_at_exit}"
+            f" | entry_abs_div={fmt_pct(item.entry_abs_divergence_pct)}"
         )
 
 
@@ -471,7 +522,9 @@ def main() -> None:
     parser.add_argument("--trailing-gap", type=float, default=12.0)
     parser.add_argument("--stop-loss-pct", type=float, default=5.0)
     parser.add_argument("--persist-stop", type=int, default=5)
+    parser.add_argument("--hard-instant-threshold-pct", type=float, default=10.0)
     parser.add_argument("--warmup-seconds", type=int, default=5)
+    parser.add_argument("--max-entry-divergence-pct", type=float, default=8.0)
     parser.add_argument("--runner-threshold-pct", type=float, default=15.0)
     parser.add_argument("--kill-margin-pct", type=float, default=2.0)
     parser.add_argument("--min-runners-saved", type=int, default=16)
@@ -489,6 +542,16 @@ def main() -> None:
     if args.last > 0:
         trades = trades[-args.last :]
     rows_by_trade = {id(trade): valid_shadow_rows(trade, args.history_dir) for trade in trades}
+    filtered_trades, excluded_trades = filter_entry_divergence(
+        trades,
+        rows_by_trade,
+        args.max_entry_divergence_pct,
+    )
+    excluded_by_symbol = {
+        str(item.get("symbol") or "").casefold(): item
+        for item in excluded_trades
+        if item.get("symbol")
+    }
 
     specs = [
         SmoothSpec(label="V2_raw", method="raw"),
@@ -504,11 +567,12 @@ def main() -> None:
                 config,
                 spec,
                 args.persist_stop,
+                args.hard_instant_threshold_pct,
                 args.warmup_seconds,
                 args.runner_threshold_pct,
                 args.kill_margin_pct,
             )
-            for trade in trades
+            for trade in filtered_trades
         ]
         summaries.append(summarize(spec.label, results))
 
@@ -517,9 +581,18 @@ def main() -> None:
     print(
         f"base=persist={args.persist}s|be={args.be}|arm={args.arm_persist}s|"
         f"trailing={args.trailing_gap:g}%|stop={args.stop_loss_pct:g}%|"
-        f"persist_stop={args.persist_stop}s|warmup={args.warmup_seconds}s | "
-        f"last={args.last} | selected={len(trades)}"
+        f"persist_stop={args.persist_stop}s|hard_instant={args.hard_instant_threshold_pct:g}%|"
+        f"warmup={args.warmup_seconds}s | "
+        f"last={args.last} | selected={len(trades)} | filtered={len(filtered_trades)} | "
+        f"excluded_entry_div>{args.max_entry_divergence_pct:g}%={len(excluded_trades)}"
     )
+    if excluded_trades:
+        print("\n## Excluidos Por Entry Divergence")
+        for item in sorted(excluded_trades, key=lambda row: row["entry_abs_divergence_pct"], reverse=True):
+            print(
+                f"{item.get('symbol')} | entry_abs_div={fmt_pct(item.get('entry_abs_divergence_pct'))} | "
+                f"real={item.get('exit_reason') or 'n/a'} real_pnl={fmt_pct(item.get('pnl_pct'))}"
+            )
 
     print("\n## Resumo")
     for summary in summaries:
@@ -547,7 +620,7 @@ def main() -> None:
         print("vencedora=V3b_ema_alpha_0.4" if "V3b_ema_alpha_0.4" in by_label else f"vencedora={approved[0]['label']}")
 
     for summary in summaries:
-        print_references(summary, baseline)
+        print_references(summary, baseline, excluded_by_symbol)
 
 
 if __name__ == "__main__":
