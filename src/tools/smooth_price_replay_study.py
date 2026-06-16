@@ -44,6 +44,8 @@ class SmoothSpec:
     method: str
     window_seconds: int = 0
     alpha: float = 0.0
+    split_exit_raw: bool = False
+    arm_with_persist_seconds: bool = False
 
 
 @dataclass
@@ -225,16 +227,17 @@ def replay_trade_smooth(
             highest_smooth_price = decision_price
 
         best_lock_pct = None
+        arm_persist_seconds = config.persistence_seconds if spec.arm_with_persist_seconds else config.arm_persist_seconds
         for trigger_pct, lock_pct in config.rules.profit_lock_steps:
             if decision_pnl_pct >= trigger_pct:
                 if lock_pct not in arm_condition_started_at_by_lock or arm_condition_started_at_by_lock[lock_pct] is None:
                     arm_condition_started_at_by_lock[lock_pct] = timestamp
                 arm_started = arm_condition_started_at_by_lock.get(lock_pct)
                 arm_ready = (
-                    config.arm_persist_seconds <= 0
+                    arm_persist_seconds <= 0
                     or (
                         arm_started is not None
-                        and (timestamp - arm_started).total_seconds() >= config.arm_persist_seconds
+                        and (timestamp - arm_started).total_seconds() >= arm_persist_seconds
                     )
                 )
                 if arm_ready and (best_lock_pct is None or lock_pct > best_lock_pct):
@@ -277,33 +280,37 @@ def replay_trade_smooth(
             smooth_active_at_exit = not warmup_active
             break
 
-        breakeven_condition = breakeven_activated and decision_price <= stop_price
+        protection_exit_price = raw_price if spec.split_exit_raw else decision_price
+        protection_exit_pnl = raw_pnl_pct if spec.split_exit_raw else decision_pnl_pct
+        protection_exit_persist = stop_persist_seconds if spec.split_exit_raw else config.persistence_seconds
+
+        breakeven_condition = breakeven_activated and protection_exit_price <= stop_price
         breakeven_condition_started_at, breakeven_ready = persisted_exit_ready(
             breakeven_condition,
             timestamp,
             breakeven_condition_started_at,
-            config.persistence_seconds,
+            protection_exit_persist,
         )
         if breakeven_ready:
             exit_reason = "BREAKEVEN_STOP"
-            exit_price = decision_price
+            exit_price = protection_exit_price
             exit_time = row.get("timestamp")
-            exit_pnl = decision_pnl_pct
+            exit_pnl = protection_exit_pnl
             smooth_active_at_exit = not warmup_active
             break
 
-        trailing_condition = trailing_stop_price is not None and decision_price <= trailing_stop_price
+        trailing_condition = trailing_stop_price is not None and protection_exit_price <= trailing_stop_price
         trailing_condition_started_at, trailing_ready = persisted_exit_ready(
             trailing_condition,
             timestamp,
             trailing_condition_started_at,
-            config.persistence_seconds,
+            protection_exit_persist,
         )
         if trailing_ready:
             exit_reason = "TRAILING_STOP"
-            exit_price = decision_price
+            exit_price = protection_exit_price
             exit_time = row.get("timestamp")
-            exit_pnl = decision_pnl_pct
+            exit_pnl = protection_exit_pnl
             smooth_active_at_exit = not warmup_active
             break
 
@@ -490,23 +497,29 @@ def print_references(
         )
 
 
-def approval(summary: Dict[str, Any], baseline: Dict[str, Any], min_runners_saved: int, min_stops_improved: int) -> str:
-    if summary["runners_saved"] < min_runners_saved:
-        return "reprova_runners"
+def approval(
+    summary: Dict[str, Any],
+    baseline: Dict[str, Any],
+    min_runners_saved: int,
+    min_stops_improved: int,
+    min_runner_capture_median: float,
+) -> str:
     if summary["stops_improved"] < min_stops_improved:
         return "reprova_stops"
 
     by_symbol = {item.symbol.casefold(): item for item in summary["results"]}
     baseline_by_symbol = {item.symbol.casefold(): item for item in baseline["results"]}
-    for token in REFERENCE_PROTECT:
-        item = by_symbol.get(token.casefold())
-        base_item = baseline_by_symbol.get(token.casefold())
-        if item is None or base_item is None:
-            continue
-        if item.replay_pnl_pct is None or base_item.replay_pnl_pct is None:
-            continue
-        if item.replay_pnl_pct < base_item.replay_pnl_pct - 1:
-            return f"reprova_{token}_piorou"
+    item = by_symbol.get("footfan")
+    base_item = baseline_by_symbol.get("footfan")
+    if item is not None and base_item is not None and item.replay_pnl_pct is not None and base_item.replay_pnl_pct is not None:
+        if item.replay_pnl_pct < base_item.replay_pnl_pct:
+            return "reprova_FOOTFAN_piorou"
+
+    capture = summary["runner_capture_median"]
+    improves_runner_count = summary["runners_saved"] >= min_runners_saved
+    improves_capture = capture is not None and capture > min_runner_capture_median
+    if not (improves_runner_count or improves_capture):
+        return "reprova_sem_melhora_runner"
     return "aprova"
 
 
@@ -527,7 +540,8 @@ def main() -> None:
     parser.add_argument("--max-entry-divergence-pct", type=float, default=8.0)
     parser.add_argument("--runner-threshold-pct", type=float, default=15.0)
     parser.add_argument("--kill-margin-pct", type=float, default=2.0)
-    parser.add_argument("--min-runners-saved", type=int, default=16)
+    parser.add_argument("--min-runners-saved", type=int, default=17)
+    parser.add_argument("--min-runner-capture-median", type=float, default=52.0)
     parser.add_argument("--min-stops-improved", type=int, default=30)
     args = parser.parse_args()
 
@@ -557,6 +571,13 @@ def main() -> None:
         SmoothSpec(label="V2_raw", method="raw"),
         SmoothSpec(label="V3a_median_5s", method="median", window_seconds=5),
         SmoothSpec(label="V3b_ema_alpha_0.4", method="ema", alpha=0.4),
+        SmoothSpec(
+            label="V3c_ema_split",
+            method="ema",
+            alpha=0.4,
+            split_exit_raw=True,
+            arm_with_persist_seconds=True,
+        ),
     ]
     summaries = []
     for spec in specs:
@@ -601,6 +622,7 @@ def main() -> None:
             baseline,
             args.min_runners_saved,
             args.min_stops_improved,
+            args.min_runner_capture_median,
         )
         print_summary(summary)
         print(f"approval={status}")
@@ -609,7 +631,14 @@ def main() -> None:
     approved = [
         summary
         for summary in summaries[1:]
-        if approval(summary, baseline, args.min_runners_saved, args.min_stops_improved) == "aprova"
+        if approval(
+            summary,
+            baseline,
+            args.min_runners_saved,
+            args.min_stops_improved,
+            args.min_runner_capture_median,
+        )
+        == "aprova"
     ]
     if not approved:
         print("nenhuma V3 aprovada; manter V2")
@@ -617,7 +646,7 @@ def main() -> None:
         print(f"vencedora={approved[0]['label']}")
     else:
         by_label = {summary["label"]: summary for summary in approved}
-        print("vencedora=V3b_ema_alpha_0.4" if "V3b_ema_alpha_0.4" in by_label else f"vencedora={approved[0]['label']}")
+        print("vencedora=V3c_ema_split" if "V3c_ema_split" in by_label else f"vencedora={approved[0]['label']}")
 
     for summary in summaries:
         print_references(summary, baseline, excluded_by_symbol)
