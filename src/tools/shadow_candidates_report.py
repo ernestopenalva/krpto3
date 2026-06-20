@@ -131,6 +131,26 @@ def delta(left: Any, right: Any) -> Optional[float]:
     return left_number - right_number
 
 
+def cumulative_pnl(rows: List[Dict[str, Any]], candidate_name: Optional[str] = None) -> tuple[float, float, int]:
+    total_pct_points = 0.0
+    total_usd = 0.0
+    usd_count = 0
+    for trade in rows:
+        if candidate_name is None:
+            pnl_pct = safe_float(trade.get("pnl_pct"))
+        else:
+            state = candidate_state(trade, candidate_name) or {}
+            pnl_pct = safe_float(state.get("pnl_pct"))
+        if pnl_pct is None:
+            continue
+        total_pct_points += pnl_pct
+        stake = safe_float(trade.get("fake_amount_usd"))
+        if stake is not None:
+            total_usd += stake * pnl_pct / 100
+            usd_count += 1
+    return total_pct_points, total_usd, usd_count
+
+
 def summarize_candidate(name: str, rows: List[Dict[str, Any]]) -> None:
     states = [(row, candidate_state(row, name)) for row in rows]
     states = [(trade, state) for trade, state in states if state is not None]
@@ -236,6 +256,7 @@ def main() -> None:
 
     pair_mtm_deltas = []
     pair_exit_deltas = []
+    triple_paired_exits: List[Dict[str, Any]] = []
     status_pairs: Counter = Counter()
     for trade in clean:
         be5 = candidate_state(trade, "be5_baseline") or {}
@@ -247,6 +268,7 @@ def main() -> None:
         be7_exited = bool(be7.get("exit_reason"))
         if be5_exited and be7_exited:
             status_pairs["both_exited"] += 1
+            triple_paired_exits.append(trade)
             if value is not None:
                 pair_exit_deltas.append(value)
         elif be5_exited:
@@ -272,6 +294,39 @@ def main() -> None:
         print(f"be7_pior_2pp={sum(1 for value in pair_exit_deltas if value <= -2)}")
     else:
         print("sem_comparacao_de_saidas_pareadas")
+
+    print("\n## Resultado Financeiro - Saidas Triplamente Pareadas")
+    print(f"trades_pareados={len(triple_paired_exits)}")
+    if triple_paired_exits:
+        dex_pp, dex_usd, dex_usd_count = cumulative_pnl(triple_paired_exits)
+        be5_pp, be5_usd, be5_usd_count = cumulative_pnl(triple_paired_exits, "be5_baseline")
+        be7_pp, be7_usd, be7_usd_count = cumulative_pnl(triple_paired_exits, "be7_candidate")
+        count = len(triple_paired_exits)
+        print(
+            f"Dex | pnl_acumulado={fmt_pct(dex_pp)} | pnl_medio={fmt_pct(dex_pp / count)} | "
+            f"pnl_usd={dex_usd:.4f} | usd_trades={dex_usd_count}"
+        )
+        print(
+            f"OnChain_BE5 | pnl_acumulado={fmt_pct(be5_pp)} | pnl_medio={fmt_pct(be5_pp / count)} | "
+            f"pnl_usd={be5_usd:.4f} | usd_trades={be5_usd_count} | "
+            f"vantagem_vs_dex={fmt_pct(be5_pp - dex_pp)}"
+        )
+        print(
+            f"OnChain_BE7 | pnl_acumulado={fmt_pct(be7_pp)} | pnl_medio={fmt_pct(be7_pp / count)} | "
+            f"pnl_usd={be7_usd:.4f} | usd_trades={be7_usd_count} | "
+            f"vantagem_vs_dex={fmt_pct(be7_pp - dex_pp)} | "
+            f"vantagem_vs_be5={fmt_pct(be7_pp - be5_pp)}"
+        )
+    else:
+        print("sem_trades_triplamente_pareados")
+
+    print("\n## Resultado MTM No Exit Real - Amostra Completa")
+    print("observacao=inclui candidates ainda abertos; nao representa PnL realizado OnChain")
+    if clean:
+        dex_pp, _dex_usd, _ = cumulative_pnl(clean)
+        be5_pp, _be5_usd, _ = cumulative_pnl(clean, "be5_baseline")
+        be7_pp, _be7_usd, _ = cumulative_pnl(clean, "be7_candidate")
+        print(f"Dex={fmt_pct(dex_pp)} | BE5_MTM={fmt_pct(be5_pp)} | BE7_MTM={fmt_pct(be7_pp)}")
 
     print("\n## Trades Da Amostra Limpa")
     relevant = sorted(
