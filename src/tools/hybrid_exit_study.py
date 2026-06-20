@@ -78,12 +78,12 @@ def find_onchain_stop(
     stop_loss_pct: float,
     persist_seconds: int,
     hard_instant_pct: float,
-) -> Optional[Dict[str, Any]]:
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not rows:
-        return None
+        return None, None
     entry_price = safe_float(rows[0].get("shadow_entry_price")) or safe_float(rows[0].get("shadow_price"))
     if entry_price is None or entry_price <= 0:
-        return None
+        return None, None
 
     condition_started_at: Optional[datetime] = None
     for row in rows:
@@ -91,6 +91,12 @@ def find_onchain_stop(
         timestamp = parse_time(row.get("timestamp"))
         if price is None or price <= 0 or timestamp is None:
             continue
+
+        # O stop inicial OnChain protege apenas a fase anterior ao armamento
+        # das protecoes Dex. Depois disso, breakeven/trailing Dex assumem.
+        if bool(row.get("breakeven_activated")):
+            return None, row.get("timestamp")
+
         pnl_pct = ((price / entry_price) - 1) * 100
         if pnl_pct <= -hard_instant_pct:
             return {
@@ -99,7 +105,7 @@ def find_onchain_stop(
                 "price": price,
                 "time": row.get("timestamp"),
                 "condition_started_at": row.get("timestamp"),
-            }
+            }, None
 
         if pnl_pct <= -stop_loss_pct:
             if condition_started_at is None:
@@ -111,10 +117,10 @@ def find_onchain_stop(
                     "price": price,
                     "time": row.get("timestamp"),
                     "condition_started_at": condition_started_at.isoformat(),
-                }
+                }, None
         else:
             condition_started_at = None
-    return None
+    return None, None
 
 
 def main() -> None:
@@ -154,7 +160,7 @@ def main() -> None:
 
     results = []
     for trade, rows, div in clean:
-        stop = find_onchain_stop(
+        stop, dex_protection_takeover_time = find_onchain_stop(
             rows,
             args.stop_loss_pct,
             args.persist_stop,
@@ -169,6 +175,7 @@ def main() -> None:
                 "trade": trade,
                 "entry_div": div,
                 "stop": stop,
+                "dex_protection_takeover_time": dex_protection_takeover_time,
                 "real_pnl": real_pnl,
                 "hybrid_pnl": hybrid_pnl,
                 "delta": hybrid_pnl - real_pnl,
@@ -179,6 +186,7 @@ def main() -> None:
     hybrid_total = sum(item["hybrid_pnl"] for item in results)
     deltas = [item["delta"] for item in results]
     triggered = [item for item in results if item["stop"] is not None]
+    dex_protection_takeovers = [item for item in results if item["dex_protection_takeover_time"] is not None]
     trigger_by_real_reason = Counter(str(item["trade"].get("exit_reason")) for item in triggered)
     harmed_winners = [item for item in triggered if item["real_pnl"] > 0 and item["delta"] < 0]
     improved_losses = [item for item in triggered if item["real_pnl"] < 0 and item["delta"] > 0]
@@ -207,6 +215,7 @@ def main() -> None:
     print(f"closed_trades_periodo={len(trades)}")
     print(f"amostra_limpa={len(results)} | unavailable={len(unavailable)} | excluded_entry_div={len(excluded)}")
     print(f"onchain_stop_antecipado={len(triggered)}")
+    print(f"dex_protection_assumiu={len(dex_protection_takeovers)}")
     print(
         "trigger_por_real_exit="
         + (", ".join(f"{reason}:{count}" for reason, count in trigger_by_real_reason.most_common()) or "n/a")
