@@ -137,9 +137,14 @@ def summarize_candidate(name: str, rows: List[Dict[str, Any]]) -> None:
     exited = [(trade, state) for trade, state in states if state.get("exit_reason")]
     open_at_real = len(states) - len(exited)
     reasons = Counter(str(state.get("exit_reason")) for _trade, state in exited)
-    deltas = [
+    mark_to_market_deltas = [
         value
         for trade, state in states
+        if (value := delta(state.get("pnl_pct"), trade.get("pnl_pct"))) is not None
+    ]
+    exit_deltas = [
+        value
+        for trade, state in exited
         if (value := delta(state.get("pnl_pct"), trade.get("pnl_pct"))) is not None
     ]
     print(f"\n## {name}")
@@ -151,11 +156,14 @@ def summarize_candidate(name: str, rows: List[Dict[str, Any]]) -> None:
         if reasons
         else "exit_reasons=n/a"
     )
-    if deltas:
-        print(f"delta_vs_real_avg={fmt_pct(sum(deltas) / len(deltas))}")
-        print(f"delta_vs_real_median={fmt_pct(median(deltas))}")
-        print(f"delta_vs_real_p10={fmt_pct(percentile(deltas, 0.10))}")
-        print(f"delta_vs_real_p90={fmt_pct(percentile(deltas, 0.90))}")
+    if mark_to_market_deltas:
+        print(f"mtm_vs_real_avg={fmt_pct(sum(mark_to_market_deltas) / len(mark_to_market_deltas))}")
+        print(f"mtm_vs_real_median={fmt_pct(median(mark_to_market_deltas))}")
+    if exit_deltas:
+        print(f"exit_delta_vs_real_avg={fmt_pct(sum(exit_deltas) / len(exit_deltas))}")
+        print(f"exit_delta_vs_real_median={fmt_pct(median(exit_deltas))}")
+        print(f"exit_delta_vs_real_p10={fmt_pct(percentile(exit_deltas, 0.10))}")
+        print(f"exit_delta_vs_real_p90={fmt_pct(percentile(exit_deltas, 0.90))}")
 
 
 def print_trade(trade: Dict[str, Any], entry_div: Optional[float]) -> None:
@@ -226,22 +234,44 @@ def main() -> None:
     summarize_candidate("be5_baseline", clean)
     summarize_candidate("be7_candidate", clean)
 
-    pair_deltas = []
+    pair_mtm_deltas = []
+    pair_exit_deltas = []
+    status_pairs: Counter = Counter()
     for trade in clean:
         be5 = candidate_state(trade, "be5_baseline") or {}
         be7 = candidate_state(trade, "be7_candidate") or {}
         value = delta(be7.get("pnl_pct"), be5.get("pnl_pct"))
         if value is not None:
-            pair_deltas.append(value)
+            pair_mtm_deltas.append(value)
+        be5_exited = bool(be5.get("exit_reason"))
+        be7_exited = bool(be7.get("exit_reason"))
+        if be5_exited and be7_exited:
+            status_pairs["both_exited"] += 1
+            if value is not None:
+                pair_exit_deltas.append(value)
+        elif be5_exited:
+            status_pairs["be5_exited_be7_open"] += 1
+        elif be7_exited:
+            status_pairs["be5_open_be7_exited"] += 1
+        else:
+            status_pairs["both_open_at_real_exit"] += 1
     print("\n## BE7 vs BE5")
-    if pair_deltas:
-        print(f"delta_avg={fmt_pct(sum(pair_deltas) / len(pair_deltas))}")
-        print(f"delta_median={fmt_pct(median(pair_deltas))}")
-        print(f"be7_melhor_2pp={sum(1 for value in pair_deltas if value >= 2)}")
-        print(f"similar={sum(1 for value in pair_deltas if -2 < value < 2)}")
-        print(f"be7_pior_2pp={sum(1 for value in pair_deltas if value <= -2)}")
+    print(
+        "status="
+        + ", ".join(f"{key}:{value}" for key, value in status_pairs.items())
+    )
+    if pair_mtm_deltas:
+        print(f"mtm_delta_avg={fmt_pct(sum(pair_mtm_deltas) / len(pair_mtm_deltas))}")
+        print(f"mtm_delta_median={fmt_pct(median(pair_mtm_deltas))}")
+    if pair_exit_deltas:
+        print(f"paired_exits={len(pair_exit_deltas)}")
+        print(f"exit_delta_avg={fmt_pct(sum(pair_exit_deltas) / len(pair_exit_deltas))}")
+        print(f"exit_delta_median={fmt_pct(median(pair_exit_deltas))}")
+        print(f"be7_melhor_2pp={sum(1 for value in pair_exit_deltas if value >= 2)}")
+        print(f"similar={sum(1 for value in pair_exit_deltas if -2 < value < 2)}")
+        print(f"be7_pior_2pp={sum(1 for value in pair_exit_deltas if value <= -2)}")
     else:
-        print("sem_comparacao")
+        print("sem_comparacao_de_saidas_pareadas")
 
     print("\n## Trades Da Amostra Limpa")
     relevant = sorted(
