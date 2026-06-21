@@ -52,6 +52,9 @@ class OnChainPumpSwapProvider(MarketDataProvider):
     def get_position_tick(self, context: MarketContext) -> Optional[MarketTick]:
         return self.get_pool_tick(context)
 
+    def get_pool_layout(self, pair_address: str) -> Optional[PoolLayout]:
+        return self._decode_pool_layout(pair_address)
+
     def get_pool_tick(self, context: MarketContext) -> Optional[MarketTick]:
         if not context.pair_address:
             return self._unresolved_tick(context, "missing_pair_address")

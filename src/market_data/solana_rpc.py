@@ -67,3 +67,36 @@ class SolanaRpcClient:
         )
         value = result.get("value", []) if isinstance(result, dict) else []
         return [item for item in value if isinstance(item, dict)]
+
+    def get_signatures_for_address(
+        self,
+        address: str,
+        *,
+        before: Optional[str] = None,
+        until: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        options: Dict[str, Any] = {
+            "commitment": "confirmed",
+            "limit": max(1, min(int(limit), 1_000)),
+        }
+        if until:
+            options["until"] = until
+        if before:
+            options["before"] = before
+        result = self.call("getSignaturesForAddress", [address, options])
+        return [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+
+    def get_transaction(self, signature: str) -> Optional[Dict[str, Any]]:
+        result = self.call(
+            "getTransaction",
+            [
+                signature,
+                {
+                    "commitment": "confirmed",
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                },
+            ],
+        )
+        return result if isinstance(result, dict) else None

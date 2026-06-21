@@ -134,15 +134,13 @@ position_monitor:
         arm_persist_seconds: 0
         hard_instant_threshold_pct: 10
 
-      be7_candidate:
-        enabled: true
-        stop_loss_pct: 5
-        persist_stop_seconds: 5
-        breakeven_trigger_pct: 7
-        trailing_gap_pct: 12
-        persist_seconds: 3
-        arm_persist_seconds: 0
-        hard_instant_threshold_pct: 10
+    hybrid_dex_gate:
+      enabled: true
+      candidate_name: hybrid_dex_gate
+      dex_arm_pct: 2
+      onchain_stop_pct: 5
+      onchain_disarm_pct: 2
+      disable_after_dex_breakeven: true
 
 shadow_monitor:
   enabled: false

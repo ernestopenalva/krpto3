@@ -363,6 +363,11 @@ def format_position_history_row(row: dict[str, Any]) -> str:
         f"shadow_price={fmt_value(row.get('shadow_price'))} | "
         f"shadow_pnl={fmt_pct(row.get('shadow_pnl_pct'))} | "
         f"shadow_exit={row.get('shadow_exit_reason') or 'n/a'} | "
+        f"hybrid_status={row.get('shadow_hybrid_dex_gate_status') or 'n/a'} | "
+        f"hybrid_armed={row.get('shadow_hybrid_dex_gate_armed')} | "
+        f"hybrid_dex_pnl={fmt_pct(row.get('shadow_hybrid_dex_gate_dex_pnl_pct'))} | "
+        f"hybrid_onchain_pnl={fmt_pct(row.get('shadow_hybrid_dex_gate_onchain_pnl_pct'))} | "
+        f"onchain_liq_native={fmt_value(row.get('onchain_liquidity_native'))} | "
         f"stop={fmt_value(row.get('stop_price'))} | "
         f"trailing={fmt_value(row.get('trailing_stop_price'))}"
     )
@@ -379,7 +384,11 @@ def format_market_audit_row(row: dict[str, Any]) -> str:
         f"shadow_status={row.get('shadow_decision_status') or 'n/a'} | "
         f"shadow_price={fmt_value(row.get('shadow_price'))} | "
         f"shadow_pnl={fmt_pct(row.get('shadow_pnl_pct'))} | "
-        f"shadow_exit={row.get('shadow_exit_reason') or 'n/a'}"
+        f"shadow_exit={row.get('shadow_exit_reason') or 'n/a'} | "
+        f"hybrid_status={row.get('shadow_hybrid_dex_gate_status') or 'n/a'} | "
+        f"hybrid_armed={row.get('shadow_hybrid_dex_gate_armed')} | "
+        f"hybrid_dex_pnl={fmt_pct(row.get('shadow_hybrid_dex_gate_dex_pnl_pct'))} | "
+        f"hybrid_onchain_pnl={fmt_pct(row.get('shadow_hybrid_dex_gate_onchain_pnl_pct'))}"
     )
 
 

@@ -74,6 +74,15 @@ class ShadowCandidateConfig:
     profit_lock_steps: List[Dict[str, float]]
 
 
+@dataclass(frozen=True)
+class HybridDexGateConfig:
+    name: str
+    dex_arm_pct: float
+    onchain_stop_pct: float
+    onchain_disarm_pct: float
+    disable_after_dex_breakeven: bool
+
+
 @dataclass
 class OpenPosition:
     token_address: str
@@ -191,6 +200,7 @@ class PositionMonitor:
             self.onchain_audit_cfg.get("write_global_file", True)
         )
         self.shadow_candidate_configs = self._load_shadow_candidate_configs()
+        self.hybrid_dex_gate_config = self._load_hybrid_dex_gate_config()
         self.liquidity_exit_cfg = position_cfg.get("liquidity_exit", {})
         self.liquidity_exit_enabled = bool(self.liquidity_exit_cfg.get("enabled", False))
         self.liquidity_exit_drop_from_open_pct = float(
@@ -394,6 +404,25 @@ class PositionMonitor:
                 )
             )
         return [config for config in configs if config.enabled]
+
+    def _load_hybrid_dex_gate_config(self) -> Optional[HybridDexGateConfig]:
+        raw = self.onchain_audit_cfg.get("hybrid_dex_gate")
+        if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
+            return None
+        dex_arm_pct = self._optional_float(raw.get("dex_arm_pct"))
+        onchain_stop_pct = self._optional_float(raw.get("onchain_stop_pct"))
+        onchain_disarm_pct = self._optional_float(raw.get("onchain_disarm_pct"))
+        thresholds = (dex_arm_pct, onchain_stop_pct, onchain_disarm_pct)
+        if any(value is None or value <= 0 for value in thresholds):
+            self._log(f"[{LOG_WARN}] Shadow hibrido desabilitado: thresholds invalidos.")
+            return None
+        return HybridDexGateConfig(
+            name=str(raw.get("candidate_name") or "hybrid_dex_gate"),
+            dex_arm_pct=float(dex_arm_pct),
+            onchain_stop_pct=float(onchain_stop_pct),
+            onchain_disarm_pct=float(onchain_disarm_pct),
+            disable_after_dex_breakeven=bool(raw.get("disable_after_dex_breakeven", True)),
+        )
 
     @staticmethod
     def _format_metric(value: Any) -> str:
@@ -749,6 +778,119 @@ class PositionMonitor:
 
         return "open"
 
+    @staticmethod
+    def _initial_hybrid_dex_gate_state(
+        config: HybridDexGateConfig,
+        entry_price: float,
+        now: str,
+        eligible: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "config_name": config.name,
+            "decision_source": "dex_gate_onchain_stop",
+            "entry_price": entry_price,
+            "entry_time": now,
+            "status": "monitoring_dex",
+            "eligible": eligible,
+            "ineligible_reason": None if eligible else "late_start",
+            "armed": False,
+            "armed_ever": False,
+            "armed_at": None,
+            "disarmed_at": None,
+            "arm_count": 0,
+            "disarm_count": 0,
+            "dex_pnl_pct": None,
+            "onchain_pnl_pct": 0.0,
+            "onchain_pnl_at_arm_pct": None,
+            "dex_pnl_at_arm_pct": None,
+            "exit_reason": None,
+            "exit_price": None,
+            "exit_time": None,
+            "pnl_pct": None,
+            "ticks": 0,
+            "disabled_reason": None,
+            "config": {
+                "dex_arm_pct": config.dex_arm_pct,
+                "onchain_stop_pct": config.onchain_stop_pct,
+                "onchain_disarm_pct": config.onchain_disarm_pct,
+                "disable_after_dex_breakeven": config.disable_after_dex_breakeven,
+            },
+        }
+
+    def _update_hybrid_dex_gate(
+        self,
+        position: OpenPosition,
+        tick: Dict[str, Any],
+        onchain_price: float,
+        now: str,
+    ) -> Optional[str]:
+        config = self.hybrid_dex_gate_config
+        if config is None:
+            return None
+        state = position.shadow_candidates.get(config.name)
+        if not isinstance(state, dict):
+            prior_ticks = [
+                int(item.get("ticks") or 0)
+                for item in position.shadow_candidates.values()
+                if isinstance(item, dict)
+            ]
+            eligible = max(prior_ticks, default=0) == 0
+            state = self._initial_hybrid_dex_gate_state(config, onchain_price, now, eligible)
+            position.shadow_candidates[config.name] = state
+
+        state["ticks"] = int(state.get("ticks") or 0) + 1
+        if not bool(state.get("eligible", True)):
+            state["status"] = "skipped_late_start"
+            return "skipped_late_start"
+        if state.get("exit_reason") is not None:
+            state["status"] = "already_exited"
+            return "already_exited"
+
+        entry_price = self._optional_float(state.get("entry_price"))
+        dex_price = self._optional_float(tick.get("price"))
+        if entry_price is None or entry_price <= 0 or dex_price is None or position.entry_price <= 0:
+            state["status"] = "unavailable"
+            return "unavailable"
+
+        dex_pnl = ((dex_price / position.entry_price) - 1) * 100
+        onchain_pnl = ((onchain_price / entry_price) - 1) * 100
+        state["dex_pnl_pct"] = dex_pnl
+        state["onchain_pnl_pct"] = onchain_pnl
+
+        if config.disable_after_dex_breakeven and position.breakeven_activated:
+            state["armed"] = False
+            state["status"] = "disabled"
+            state["disabled_reason"] = "dex_breakeven_activated"
+            return "disabled"
+
+        if not bool(state.get("armed")) and dex_pnl <= -config.dex_arm_pct:
+            state["armed"] = True
+            state["armed_ever"] = True
+            state["armed_at"] = now
+            state["arm_count"] = int(state.get("arm_count") or 0) + 1
+            state["dex_pnl_at_arm_pct"] = dex_pnl
+            state["onchain_pnl_at_arm_pct"] = onchain_pnl
+
+        if bool(state.get("armed")):
+            state["status"] = "armed"
+            if onchain_pnl <= -config.onchain_stop_pct:
+                state["status"] = "would_exit"
+                state["exit_reason"] = "STOP_LOSS"
+                state["exit_price"] = onchain_price
+                state["exit_time"] = now
+                state["pnl_pct"] = onchain_pnl
+                return "would_exit"
+            if onchain_pnl > -config.onchain_disarm_pct:
+                state["armed"] = False
+                state["status"] = "monitoring_dex"
+                state["disarmed_at"] = now
+                state["disarm_count"] = int(state.get("disarm_count") or 0) + 1
+                return "monitoring_dex"
+            return "armed"
+
+        state["status"] = "monitoring_dex"
+        return "monitoring_dex"
+
     def _sync_legacy_shadow_from_candidate(self, position: OpenPosition, candidate_name: str) -> None:
         state = position.shadow_candidates.get(candidate_name) or {}
         position.shadow_entry_price = state.get("entry_price")
@@ -786,6 +928,10 @@ class PositionMonitor:
         current_price = float(shadow_price)
         candidate_statuses: Dict[str, str] = {}
         candidate_reason = None
+        hybrid_status = self._update_hybrid_dex_gate(position, tick, current_price, now)
+        if self.hybrid_dex_gate_config is not None and hybrid_status is not None:
+            candidate_statuses[self.hybrid_dex_gate_config.name] = hybrid_status
+
         for config in self.shadow_candidate_configs:
             state = position.shadow_candidates.get(config.name)
             if not isinstance(state, dict):
@@ -824,12 +970,18 @@ class PositionMonitor:
             "decision_price": tick.get("price"),
             "market_data_decision_source": tick.get("market_data_decision_source"),
             "dex_price_native": tick.get("dex_price_native"),
+            "dex_liquidity_usd": tick.get("liquidity_usd"),
+            "dex_volume_m5": tick.get("volume_m5"),
+            "dex_buy_pressure": tick.get("buy_pressure"),
             "onchain_price_native": tick.get("onchain_price_native"),
             "divergence_pct": tick.get("divergence_pct"),
             "onchain_status": tick.get("onchain_status"),
             "onchain_reason": tick.get("onchain_reason"),
             "onchain_slot": tick.get("onchain_slot"),
             "onchain_timestamp": tick.get("onchain_timestamp"),
+            "onchain_liquidity_native": tick.get("onchain_liquidity_native"),
+            "onchain_base_reserve": tick.get("onchain_base_reserve"),
+            "onchain_quote_reserve": tick.get("onchain_quote_reserve"),
             "shadow_decision_status": tick.get("shadow_decision_status"),
             "shadow_decision_reason": tick.get("shadow_decision_reason"),
             "shadow_entry_price": tick.get("shadow_entry_price"),
@@ -858,6 +1010,16 @@ class PositionMonitor:
                     f"{prefix}_stop_price": state.get("stop_price"),
                     f"{prefix}_trailing_stop_price": state.get("trailing_stop_price"),
                     f"{prefix}_ticks": state.get("ticks"),
+                    f"{prefix}_status": state.get("status"),
+                    f"{prefix}_eligible": state.get("eligible"),
+                    f"{prefix}_ineligible_reason": state.get("ineligible_reason"),
+                    f"{prefix}_armed": state.get("armed"),
+                    f"{prefix}_armed_ever": state.get("armed_ever"),
+                    f"{prefix}_dex_pnl_pct": state.get("dex_pnl_pct"),
+                    f"{prefix}_onchain_pnl_pct": state.get("onchain_pnl_pct"),
+                    f"{prefix}_arm_count": state.get("arm_count"),
+                    f"{prefix}_disarm_count": state.get("disarm_count"),
+                    f"{prefix}_disabled_reason": state.get("disabled_reason"),
                 }
             )
         self._append_jsonl(self.market_data_audit_file, payload)
@@ -1398,6 +1560,16 @@ class PositionMonitor:
                     f"{prefix}_stop_price": state.get("stop_price"),
                     f"{prefix}_trailing_stop_price": state.get("trailing_stop_price"),
                     f"{prefix}_ticks": state.get("ticks"),
+                    f"{prefix}_status": state.get("status"),
+                    f"{prefix}_eligible": state.get("eligible"),
+                    f"{prefix}_ineligible_reason": state.get("ineligible_reason"),
+                    f"{prefix}_armed": state.get("armed"),
+                    f"{prefix}_armed_ever": state.get("armed_ever"),
+                    f"{prefix}_dex_pnl_pct": state.get("dex_pnl_pct"),
+                    f"{prefix}_onchain_pnl_pct": state.get("onchain_pnl_pct"),
+                    f"{prefix}_arm_count": state.get("arm_count"),
+                    f"{prefix}_disarm_count": state.get("disarm_count"),
+                    f"{prefix}_disabled_reason": state.get("disabled_reason"),
                 }
             )
         self._append_jsonl(path, enriched_tick)
