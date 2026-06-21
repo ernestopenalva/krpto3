@@ -39,6 +39,11 @@ def find_gated_stop(
 
     armed = False
     armed_ever = False
+    current_dex_pnl: Optional[float] = None
+    current_dex_time = None
+    previous_dex_pnl: Optional[float] = None
+    previous_dex_time = None
+    arm_context: Dict[str, Any] = {}
     for row in rows:
         timestamp = parse_time(row.get("timestamp"))
         onchain_price = safe_float(row.get("shadow_price"))
@@ -53,11 +58,37 @@ def find_gated_stop(
             if dex_price is not None and dex_price > 0:
                 dex_pnl = ((dex_price / dex_entry_price) - 1) * 100
 
+        if dex_pnl is not None and (
+            current_dex_pnl is None or abs(dex_pnl - current_dex_pnl) > 1e-12
+        ):
+            previous_dex_pnl = current_dex_pnl
+            previous_dex_time = current_dex_time
+            current_dex_pnl = dex_pnl
+            current_dex_time = timestamp
+
         if not armed:
             if dex_pnl is None or dex_pnl > -dex_arm_pct:
                 continue
             armed = True
             armed_ever = True
+            arm_context = {
+                "dex_pnl_at_arm": dex_pnl,
+                "dex_arm_time": row.get("timestamp"),
+                "dex_snapshot_time_at_arm": current_dex_time.isoformat() if current_dex_time else None,
+                "previous_dex_pnl": previous_dex_pnl,
+                "previous_dex_time": previous_dex_time.isoformat() if previous_dex_time else None,
+                "dex_jump_at_arm_pp": (
+                    dex_pnl - previous_dex_pnl if previous_dex_pnl is not None else None
+                ),
+                "seconds_from_previous_dex_snapshot": (
+                    (current_dex_time - previous_dex_time).total_seconds()
+                    if current_dex_time is not None and previous_dex_time is not None
+                    else None
+                ),
+                "dex_snapshot_age_at_arm_seconds": (
+                    (timestamp - current_dex_time).total_seconds() if current_dex_time is not None else None
+                ),
+            }
 
         onchain_pnl = ((onchain_price / onchain_entry) - 1) * 100
         if onchain_pnl <= -onchain_stop_pct:
@@ -65,6 +96,7 @@ def find_gated_stop(
                 "pnl_pct": onchain_pnl,
                 "time": row.get("timestamp"),
                 "dex_pnl_at_trigger": dex_pnl,
+                **arm_context,
             }, armed_ever
         if onchain_pnl > -onchain_disarm_pct:
             armed = False
@@ -156,13 +188,34 @@ def main() -> None:
     if deltas:
         print(f"delta_medio={fmt_pct(sum(deltas) / len(deltas))} | delta_mediano={fmt_pct(median(deltas))}")
     print(f"usd_trades={usd_count}")
+    stops_with_previous_dex = [
+        item for item in triggered if safe_float((item["stop"] or {}).get("previous_dex_pnl")) is not None
+    ]
+    print("\n## Contexto Dex Do Armamento")
+    print(f"stops_com_snapshot_dex_anterior={len(stops_with_previous_dex)} / {len(triggered)}")
+    if stops_with_previous_dex:
+        snapshot_gaps = [
+            safe_float((item["stop"] or {}).get("seconds_from_previous_dex_snapshot"))
+            for item in stops_with_previous_dex
+        ]
+        snapshot_gaps = [value for value in snapshot_gaps if value is not None]
+        if snapshot_gaps:
+            print(
+                f"intervalo_snapshots_dex_mediano={median(snapshot_gaps):.1f}s | "
+                f"max={max(snapshot_gaps):.1f}s"
+            )
     print("\n## Trades Alterados")
     for item in sorted(triggered, key=lambda row: abs(row["delta"]), reverse=True)[:args.limit]:
         trade, stop = item["trade"], item["stop"] or {}
         print(
             f"{trade.get('symbol')} | real={trade.get('exit_reason')} {fmt_pct(item['real_pnl'])} | "
             f"hybrid={fmt_pct(item['hybrid_pnl'])} | delta={fmt_pct(item['delta'])} | "
-            f"dex_pnl_trigger={fmt_pct(stop.get('dex_pnl_at_trigger'))} | "
+            f"dex_prev={fmt_pct(stop.get('previous_dex_pnl'))} | "
+            f"dex_arm={fmt_pct(stop.get('dex_pnl_at_arm'))} | "
+            f"dex_jump={fmt_pct(stop.get('dex_jump_at_arm_pp'))} | "
+            f"snapshot_gap={safe_float(stop.get('seconds_from_previous_dex_snapshot'))}s | "
+            f"dex_trigger={fmt_pct(stop.get('dex_pnl_at_trigger'))} | "
+            f"prev_time={stop.get('previous_dex_time')} | arm_time={stop.get('dex_arm_time')} | "
             f"stop_time={stop.get('time')} | entry_div={fmt_pct(item['entry_div'])}"
         )
 
