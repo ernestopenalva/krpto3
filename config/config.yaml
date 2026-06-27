@@ -142,6 +142,30 @@ position_monitor:
       onchain_disarm_pct: 2
       disable_after_dex_breakeven: true
 
+abb_position:
+  enabled: true
+  source: onchain
+  provider: pumpswap
+  output_dir: "data/position_monitor_abb"
+  poll_interval_seconds: 1
+  timeout_seconds: 15
+
+  stop_loss_pct: 5
+  hard_instant_threshold_pct: 10
+  breakeven_trigger_pct: 5
+  trailing_gap_pct: 12
+  profit_lock_enabled: true
+
+  persist_stop_seconds: 5
+  persist_seconds: 3
+  arm_persist_seconds: 0
+
+  abb_window_seconds: 120
+  abb_multiplier: 0.5
+  abb_min_pct: 1.0
+  abb_max_pct: 8.0
+  abb_fallback: reserve_ratio
+
 shadow_monitor:
   enabled: false
   poll_interval_seconds: 10

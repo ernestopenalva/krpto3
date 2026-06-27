@@ -34,6 +34,7 @@ ENTRY_CFG = CFG.get("entry", {})
 MOMENTUM_CFG = CFG.get("momentum_entry", {})
 POSITION_CFG = CONFIG.get("position_monitor", {})
 SHADOW_CFG = CONFIG.get("shadow_monitor", {})
+ABB_POSITION_CFG = CONFIG.get("abb_position", {})
 
 
 # =========================
@@ -52,6 +53,7 @@ SHADOW_WATCHLIST_LOCK_FILE = OUTPUT_DIR / "shadow_watchlist.lock"
 WATCHLIST_FILE = Path("data/watchlist/watchlist.json")
 OPEN_POSITIONS_FILE = Path(POSITION_CFG.get("output_dir", "data/position_monitor")) / "open_positions.json"
 POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor.py"
+ABB_POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor_abb.py"
 LOGS_DIR = PROJECT_ROOT / "logs"
 
 POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
@@ -195,6 +197,27 @@ def dispatch_position_monitor(token_address: str) -> None:
                 sys.executable,
                 "-u",
                 str(POSITION_MONITOR_SCRIPT),
+                "--token",
+                token_address,
+            ],
+            cwd=PROJECT_ROOT,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+
+def dispatch_abb_position_monitor(token_address: str) -> None:
+    if not bool(ABB_POSITION_CFG.get("enabled", False)):
+        return
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOGS_DIR / f"position_abb_{datetime.now().strftime('%Y-%m-%d')}.txt"
+    with log_file.open("a", encoding="utf-8") as log_handle:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                str(ABB_POSITION_MONITOR_SCRIPT),
                 "--token",
                 token_address,
             ],
@@ -403,6 +426,9 @@ def load_candidates() -> List[Dict[str, Any]]:
             "symbol": symbol or token_address[:6],
             "chain_id": chain_id,
             "pair_address": pair_address,
+            "dex_id": selected_pair.get("dexId") or item.get("dex_id"),
+            "base_mint": (selected_pair.get("baseToken") or {}).get("address") or item.get("base_mint"),
+            "quote_mint": (selected_pair.get("quoteToken") or {}).get("address") or item.get("quote_mint"),
             "started_at": now_iso(),
             "status": "monitoring",
             "signal_emitted": False,
@@ -467,7 +493,11 @@ def build_tick(candidate: Dict[str, Any], pair: Dict[str, Any]) -> Dict[str, Any
         "symbol": candidate["symbol"],
         "chain_id": candidate["chain_id"],
         "pair_address": candidate["pair_address"],
+        "dex_id": candidate.get("dex_id"),
+        "base_mint": candidate.get("base_mint"),
+        "quote_mint": candidate.get("quote_mint"),
         "price_usd": safe_float(pair.get("priceUsd")),
+        "price_native": safe_float(pair.get("priceNative")),
         "volume_m5": safe_float(volume_m5),
         "buys_m5": buys,
         "sells_m5": sells,
@@ -917,7 +947,11 @@ def register_buy_signal(candidate: Dict[str, Any], tick: Dict[str, Any], evaluat
         "symbol": candidate["symbol"],
         "chain_id": candidate["chain_id"],
         "pair_address": candidate["pair_address"],
+        "dex_id": candidate.get("dex_id"),
+        "base_mint": candidate.get("base_mint"),
+        "quote_mint": candidate.get("quote_mint"),
         "entry_price_usd": tick["price_usd"],
+        "entry_price_native": tick.get("price_native"),
         "entry_reason": evaluation.get("entry_reason") or evaluation.get("metrics", {}).get("entry_reason"),
         "motivo_entrada": evaluation.get("metrics", {}).get("motivo_entrada"),
         "reason": evaluation["reason"],
@@ -1046,6 +1080,7 @@ def monitor() -> None:
 
                 register_buy_signal(candidate, tick, evaluation)
                 dispatch_position_monitor(candidate["token_address"])
+                dispatch_abb_position_monitor(candidate["token_address"])
                 update_watchlist_status(candidate["token_address"], "comprado", evaluation.get("reason"))
                 register_processed_token(candidate, "comprado", evaluation.get("reason"))
                 candidate["signal_emitted"] = True
