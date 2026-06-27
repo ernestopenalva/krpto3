@@ -72,6 +72,19 @@ class ReplayResult:
     emergency_used: bool
     band_values: List[float]
     band_relevant: bool
+    band_sources: Dict[str, int]
+
+
+@dataclass
+class EmergencyEvent:
+    symbol: str
+    token_address: str
+    timestamp: str
+    trigger: str
+    max_drop_pct: float
+    reserve_quote: Optional[float]
+    real_exit_reason: str
+    real_pnl: Optional[float]
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -269,10 +282,15 @@ def fallback_band(reserve_quote: Optional[float], reserve_quote_start: Optional[
     return clip(variation * 2.0, config.band_min_pct / 100.0, config.band_max_pct / 100.0)
 
 
-def emergency_active(row_time: datetime, reserve_quote: Optional[float], reserve_history: Deque[Tuple[datetime, float]], config: AbbConfig) -> bool:
+def reserve_drop_since(
+    row_time: datetime,
+    reserve_quote: Optional[float],
+    reserve_history: Deque[Tuple[datetime, float]],
+    seconds: int,
+) -> Optional[float]:
     if reserve_quote is None or reserve_quote <= 0:
-        return False
-    threshold_time = row_time - timedelta(seconds=60)
+        return None
+    threshold_time = row_time - timedelta(seconds=seconds)
     prior: Optional[Tuple[datetime, float]] = None
     for item_time, item_reserve in reserve_history:
         if item_time <= threshold_time:
@@ -280,9 +298,47 @@ def emergency_active(row_time: datetime, reserve_quote: Optional[float], reserve
         else:
             break
     if prior is None or prior[1] <= 0:
-        return False
-    drop = (prior[1] - reserve_quote) / prior[1]
-    return drop > (config.liquidity_drain_threshold_pct / 100.0)
+        return None
+    return (prior[1] - reserve_quote) / prior[1]
+
+
+def emergency_trigger(
+    row_time: datetime,
+    reserve_quote: Optional[float],
+    reserve_history: Deque[Tuple[datetime, float]],
+    reserve_entry: Optional[float],
+    config: AbbConfig,
+    mode: str = "old",
+) -> Tuple[bool, str, float]:
+    drops: List[Tuple[str, Optional[float], float]] = []
+    if mode == "old":
+        drops.append(("60s", reserve_drop_since(row_time, reserve_quote, reserve_history, 60), config.liquidity_drain_threshold_pct / 100.0))
+    else:
+        drops.extend(
+            [
+                ("15s", reserve_drop_since(row_time, reserve_quote, reserve_history, 15), 0.10),
+                ("30s", reserve_drop_since(row_time, reserve_quote, reserve_history, 30), 0.12),
+                ("60s", reserve_drop_since(row_time, reserve_quote, reserve_history, 60), 0.15),
+            ]
+        )
+        if reserve_quote is not None and reserve_quote > 0 and reserve_entry is not None and reserve_entry > 0:
+            drops.append(("entry", (reserve_entry - reserve_quote) / reserve_entry, 0.25))
+
+    max_drop = max((drop for _label, drop, _threshold in drops if drop is not None), default=0.0)
+    for label, drop, threshold in drops:
+        if drop is not None and drop > threshold:
+            return True, label, max_drop * 100.0
+    return False, "none", max_drop * 100.0
+
+
+def emergency_active(
+    row_time: datetime,
+    reserve_quote: Optional[float],
+    reserve_history: Deque[Tuple[datetime, float]],
+    config: AbbConfig,
+) -> bool:
+    active, _reason, _drop = emergency_trigger(row_time, reserve_quote, reserve_history, None, config, mode="old")
+    return active
 
 
 def active_protection_level(entry_price: float, highest_price: float, config: AbbConfig) -> Tuple[float, str]:
@@ -377,17 +433,18 @@ def replay_abb(
     audit_rows: List[Dict[str, Any]],
     swaps: List[Dict[str, Any]],
     config: AbbConfig,
+    emergency_mode: str = "old",
 ) -> ReplayResult:
     symbol = str(trade.get("symbol") or "")
     token = token_key(trade)
     real_pnl = safe_float(trade.get("pnl_pct"))
     hybrid_pnl = hybrid_pnl_for_trade(trade)
     if not audit_rows:
-        return ReplayResult(config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl, None, None, None, None, 0, len(swaps), len(swaps) < 10, False, False, [], False)
+        return ReplayResult(config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl, None, None, None, None, 0, len(swaps), len(swaps) < 10, False, False, [], False, {})
 
     entry_price = safe_float(audit_rows[0].get("onchain_price_native"))
     if entry_price is None or entry_price <= 0:
-        return ReplayResult(config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl, None, None, None, None, len(audit_rows), len(swaps), len(swaps) < 10, False, False, [], False)
+        return ReplayResult(config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl, None, None, None, None, len(audit_rows), len(swaps), len(swaps) < 10, False, False, [], False, {})
 
     swaps_sorted = sorted(swaps, key=lambda item: parse_time(item.get("timestamp")) or datetime.min.replace(tzinfo=BRASILIA))
     swap_index = 0
@@ -402,6 +459,7 @@ def replay_abb(
     emergency_used = False
     band_values: List[float] = []
     band_relevant = False
+    band_sources: Counter[str] = Counter()
 
     for row in audit_rows:
         row_time = parse_time(row.get("timestamp"))
@@ -432,26 +490,41 @@ def replay_abb(
         pnl = ((raw_price / entry_price) - 1) * 100
         max_pnl = ((highest_price / entry_price) - 1) * 100
 
-        if pnl <= -config.hard_instant_threshold_pct:
-            return ReplayResult(
-                config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl,
-                "STOP_LOSS", row.get("timestamp"), pnl, max_pnl, len(audit_rows), len(swaps), len(swaps) < 10,
-                fallback_used, emergency_used, band_values, band_relevant,
-            )
-
+        source = "price_range"
         band = band_from_prices([price for _time, price in recent_prices], config)
         if band is None:
             band = fallback_band(reserve_quote, reserve_start, config)
             fallback_used = fallback_used or band is not None
+            if band is not None:
+                source = "reserve_fallback"
         if band is None:
             band = config.band_min_pct / 100.0
             fallback_used = True
+            source = "min_fallback"
 
-        if emergency_active(row_time, reserve_quote, reserve_history, config):
+        emergency_now, _emergency_reason, _emergency_drop = emergency_trigger(
+            row_time,
+            reserve_quote,
+            reserve_history,
+            reserve_start,
+            config,
+            mode=emergency_mode,
+        )
+        if emergency_now:
             band = 0.0
             emergency_used = True
+            source = "emergency"
 
         band_values.append(band * 100.0)
+        band_sources[source] += 1
+
+        if pnl <= -config.hard_instant_threshold_pct:
+            return ReplayResult(
+                config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl,
+                "STOP_LOSS", row.get("timestamp"), pnl, max_pnl, len(audit_rows), len(swaps), len(swaps) < 10,
+                fallback_used, emergency_used, band_values, band_relevant, dict(band_sources),
+            )
+
         protection_level, reason = active_protection_level(entry_price, highest_price, config)
         below_level = raw_price < protection_level
         outside_band = raw_price < protection_level * (1 - band)
@@ -467,7 +540,7 @@ def replay_abb(
                 return ReplayResult(
                     config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl,
                     reason, row.get("timestamp"), pnl, max_pnl, len(audit_rows), len(swaps), len(swaps) < 10,
-                    fallback_used, emergency_used, band_values, band_relevant,
+                    fallback_used, emergency_used, band_values, band_relevant, dict(band_sources),
                 )
         else:
             condition_started_at = None
@@ -479,7 +552,7 @@ def replay_abb(
     return ReplayResult(
         config.label, symbol, token, str(trade.get("exit_reason") or ""), real_pnl, hybrid_pnl,
         None, None, pnl, max_pnl, len(audit_rows), len(swaps), len(swaps) < 10,
-        fallback_used, emergency_used, band_values, band_relevant,
+        fallback_used, emergency_used, band_values, band_relevant, dict(band_sources),
     )
 
 
@@ -526,6 +599,141 @@ def classify_counts(results: List[ReplayResult]) -> Dict[str, int]:
         if result.real_pnl > 0 and delta < 0:
             counts["winners_prejudicados"] += 1
     return counts
+
+
+def first_emergency_event(
+    trade: Dict[str, Any],
+    audit_rows: List[Dict[str, Any]],
+    config: AbbConfig,
+    mode: str,
+) -> Optional[EmergencyEvent]:
+    if not audit_rows:
+        return None
+    reserve_start = reserve_quote_from_row(audit_rows[0])
+    reserve_history: Deque[Tuple[datetime, float]] = deque()
+    best_drop = 0.0
+    best_trigger = "none"
+
+    for row in audit_rows:
+        row_time = parse_time(row.get("timestamp"))
+        if row_time is None:
+            continue
+        reserve_quote = reserve_quote_from_row(row)
+        if reserve_quote is not None and reserve_quote > 0:
+            reserve_history.append((row_time, reserve_quote))
+            while reserve_history and reserve_history[0][0] < row_time - timedelta(seconds=180):
+                reserve_history.popleft()
+
+        active, trigger, max_drop = emergency_trigger(
+            row_time,
+            reserve_quote,
+            reserve_history,
+            reserve_start,
+            config,
+            mode=mode,
+        )
+        if max_drop > best_drop:
+            best_drop = max_drop
+            best_trigger = trigger
+        if active:
+            return EmergencyEvent(
+                symbol=str(trade.get("symbol") or ""),
+                token_address=token_key(trade),
+                timestamp=str(row.get("timestamp") or ""),
+                trigger=trigger,
+                max_drop_pct=max_drop,
+                reserve_quote=reserve_quote,
+                real_exit_reason=str(trade.get("exit_reason") or ""),
+                real_pnl=safe_float(trade.get("pnl_pct")),
+            )
+
+    if best_drop > 0:
+        return None
+    return None
+
+
+def print_emergency_study(
+    dataset: List[Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]],
+    config: AbbConfig,
+    limit: int,
+) -> None:
+    affected: List[Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], EmergencyEvent]] = []
+    for trade, audit_rows, swaps in dataset:
+        event = first_emergency_event(trade, audit_rows, config, mode="multi")
+        if event is not None:
+            affected.append((trade, audit_rows, swaps, event))
+
+    old_results = [
+        replay_abb(trade, audit_rows, swaps, AbbConfig(label="ABB_8_old_emergency", band_max_pct=config.band_max_pct), emergency_mode="old")
+        for trade, audit_rows, swaps, _event in affected
+    ]
+    new_results = [
+        replay_abb(trade, audit_rows, swaps, AbbConfig(label="ABB_8_new_emergency", band_max_pct=config.band_max_pct), emergency_mode="multi")
+        for trade, audit_rows, swaps, _event in affected
+    ]
+
+    print("# ABB - Estudo Restrito De Emergencia")
+    print("escopo=somente trades em que a emergencia nova dispararia")
+    print("emergencia_antiga=queda >15% em 60s")
+    print("emergencia_nova=queda >10% em 15s OU >12% em 30s OU >15% em 60s OU >25% desde entrada")
+
+    print("\n## Trades Com Emergencia Nova")
+    print(f"trades_com_emergencia_nova={len(affected)}")
+    for trade, _audit_rows, _swaps, event in sorted(affected, key=lambda item: item[3].max_drop_pct, reverse=True)[:limit]:
+        print(
+            f"{event.symbol} | trigger={event.trigger} | queda_max={fmt_pct(event.max_drop_pct)} | "
+            f"emergency_at={event.timestamp} | real={event.real_exit_reason} {fmt_pct(event.real_pnl)}"
+        )
+
+    old_by_token = {result.token_address: result for result in old_results}
+    new_by_token = {result.token_address: result for result in new_results}
+
+    old_sum = summarize([result.pnl for result in old_results])["sum"]
+    new_sum = summarize([result.pnl for result in new_results])["sum"]
+    improved = 0
+    worsened = 0
+    same = 0
+    for token, new_result in new_by_token.items():
+        old_result = old_by_token.get(token)
+        if old_result is None or old_result.pnl is None or new_result.pnl is None:
+            continue
+        delta = new_result.pnl - old_result.pnl
+        if delta > 1e-9:
+            improved += 1
+        elif delta < -1e-9:
+            worsened += 1
+        else:
+            same += 1
+
+    print("\n## Agregado Restrito")
+    print(f"trades_afetados={len(affected)}")
+    print(f"pnl_sum_emergencia_antiga={fmt_pct(old_sum)}")
+    print(f"pnl_sum_emergencia_nova={fmt_pct(new_sum)}")
+    print(f"delta={fmt_pct((new_sum - old_sum) if old_sum is not None and new_sum is not None else None)}")
+    print(f"casos_melhorados={improved} | casos_piorados={worsened} | casos_iguais={same}")
+
+    print("\n## Comparacao Por Trade")
+    rows = []
+    for trade, _audit_rows, _swaps, event in affected:
+        old_result = old_by_token.get(token_key(trade))
+        new_result = new_by_token.get(token_key(trade))
+        if old_result is None or new_result is None:
+            continue
+        delta = (new_result.pnl - old_result.pnl) if old_result.pnl is not None and new_result.pnl is not None else None
+        rows.append((abs(delta or 0), event, old_result, new_result))
+
+    for _abs_delta, event, old_result, new_result in sorted(rows, key=lambda item: item[0], reverse=True)[:limit]:
+        event_time = parse_time(event.timestamp)
+        old_exit_time = parse_time(old_result.exit_time)
+        new_exit_time = parse_time(new_result.exit_time)
+        old_timing = "before_or_at_exit" if event_time is not None and old_exit_time is not None and event_time <= old_exit_time else "after_exit"
+        new_timing = "before_or_at_exit" if event_time is not None and new_exit_time is not None and event_time <= new_exit_time else "after_exit"
+        print(
+            f"{event.symbol} | queda_reserva_max={fmt_pct(event.max_drop_pct)} | janela={event.trigger} | "
+            f"emergencia_antiga={old_result.emergency_used} ({old_timing}) | emergencia_nova={new_result.emergency_used} ({new_timing}) | "
+            f"pnl_sem_emergencia={fmt_pct(old_result.pnl)} | pnl_com_emergencia_nova={fmt_pct(new_result.pnl)} | "
+            f"delta={fmt_pct((new_result.pnl - old_result.pnl) if old_result.pnl is not None and new_result.pnl is not None else None)}"
+        )
 
 
 def print_smoke_report(
@@ -610,6 +818,7 @@ def main() -> None:
     parser.add_argument("--entry-div-filter-pct", type=float, default=8.0)
     parser.add_argument("--limit", type=int, default=30)
     parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--emergency-study-only", action="store_true")
     args = parser.parse_args()
 
     load_project_env()
@@ -645,6 +854,10 @@ def main() -> None:
 
     if args.smoke_only:
         print_smoke_report(dataset, configs, args.limit)
+        return
+
+    if args.emergency_study_only:
+        print_emergency_study(dataset, configs[0], args.limit)
         return
 
     results_by_label: Dict[str, List[ReplayResult]] = {}
@@ -687,11 +900,20 @@ def main() -> None:
         emergencies = sum(1 for result in results if result.emergency_used)
         fallback = sum(1 for result in results if result.fallback_used)
         relevant = sum(1 for result in results if result.band_relevant)
+        source_counts = Counter()
+        for result in results:
+            source_counts.update(result.band_sources)
+        total_source_ticks = sum(source_counts.values())
+        source_summary = ", ".join(
+            f"{source}:{count}/{total_source_ticks}"
+            for source, count in source_counts.most_common()
+        ) or "n/a"
         print(
             f"{label}: band_pct_median={fmt_pct(median(bands) if bands else None)} | "
             f"p25={fmt_pct(pctile(bands, 0.25))} | p75={fmt_pct(pctile(bands, 0.75))} | "
             f"p90={fmt_pct(pctile(bands, 0.90))} | emergencias_ativadas={emergencies}/{len(results)} | "
-            f"fallback_usado={fallback}/{len(results)} | banda_relevante={relevant}/{len(results)}"
+            f"fallback_usado_em_algum_tick={fallback}/{len(results)} | banda_relevante={relevant}/{len(results)} | "
+            f"fontes_por_tick={source_summary}"
         )
 
     print("\n## Resultado Agregado")
@@ -743,7 +965,7 @@ def main() -> None:
         print(
             f"{label}: banda_relevante_em={sum(1 for result in results if result.band_relevant)} | "
             f"emergencia_em={sum(1 for result in results if result.emergency_used)} | "
-            f"fallback_em={sum(1 for result in results if result.fallback_used)} | "
+            f"fallback_em_algum_tick={sum(1 for result in results if result.fallback_used)} | "
             f"salvou_runner_vs_hibrido={len(saved_hybrid_runner)} | "
             f"deixou_passar_crash_vs_hibrido={len(hybrid_passed)}"
         )
