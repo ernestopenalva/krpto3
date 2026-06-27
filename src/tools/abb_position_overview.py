@@ -10,6 +10,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -18,11 +19,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 DEFAULT_WATCHLIST_FILE = PROJECT_ROOT / "data" / "watchlist" / "watchlist.json"
+DEFAULT_SCANNER_CANDIDATES_FILE = PROJECT_ROOT / "data" / "token_scanner" / "final_monitoring_candidates.json"
 DEFAULT_SIGNALS_FILE = PROJECT_ROOT / "data" / "token_monitor" / "buy_signals.json"
 DEFAULT_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
 DEFAULT_ABB_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor_abb" / "closed_trades.json"
 DEFAULT_ABB_OPEN_POSITIONS_FILE = PROJECT_ROOT / "data" / "position_monitor_abb" / "open_positions.json"
 DEFAULT_ABB_AUDIT_FILE = PROJECT_ROOT / "data" / "position_monitor_abb" / "abb_market_data_audit.jsonl"
+BRASILIA = ZoneInfo("America/Sao_Paulo")
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -66,9 +69,12 @@ def parse_time(value: Any) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BRASILIA)
+    return parsed.astimezone(BRASILIA)
 
 
 def fmt_time(value: Any) -> str:
@@ -76,6 +82,16 @@ def fmt_time(value: Any) -> str:
     if parsed is None:
         return str(value or "-")
     return parsed.isoformat(timespec="seconds")
+
+
+def fmt_price(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    if value == 0:
+        return "0"
+    if abs(value) < 0.0001:
+        return f"{value:.8g}"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
 def fmt_pct(value: Optional[float]) -> str:
@@ -124,6 +140,42 @@ def normalize_watchlist(payload: Any) -> Dict[str, Dict[str, Any]]:
     return {}
 
 
+def scanner_candidates_by_token(payload: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(payload, list):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        key = token_key(item)
+        if key:
+            result[key] = item
+    return result
+
+
+def nested_price(row: Dict[str, Any], *paths: List[str]) -> Optional[float]:
+    for path in paths:
+        current: Any = row
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        value = safe_float(current)
+        if value is not None:
+            return value
+    return None
+
+
+def scanner_price(candidate: Dict[str, Any], watch: Dict[str, Any]) -> Optional[float]:
+    return (
+        safe_float(watch.get("scanner_price_usd"))
+        or safe_float(watch.get("price_usd"))
+        or safe_float(candidate.get("price_usd"))
+        or nested_price(candidate, ["candidate", "selected_pair", "priceUsd"], ["selected_pair", "priceUsd"])
+    )
+
+
 def hybrid_pnl_for_trade(trade: Dict[str, Any]) -> Optional[float]:
     candidates = trade.get("shadow_candidates")
     state = candidates.get("hybrid_dex_gate") if isinstance(candidates, dict) else None
@@ -154,6 +206,7 @@ def abb_pnl_for_token(
 
 def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
     watchlist = normalize_watchlist(load_json(args.watchlist_file, {}))
+    scanner_candidates = scanner_candidates_by_token(load_json(args.scanner_candidates_file, []))
     signals = latest_by_token(load_json(args.signals_file, []))
     closed = latest_by_token(load_json(args.closed_trades_file, []))
     abb_closed = latest_by_token(load_json(args.abb_closed_trades_file, []))
@@ -175,6 +228,7 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
         abb_open_row = abb_open.get(token, {})
         abb_tick = abb_last_tick.get(token, {})
         watch = watchlist.get(token, {})
+        scanner = scanner_candidates.get(token, {})
         source = signal or real or abb_closed_row or abb_open_row or abb_tick or watch
 
         if args.only_abb and not (abb_closed_row or abb_open_row or abb_tick):
@@ -191,7 +245,9 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "symbol": source.get("symbol") or token[:8],
                 "quote": quote_label(source),
                 "detected_at": watch.get("discovered_at") or watch.get("discovered_at_utc"),
+                "scanner_price": scanner_price(scanner, watch),
                 "signal_at": signal_time,
+                "signal_price": safe_float(signal.get("entry_price_usd") or real.get("entry_price") or abb_closed_row.get("entry_price_dex_native")),
                 "entry_reason": signal.get("entry_reason") or real.get("source_signal", {}).get("entry_reason") or "-",
                 "pnl_ds": safe_float(real.get("pnl_pct")),
                 "pnl_hybrid": hybrid_pnl_for_trade(real) if real else None,
@@ -208,7 +264,9 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
     headers = [
         "Nome/quote",
         "Data detectado scanner",
+        "Preco scanner",
         "Data position ABB (SINAL)",
+        "Preco sinal",
         "Tipo Entrada",
         "Pnl DS",
         "Pnl Hibrido",
@@ -221,7 +279,9 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
             [
                 f"{row['symbol']}/{row['quote']}",
                 fmt_time(row.get("detected_at")),
+                fmt_price(row.get("scanner_price")),
                 fmt_time(row.get("signal_at")),
+                fmt_price(row.get("signal_price")),
                 str(row.get("entry_reason") or "-"),
                 fmt_pct(row.get("pnl_ds")),
                 fmt_pct(row.get("pnl_hybrid")),
@@ -244,6 +304,7 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visao consolidada Dex/Hibrido/ABB por token.")
     parser.add_argument("--watchlist-file", type=Path, default=DEFAULT_WATCHLIST_FILE)
+    parser.add_argument("--scanner-candidates-file", type=Path, default=DEFAULT_SCANNER_CANDIDATES_FILE)
     parser.add_argument("--signals-file", type=Path, default=DEFAULT_SIGNALS_FILE)
     parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_CLOSED_TRADES_FILE)
     parser.add_argument("--abb-closed-trades-file", type=Path, default=DEFAULT_ABB_CLOSED_TRADES_FILE)
