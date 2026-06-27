@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +30,7 @@ from src.project_env import load_project_env
 
 DEFAULT_HISTORY_DIR = PROJECT_ROOT / "data" / "token_monitor" / "history"
 DEFAULT_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
+BRASILIA = ZoneInfo("America/Sao_Paulo")
 monitor: Any = None
 
 
@@ -63,9 +65,12 @@ def parse_time(value: Any) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BRASILIA)
+    return parsed.astimezone(BRASILIA)
 
 
 def parse_boundary(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
@@ -127,7 +132,8 @@ def normalize_tick(tick: Dict[str, Any]) -> Dict[str, Any]:
 def load_history(path: Path) -> List[Dict[str, Any]]:
     ticks = [normalize_tick(tick) for tick in iter_jsonl(path)]
     ticks = [tick for tick in ticks if safe_float(tick.get("price_usd")) and tick.get("price_usd", 0) > 0]
-    return sorted(ticks, key=lambda tick: parse_time(tick.get("timestamp")) or datetime.min)
+    minimum_time = datetime.min.replace(tzinfo=BRASILIA)
+    return sorted(ticks, key=lambda tick: parse_time(tick.get("timestamp")) or minimum_time)
 
 
 def token_key(payload: Dict[str, Any]) -> Optional[str]:
