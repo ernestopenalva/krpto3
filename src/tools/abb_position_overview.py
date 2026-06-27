@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 DEFAULT_WATCHLIST_FILE = PROJECT_ROOT / "data" / "watchlist" / "watchlist.json"
 DEFAULT_SCANNER_CANDIDATES_FILE = PROJECT_ROOT / "data" / "token_scanner" / "final_monitoring_candidates.json"
+DEFAULT_MONITOR_HISTORY_DIR = PROJECT_ROOT / "data" / "token_monitor" / "history"
 DEFAULT_SIGNALS_FILE = PROJECT_ROOT / "data" / "token_monitor" / "buy_signals.json"
 DEFAULT_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
 DEFAULT_ABB_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor_abb" / "closed_trades.json"
@@ -92,6 +93,29 @@ def fmt_price(value: Optional[float]) -> str:
     if abs(value) < 0.0001:
         return f"{value:.8g}"
     return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def fmt_delta_pct(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:+.2f}%"
+
+
+def fmt_duration(start: Any, end: Any) -> str:
+    start_dt = parse_time(start)
+    end_dt = parse_time(end)
+    if start_dt is None or end_dt is None:
+        return "-"
+    seconds = int((end_dt - start_dt).total_seconds())
+    if seconds < 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def fmt_pct(value: Optional[float]) -> str:
@@ -176,6 +200,24 @@ def scanner_price(candidate: Dict[str, Any], watch: Dict[str, Any]) -> Optional[
     )
 
 
+def first_monitor_ticks_by_token(history_dir: Path) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    if not history_dir.exists():
+        return result
+    for path in history_dir.glob("*.jsonl"):
+        for row in iter_jsonl(path):
+            key = token_key(row)
+            if not key:
+                continue
+            current = result.get(key)
+            current_time = parse_time((current or {}).get("timestamp"))
+            row_time = parse_time(row.get("timestamp"))
+            if current is None or (row_time is not None and (current_time is None or row_time < current_time)):
+                result[key] = row
+            break
+    return result
+
+
 def hybrid_pnl_for_trade(trade: Dict[str, Any]) -> Optional[float]:
     candidates = trade.get("shadow_candidates")
     state = candidates.get("hybrid_dex_gate") if isinstance(candidates, dict) else None
@@ -207,6 +249,7 @@ def abb_pnl_for_token(
 def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
     watchlist = normalize_watchlist(load_json(args.watchlist_file, {}))
     scanner_candidates = scanner_candidates_by_token(load_json(args.scanner_candidates_file, []))
+    monitor_first_ticks = first_monitor_ticks_by_token(args.monitor_history_dir)
     signals = latest_by_token(load_json(args.signals_file, []))
     closed = latest_by_token(load_json(args.closed_trades_file, []))
     abb_closed = latest_by_token(load_json(args.abb_closed_trades_file, []))
@@ -229,6 +272,7 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
         abb_tick = abb_last_tick.get(token, {})
         watch = watchlist.get(token, {})
         scanner = scanner_candidates.get(token, {})
+        monitor_first = monitor_first_ticks.get(token, {})
         source = signal or real or abb_closed_row or abb_open_row or abb_tick or watch
 
         if args.only_abb and not (abb_closed_row or abb_open_row or abb_tick):
@@ -246,6 +290,8 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "quote": quote_label(source),
                 "detected_at": watch.get("discovered_at") or watch.get("discovered_at_utc"),
                 "scanner_price": scanner_price(scanner, watch),
+                "monitor_start_at": monitor_first.get("timestamp"),
+                "monitor_start_price": safe_float(monitor_first.get("price_usd")),
                 "signal_at": signal_time,
                 "signal_price": safe_float(signal.get("entry_price_usd") or real.get("entry_price") or abb_closed_row.get("entry_price_dex_native")),
                 "entry_reason": signal.get("entry_reason") or real.get("source_signal", {}).get("entry_reason") or "-",
@@ -264,9 +310,12 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
     headers = [
         "Nome/quote",
         "Data detectado scanner",
-        "Preco scanner",
+        "Inicio monitor",
+        "Preco inicio",
         "Data position ABB (SINAL)",
         "Preco sinal",
+        "Delta sinal",
+        "Tempo ate sinal",
         "Tipo Entrada",
         "Pnl DS",
         "Pnl Hibrido",
@@ -275,13 +324,23 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
     ]
     table = []
     for row in rows:
+        signal_price = row.get("signal_price")
+        monitor_price = row.get("monitor_start_price")
+        delta_signal = (
+            ((signal_price / monitor_price) - 1) * 100
+            if signal_price is not None and monitor_price is not None and monitor_price > 0
+            else None
+        )
         table.append(
             [
                 f"{row['symbol']}/{row['quote']}",
                 fmt_time(row.get("detected_at")),
-                fmt_price(row.get("scanner_price")),
+                fmt_time(row.get("monitor_start_at")),
+                fmt_price(row.get("monitor_start_price") or row.get("scanner_price")),
                 fmt_time(row.get("signal_at")),
                 fmt_price(row.get("signal_price")),
+                fmt_delta_pct(delta_signal),
+                fmt_duration(row.get("monitor_start_at") or row.get("detected_at"), row.get("signal_at")),
                 str(row.get("entry_reason") or "-"),
                 fmt_pct(row.get("pnl_ds")),
                 fmt_pct(row.get("pnl_hybrid")),
@@ -305,6 +364,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Visao consolidada Dex/Hibrido/ABB por token.")
     parser.add_argument("--watchlist-file", type=Path, default=DEFAULT_WATCHLIST_FILE)
     parser.add_argument("--scanner-candidates-file", type=Path, default=DEFAULT_SCANNER_CANDIDATES_FILE)
+    parser.add_argument("--monitor-history-dir", type=Path, default=DEFAULT_MONITOR_HISTORY_DIR)
     parser.add_argument("--signals-file", type=Path, default=DEFAULT_SIGNALS_FILE)
     parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_CLOSED_TRADES_FILE)
     parser.add_argument("--abb-closed-trades-file", type=Path, default=DEFAULT_ABB_CLOSED_TRADES_FILE)
