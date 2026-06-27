@@ -246,6 +246,60 @@ def abb_pnl_for_token(
     return "-"
 
 
+def abb_exit_time_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+) -> Any:
+    closed = abb_closed.get(token)
+    if closed is None:
+        return None
+    return closed.get("exit_time")
+
+
+def abb_exit_price_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> Optional[float]:
+    closed = abb_closed.get(token)
+    if closed is not None:
+        return safe_float(closed.get("exit_price_onchain"))
+    tick = abb_last_tick.get(token)
+    return safe_float((tick or {}).get("price_onchain"))
+
+
+def abb_entry_time_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_open: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> Any:
+    closed = abb_closed.get(token)
+    if closed is not None:
+        return closed.get("entry_time")
+    open_position = abb_open.get(token)
+    if open_position is not None:
+        return open_position.get("entry_time")
+    tick = abb_last_tick.get(token)
+    return (tick or {}).get("timestamp")
+
+
+def abb_entry_price_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_open: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> Optional[float]:
+    closed = abb_closed.get(token)
+    if closed is not None:
+        return safe_float(closed.get("entry_price_onchain"))
+    open_position = abb_open.get(token)
+    if open_position is not None:
+        return safe_float(open_position.get("entry_price_onchain"))
+    tick = abb_last_tick.get(token)
+    return safe_float((tick or {}).get("entry_price_onchain"))
+
+
 def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
     watchlist = normalize_watchlist(load_json(args.watchlist_file, {}))
     scanner_candidates = scanner_candidates_by_token(load_json(args.scanner_candidates_file, []))
@@ -284,6 +338,8 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
             or abb_open_row.get("entry_time")
             or abb_tick.get("timestamp")
         )
+        abb_entry_at = abb_entry_time_for_token(token, abb_closed, abb_open, abb_last_tick)
+        abb_entry_price = abb_entry_price_for_token(token, abb_closed, abb_open, abb_last_tick)
         rows.append(
             {
                 "symbol": source.get("symbol") or token[:8],
@@ -293,7 +349,10 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "monitor_start_at": monitor_first.get("timestamp"),
                 "monitor_start_price": safe_float(monitor_first.get("price_usd")),
                 "signal_at": signal_time,
-                "signal_price": safe_float(signal.get("entry_price_usd") or real.get("entry_price") or abb_closed_row.get("entry_price_dex_native")),
+                "abb_entry_at": abb_entry_at,
+                "abb_entry_price": abb_entry_price,
+                "abb_exit_at": abb_exit_time_for_token(token, abb_closed),
+                "abb_exit_price": abb_exit_price_for_token(token, abb_closed, abb_last_tick),
                 "entry_reason": signal.get("entry_reason") or real.get("source_signal", {}).get("entry_reason") or "-",
                 "pnl_ds": safe_float(real.get("pnl_pct")),
                 "pnl_hybrid": hybrid_pnl_for_trade(real) if real else None,
@@ -312,10 +371,12 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
         "Data detectado scanner",
         "Inicio monitor",
         "Preco inicio",
-        "Data position ABB (SINAL)",
-        "Preco sinal",
-        "Delta sinal",
-        "Tempo ate sinal",
+        "Data entrada ABB",
+        "Preco entrada ABB",
+        "Delta ate ABB",
+        "Tempo ate ABB",
+        "Data saida ABB",
+        "Preco saida ABB",
         "Tipo Entrada",
         "Pnl DS",
         "Pnl Hibrido",
@@ -324,7 +385,7 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
     ]
     table = []
     for row in rows:
-        signal_price = row.get("signal_price")
+        signal_price = row.get("abb_entry_price")
         monitor_price = row.get("monitor_start_price")
         delta_signal = (
             ((signal_price / monitor_price) - 1) * 100
@@ -337,10 +398,12 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
                 fmt_time(row.get("detected_at")),
                 fmt_time(row.get("monitor_start_at")),
                 fmt_price(row.get("monitor_start_price") or row.get("scanner_price")),
-                fmt_time(row.get("signal_at")),
-                fmt_price(row.get("signal_price")),
+                fmt_time(row.get("abb_entry_at")),
+                fmt_price(row.get("abb_entry_price")),
                 fmt_delta_pct(delta_signal),
-                fmt_duration(row.get("monitor_start_at") or row.get("detected_at"), row.get("signal_at")),
+                fmt_duration(row.get("monitor_start_at") or row.get("detected_at"), row.get("abb_entry_at")),
+                fmt_time(row.get("abb_exit_at")),
+                fmt_price(row.get("abb_exit_price")),
                 str(row.get("entry_reason") or "-"),
                 fmt_pct(row.get("pnl_ds")),
                 fmt_pct(row.get("pnl_hybrid")),
