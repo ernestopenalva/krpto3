@@ -155,6 +155,14 @@ class PumpSwapSwapCollector:
         self.output_file = output_file
         self.state_file = state_file
         self.signature_limit = signature_limit
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        self.output_file.touch(exist_ok=True)
+        self.last_stats: Dict[str, int] = {
+            "active_pools": 0,
+            "signatures": 0,
+            "transactions": 0,
+            "swaps": 0,
+        }
         state = load_json(state_file, {})
         self.state: Dict[str, Dict[str, Any]] = state if isinstance(state, dict) else {}
 
@@ -211,7 +219,14 @@ class PumpSwapSwapCollector:
 
     def collect_once(self) -> int:
         collected = 0
-        for pool in self._active_pools():
+        active_pools = self._active_pools()
+        self.last_stats = {
+            "active_pools": len(active_pools),
+            "signatures": 0,
+            "transactions": 0,
+            "swaps": 0,
+        }
+        for pool in active_pools:
             pair_address = str(pool["pair_address"])
             pool_state = self.state.get(pair_address)
             if not isinstance(pool_state, dict) or pool_state.get("position_key") != pool["position_key"]:
@@ -242,6 +257,7 @@ class PumpSwapSwapCollector:
                 continue
             if not signatures:
                 continue
+            self.last_stats["signatures"] += len(signatures)
 
             processed_signature = pool_state.get("last_signature")
             for signature_info in reversed(signatures):
@@ -255,10 +271,12 @@ class PumpSwapSwapCollector:
                     break
                 if transaction is None:
                     break
+                self.last_stats["transactions"] += 1
                 swap = parse_swap(transaction, pool, signature_info)
                 if swap is not None:
                     append_jsonl(self.output_file, swap)
                     collected += 1
+                    self.last_stats["swaps"] += 1
                 processed_signature = signature
 
             if processed_signature != pool_state.get("last_signature"):
@@ -295,10 +313,18 @@ def main() -> None:
     )
     print("# PumpSwap Swap Collector")
     print(f"open_positions={args.open_positions_file} | output={args.output}")
+    last_heartbeat = 0.0
     while True:
         collected = collector.collect_once()
-        if collected:
-            print(f"swaps_coletados={collected}")
+        now = time.monotonic()
+        if collected or now - last_heartbeat >= 60:
+            stats = collector.last_stats
+            print(
+                f"heartbeat | active_pools={stats['active_pools']} | "
+                f"signatures={stats['signatures']} | transactions={stats['transactions']} | "
+                f"swaps={stats['swaps']}"
+            )
+            last_heartbeat = now
         if args.once:
             break
         time.sleep(max(0.5, args.poll_seconds))
