@@ -82,7 +82,7 @@ def fmt_time(value: Any) -> str:
     parsed = parse_time(value)
     if parsed is None:
         return str(value or "-")
-    return parsed.isoformat(timespec="seconds")
+    return parsed.replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def fmt_price(value: Optional[float]) -> str:
@@ -93,12 +93,6 @@ def fmt_price(value: Optional[float]) -> str:
     if abs(value) < 0.0001:
         return f"{value:.8g}"
     return f"{value:.8f}".rstrip("0").rstrip(".")
-
-
-def fmt_delta_pct(value: Optional[float]) -> str:
-    if value is None:
-        return "-"
-    return f"{value:+.2f}%"
 
 
 def fmt_duration(start: Any, end: Any) -> str:
@@ -120,6 +114,10 @@ def fmt_duration(start: Any, end: Any) -> str:
 
 def fmt_pct(value: Optional[float]) -> str:
     return "-" if value is None else f"{value:.2f}%"
+
+
+def fmt_signed_pct(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:+.2f}%"
 
 
 def short_ca(value: str, full: bool = False) -> str:
@@ -200,6 +198,38 @@ def scanner_price(candidate: Dict[str, Any], watch: Dict[str, Any]) -> Optional[
     )
 
 
+def source_signal_for_token(
+    token: str,
+    signal: Dict[str, Any],
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_open: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    for row in (abb_closed.get(token), abb_open.get(token), abb_last_tick.get(token), signal):
+        if not isinstance(row, dict):
+            continue
+        source = row.get("source_signal")
+        if isinstance(source, dict):
+            return source
+        if row:
+            return row
+    return {}
+
+
+def implied_usd_price(native_price: Optional[float], source_signal: Dict[str, Any]) -> Optional[float]:
+    if native_price is None:
+        return None
+    signal_usd = safe_float(source_signal.get("entry_price_usd") or source_signal.get("price_usd"))
+    signal_native = safe_float(source_signal.get("entry_price_native") or source_signal.get("price_native"))
+    if signal_usd is None or signal_native is None or signal_native <= 0:
+        snapshot = source_signal.get("snapshot") if isinstance(source_signal.get("snapshot"), dict) else {}
+        signal_usd = safe_float(snapshot.get("price_usd"))
+        signal_native = safe_float(snapshot.get("price_native"))
+    if signal_usd is None or signal_native is None or signal_native <= 0:
+        return None
+    return native_price * (signal_usd / signal_native)
+
+
 def first_monitor_ticks_by_token(history_dir: Path) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
     if not history_dir.exists():
@@ -266,6 +296,40 @@ def abb_exit_price_for_token(
         return safe_float(closed.get("exit_price_onchain"))
     tick = abb_last_tick.get(token)
     return safe_float((tick or {}).get("price_onchain"))
+
+
+def abb_max_pnl_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_open: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> Optional[float]:
+    closed = abb_closed.get(token)
+    if closed is not None:
+        return safe_float(closed.get("max_profit_pct"))
+    tick = abb_last_tick.get(token)
+    if tick is not None:
+        return safe_float(tick.get("max_profit_pct"))
+    open_position = abb_open.get(token)
+    if open_position is None:
+        return None
+    entry = safe_float(open_position.get("entry_price_onchain"))
+    high = safe_float(open_position.get("highest_price_onchain"))
+    if entry is None or high is None or entry <= 0:
+        return None
+    return ((high / entry) - 1) * 100
+
+
+def abb_exit_pnl_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> Optional[float]:
+    closed = abb_closed.get(token)
+    if closed is not None:
+        return safe_float(closed.get("pnl_pct"))
+    tick = abb_last_tick.get(token)
+    return safe_float((tick or {}).get("pnl_onchain"))
 
 
 def abb_entry_time_for_token(
@@ -339,7 +403,11 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
             or abb_tick.get("timestamp")
         )
         abb_entry_at = abb_entry_time_for_token(token, abb_closed, abb_open, abb_last_tick)
-        abb_entry_price = abb_entry_price_for_token(token, abb_closed, abb_open, abb_last_tick)
+        abb_source_signal = source_signal_for_token(token, signal, abb_closed, abb_open, abb_last_tick)
+        abb_entry_price_native = abb_entry_price_for_token(token, abb_closed, abb_open, abb_last_tick)
+        abb_exit_price_native = abb_exit_price_for_token(token, abb_closed, abb_last_tick)
+        abb_max_pnl = abb_max_pnl_for_token(token, abb_closed, abb_open, abb_last_tick)
+        abb_exit_pnl = abb_exit_pnl_for_token(token, abb_closed, abb_last_tick)
         rows.append(
             {
                 "symbol": source.get("symbol") or token[:8],
@@ -350,9 +418,11 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "monitor_start_price": safe_float(monitor_first.get("price_usd")),
                 "signal_at": signal_time,
                 "abb_entry_at": abb_entry_at,
-                "abb_entry_price": abb_entry_price,
+                "abb_entry_price": implied_usd_price(abb_entry_price_native, abb_source_signal),
                 "abb_exit_at": abb_exit_time_for_token(token, abb_closed),
-                "abb_exit_price": abb_exit_price_for_token(token, abb_closed, abb_last_tick),
+                "abb_exit_price": implied_usd_price(abb_exit_price_native, abb_source_signal),
+                "max_pnl_abb": abb_max_pnl,
+                "giveback_pct": (abb_max_pnl - abb_exit_pnl) if abb_max_pnl is not None and abb_exit_pnl is not None else None,
                 "entry_reason": signal.get("entry_reason") or real.get("source_signal", {}).get("entry_reason") or "-",
                 "pnl_ds": safe_float(real.get("pnl_pct")),
                 "pnl_hybrid": hybrid_pnl_for_trade(real) if real else None,
@@ -373,7 +443,6 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
         "Preco inicio",
         "Data entrada ABB",
         "Preco entrada ABB",
-        "Delta ate ABB",
         "Tempo ate ABB",
         "Data saida ABB",
         "Preco saida ABB",
@@ -381,17 +450,12 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
         "Pnl DS",
         "Pnl Hibrido",
         "Pnl Position ABB",
+        "Max PnL ABB",
+        "Giveback ABB",
         "CA",
     ]
     table = []
     for row in rows:
-        signal_price = row.get("abb_entry_price")
-        monitor_price = row.get("monitor_start_price")
-        delta_signal = (
-            ((signal_price / monitor_price) - 1) * 100
-            if signal_price is not None and monitor_price is not None and monitor_price > 0
-            else None
-        )
         table.append(
             [
                 f"{row['symbol']}/{row['quote']}",
@@ -400,7 +464,6 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
                 fmt_price(row.get("monitor_start_price") or row.get("scanner_price")),
                 fmt_time(row.get("abb_entry_at")),
                 fmt_price(row.get("abb_entry_price")),
-                fmt_delta_pct(delta_signal),
                 fmt_duration(row.get("monitor_start_at") or row.get("detected_at"), row.get("abb_entry_at")),
                 fmt_time(row.get("abb_exit_at")),
                 fmt_price(row.get("abb_exit_price")),
@@ -408,6 +471,8 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
                 fmt_pct(row.get("pnl_ds")),
                 fmt_pct(row.get("pnl_hybrid")),
                 str(row.get("pnl_abb") or "-"),
+                fmt_signed_pct(row.get("max_pnl_abb")),
+                fmt_pct(row.get("giveback_pct")),
                 short_ca(str(row.get("ca") or ""), full=full_ca),
             ]
         )
@@ -441,6 +506,8 @@ def main() -> None:
 
     rows = build_rows(args)
     print("# Visao Position ABB")
+    print("precos=USD (ABB convertido de native via cotacao Dex do sinal quando disponivel)")
+    print("horario=America/Sao_Paulo")
     print(f"linhas={len(rows)}")
     print_table(rows, full_ca=args.full_ca)
 
