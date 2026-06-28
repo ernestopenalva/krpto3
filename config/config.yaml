@@ -59,7 +59,7 @@ token_monitor_buy:
 
   momentum_entry:
     enabled: true
-    min_momentum_pct: 15.0
+    min_momentum_pct: 4.0
     max_pullback_from_peak_pct: 3.0
     min_liquidity_growth_pct: 0.0
     max_liquidity_drop_pct: 5.0
