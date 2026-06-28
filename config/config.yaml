@@ -160,9 +160,19 @@ abb_position:
   persist_seconds: 3
   arm_persist_seconds: 0
 
+  adaptive_breathing_band:
+    enabled: true
+    candle_seconds: 3
+    lookback_candles: 5
+    band_fraction: 0.5
+    band_min_pct: 2.0
+    band_max_pct: 8.0
+    trailing_persist_seconds: 3
+    initial_breathing_pct:
+
   abb_window_seconds: 120
   abb_multiplier: 0.5
-  abb_min_pct: 1.0
+  abb_min_pct: 2.0
   abb_max_pct: 8.0
   abb_fallback: reserve_ratio
 

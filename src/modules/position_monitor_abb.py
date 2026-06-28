@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import yaml
@@ -65,6 +66,14 @@ class AbbRuntimeConfig:
     abb_min_pct: float
     abb_max_pct: float
     abb_fallback: str
+    breathing_enabled: bool
+    breathing_candle_seconds: int
+    breathing_lookback_candles: int
+    breathing_band_fraction: float
+    breathing_band_min_pct: float
+    breathing_band_max_pct: float
+    trailing_persist_seconds: int
+    initial_breathing_pct: Optional[float]
 
 
 @dataclass
@@ -89,6 +98,7 @@ class AbbPosition:
     breakeven_activated: bool = False
     condition_started_at: Optional[str] = None
     condition_reason: Optional[str] = None
+    trailing_condition_started_at: Optional[str] = None
     arm_condition_started_at: Optional[str] = None
     recent_prices: List[Tuple[str, float]] = field(default_factory=list)
     reserve_quote_entry: Optional[float] = None
@@ -156,7 +166,10 @@ class AbbPositionMonitor:
 
     def _load_abb_config(self) -> AbbRuntimeConfig:
         raw = self.config.get("abb_position") or {}
+        breathing = raw.get("adaptive_breathing_band") or {}
         position_input = self.position_cfg.get("input_file", "data/token_monitor/buy_signals.json")
+        band_min_pct = float(breathing.get("band_min_pct", raw.get("abb_min_pct", 2.0)))
+        band_max_pct = float(breathing.get("band_max_pct", raw.get("abb_max_pct", 8.0)))
         return AbbRuntimeConfig(
             enabled=bool(raw.get("enabled", False)),
             output_dir=str(raw.get("output_dir", "data/position_monitor_abb")),
@@ -174,9 +187,17 @@ class AbbPositionMonitor:
             arm_persist_seconds=int(raw.get("arm_persist_seconds", 0)),
             abb_window_seconds=int(raw.get("abb_window_seconds", 120)),
             abb_multiplier=float(raw.get("abb_multiplier", 0.5)),
-            abb_min_pct=float(raw.get("abb_min_pct", 1.0)),
-            abb_max_pct=float(raw.get("abb_max_pct", 8.0)),
+            abb_min_pct=band_min_pct,
+            abb_max_pct=band_max_pct,
             abb_fallback=str(raw.get("abb_fallback", "reserve_ratio")),
+            breathing_enabled=bool(breathing.get("enabled", True)),
+            breathing_candle_seconds=max(1, int(breathing.get("candle_seconds", 3))),
+            breathing_lookback_candles=max(1, int(breathing.get("lookback_candles", 5))),
+            breathing_band_fraction=float(breathing.get("band_fraction", 0.5)),
+            breathing_band_min_pct=band_min_pct,
+            breathing_band_max_pct=band_max_pct,
+            trailing_persist_seconds=int(breathing.get("trailing_persist_seconds", raw.get("persist_seconds", 3))),
+            initial_breathing_pct=self._optional_float(breathing.get("initial_breathing_pct")),
         )
 
     def _build_provider(self) -> Optional[OnChainPumpSwapProvider]:
@@ -206,6 +227,10 @@ class AbbPositionMonitor:
         if math.isnan(result) or math.isinf(result):
             return None
         return result
+
+    @classmethod
+    def _optional_float(cls, value: Any) -> Optional[float]:
+        return cls._safe_float(value)
 
     @staticmethod
     def _parse_time(value: Any) -> Optional[datetime]:
@@ -410,7 +435,24 @@ class AbbPositionMonitor:
             last_tick=tick,
         )
         self._replace_open_position(token_address, position)
-        self._write_tick(position, tick, band_pct=None, band_source="entry", exit_reason=None)
+        entry_down_band_pct = self._clip_down_band_pct(
+            (self.cfg.initial_breathing_pct * self.cfg.breathing_band_fraction)
+            if self.cfg.initial_breathing_pct is not None
+            else self.cfg.breathing_band_min_pct
+        )
+        self._write_tick(
+            position,
+            tick,
+            band_info={
+                "breathing_pct": self.cfg.initial_breathing_pct,
+                "down_band_pct": entry_down_band_pct,
+                "breathing_method": "entry",
+                "candle_seconds": self.cfg.breathing_candle_seconds,
+                "lookback_candles": self.cfg.breathing_lookback_candles,
+                "closed_candles": 0,
+            },
+            exit_reason=None,
+        )
         self._log(
             f"[{LOG_ABB_BUY}] {position.symbol} | entry_onchain={entry_price} | "
             f"entry_div={entry_div if entry_div is not None else 'n/a'}%"
@@ -419,41 +461,77 @@ class AbbPositionMonitor:
 
     def _trim_recent_prices(self, position: AbbPosition, now: datetime) -> Deque[Tuple[datetime, float]]:
         recent: Deque[Tuple[datetime, float]] = deque()
-        cutoff = now - timedelta(seconds=self.cfg.abb_window_seconds)
+        keep_seconds = self.cfg.breathing_candle_seconds * (self.cfg.breathing_lookback_candles + 2)
+        cutoff = now - timedelta(seconds=max(keep_seconds, self.cfg.breathing_candle_seconds))
         for timestamp, price in position.recent_prices:
             parsed = self._parse_time(timestamp)
             if parsed is not None and parsed >= cutoff and price > 0:
                 recent.append((parsed, price))
         return recent
 
-    def _fallback_band(self, reserve_quote: Optional[float], reserve_entry: Optional[float]) -> Tuple[float, str]:
-        if (
-            self.cfg.abb_fallback == "reserve_ratio"
-            and reserve_quote is not None
-            and reserve_quote > 0
-            and reserve_entry is not None
-            and reserve_entry > 0
-        ):
-            variation = abs(reserve_quote - reserve_entry) / reserve_entry
-            return self._clip_band(variation * 2.0), "reserve_fallback"
-        return self.cfg.abb_min_pct / 100.0, "min_fallback"
+    def _clip_down_band_pct(self, value: float) -> float:
+        return max(self.cfg.breathing_band_min_pct, min(self.cfg.breathing_band_max_pct, value))
 
-    def _clip_band(self, value: float) -> float:
-        return max(self.cfg.abb_min_pct / 100.0, min(self.cfg.abb_max_pct / 100.0, value))
-
-    def _compute_band(self, position: AbbPosition, tick_time: datetime, price: float, reserve_quote: Optional[float]) -> Tuple[float, str, int]:
+    def _compute_band(self, position: AbbPosition, tick_time: datetime, price: float) -> Dict[str, Any]:
         recent = self._trim_recent_prices(position, tick_time)
         recent.append((tick_time, price))
-        valid_prices = [item_price for _time, item_price in recent if item_price > 0]
         position.recent_prices = [(item_time.isoformat(timespec="seconds"), item_price) for item_time, item_price in recent]
 
-        if len(valid_prices) >= 5:
-            reference = valid_prices[0]
-            if reference > 0:
-                range_pct = (max(valid_prices) - min(valid_prices)) / reference
-                return self._clip_band(self.cfg.abb_multiplier * range_pct), "price_range", len(valid_prices)
-        band, source = self._fallback_band(reserve_quote, position.reserve_quote_entry)
-        return band, source, len(valid_prices)
+        fallback_breathing = self.cfg.initial_breathing_pct
+        fallback_down_band = self._clip_down_band_pct(
+            (fallback_breathing * self.cfg.breathing_band_fraction)
+            if fallback_breathing is not None
+            else self.cfg.breathing_band_min_pct
+        )
+        result: Dict[str, Any] = {
+            "breathing_pct": fallback_breathing,
+            "down_band_pct": fallback_down_band,
+            "breathing_method": "initial_breathing" if fallback_breathing is not None else "fallback_min",
+            "candle_seconds": self.cfg.breathing_candle_seconds,
+            "lookback_candles": self.cfg.breathing_lookback_candles,
+            "samples": len(recent),
+            "closed_candles": 0,
+        }
+        if not self.cfg.breathing_enabled:
+            result["down_band_pct"] = 0.0
+            result["breathing_method"] = "disabled"
+            return result
+
+        candle_seconds = self.cfg.breathing_candle_seconds
+        current_bucket = int(tick_time.timestamp() // candle_seconds)
+        buckets: Dict[int, List[float]] = {}
+        for item_time, item_price in recent:
+            if item_price <= 0:
+                continue
+            bucket = int(item_time.timestamp() // candle_seconds)
+            if bucket >= current_bucket:
+                continue
+            buckets.setdefault(bucket, []).append(item_price)
+
+        selected = [buckets[key] for key in sorted(buckets)[-self.cfg.breathing_lookback_candles :]]
+        result["closed_candles"] = len(selected)
+        if len(selected) < self.cfg.breathing_lookback_candles:
+            return result
+
+        ranges_pct = []
+        for candle_prices in selected:
+            low = min(candle_prices)
+            high = max(candle_prices)
+            if low > 0:
+                ranges_pct.append(((high - low) / low) * 100)
+        if len(ranges_pct) < self.cfg.breathing_lookback_candles:
+            return result
+
+        breathing_pct = median(ranges_pct)
+        down_band_pct = self._clip_down_band_pct(breathing_pct * self.cfg.breathing_band_fraction)
+        result.update(
+            {
+                "breathing_pct": breathing_pct,
+                "down_band_pct": down_band_pct,
+                "breathing_method": "median_candle_range",
+            }
+        )
+        return result
 
     def _profit_lock_steps(self) -> List[Dict[str, float]]:
         if not self.cfg.profit_lock_enabled:
@@ -505,47 +583,82 @@ class AbbPositionMonitor:
         if max_pnl >= self.cfg.trailing_gap_pct:
             position.trailing_stop_price = position.highest_price_onchain * (1 - self.cfg.trailing_gap_pct / 100)
 
-    def _evaluate_exit(self, position: AbbPosition, price: float, band: float, now: str) -> Tuple[Optional[str], float, float]:
+    def _evaluate_exit(self, position: AbbPosition, price: float, band_info: Dict[str, Any], now: str) -> Tuple[Optional[str], float, float, Dict[str, Any]]:
         pnl_pct = ((price / position.entry_price_onchain) - 1) * 100
         max_pnl = ((position.highest_price_onchain / position.entry_price_onchain) - 1) * 100
+        diagnostics: Dict[str, Any] = {
+            "trailing_level": position.trailing_stop_price,
+            "trailing_exit_threshold": None,
+            "trailing_level_violated": False,
+            "trailing_threshold_violated": False,
+            "trailing_persist_started_at": position.trailing_condition_started_at,
+            "trailing_persist_elapsed": None,
+            "stop_loss_sovereign_triggered": False,
+            "breakeven_sovereign_triggered": False,
+            "abb_applied_to_reason": None,
+        }
 
-        if pnl_pct <= -self.cfg.hard_instant_threshold_pct:
-            return "STOP_LOSS", pnl_pct, max_pnl
-
-        protection_level = position.stop_price
-        reason = "BREAKEVEN_STOP" if position.breakeven_activated else "STOP_LOSS"
-        if position.trailing_stop_price is not None and position.trailing_stop_price > protection_level:
-            protection_level = position.trailing_stop_price
-            reason = "TRAILING_STOP"
-
-        below_level = price <= protection_level
-        outside_band = price <= protection_level * (1 - band)
-        if not below_level or not outside_band:
+        if pnl_pct <= -self.cfg.stop_loss_pct:
             position.condition_started_at = None
             position.condition_reason = None
-            return None, pnl_pct, max_pnl
+            position.trailing_condition_started_at = None
+            diagnostics["stop_loss_sovereign_triggered"] = True
+            return "STOP_LOSS", pnl_pct, max_pnl, diagnostics
 
-        required = self.cfg.persist_stop_seconds if reason == "STOP_LOSS" else self.cfg.persist_seconds
-        if position.condition_reason != reason:
-            position.condition_reason = reason
-            position.condition_started_at = now
+        if position.breakeven_activated and price <= position.stop_price:
+            position.condition_started_at = None
+            position.condition_reason = None
+            position.trailing_condition_started_at = None
+            diagnostics["breakeven_sovereign_triggered"] = True
+            return "BREAKEVEN_STOP", pnl_pct, max_pnl, diagnostics
 
-        started = self._parse_time(position.condition_started_at)
+        trailing_level = position.trailing_stop_price
+        if trailing_level is None:
+            position.trailing_condition_started_at = None
+            return None, pnl_pct, max_pnl, diagnostics
+
+        down_band_pct = float(band_info.get("down_band_pct") or 0.0)
+        threshold = trailing_level * (1 - down_band_pct / 100)
+        diagnostics.update(
+            {
+                "trailing_level": trailing_level,
+                "trailing_exit_threshold": threshold,
+                "trailing_level_violated": price <= trailing_level,
+                "trailing_threshold_violated": price <= threshold,
+                "abb_applied_to_reason": "TRAILING_STOP",
+            }
+        )
+
+        if price > threshold:
+            position.trailing_condition_started_at = None
+            diagnostics["trailing_persist_started_at"] = None
+            return None, pnl_pct, max_pnl, diagnostics
+
+        if position.trailing_condition_started_at is None:
+            position.trailing_condition_started_at = now
+
+        diagnostics["trailing_persist_started_at"] = position.trailing_condition_started_at
+        required = self.cfg.trailing_persist_seconds
+        started = self._parse_time(position.trailing_condition_started_at)
         current = self._parse_time(now)
-        if required <= 0 or (started is not None and current is not None and (current - started).total_seconds() >= required):
-            return reason, pnl_pct, max_pnl
-        return None, pnl_pct, max_pnl
+        elapsed = (current - started).total_seconds() if started is not None and current is not None else None
+        diagnostics["trailing_persist_elapsed"] = elapsed
+        if required <= 0 or (elapsed is not None and elapsed >= required):
+            return "TRAILING_STOP", pnl_pct, max_pnl, diagnostics
+        return None, pnl_pct, max_pnl, diagnostics
 
     def _write_tick(
         self,
         position: AbbPosition,
         tick: Dict[str, Any],
-        band_pct: Optional[float],
-        band_source: Optional[str],
+        band_info: Optional[Dict[str, Any]],
         exit_reason: Optional[str],
+        exit_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> None:
         price = self._safe_float(tick.get("onchain_price_native"))
         pnl_pct = ((price / position.entry_price_onchain) - 1) * 100 if price and position.entry_price_onchain > 0 else None
+        band_info = band_info or {}
+        exit_diagnostics = exit_diagnostics or {}
         payload = {
             "timestamp": tick.get("timestamp") or self._now_iso(),
             "mode": "abb_position_experimental",
@@ -569,8 +682,24 @@ class AbbPositionMonitor:
             "stop_price": position.stop_price,
             "trailing_stop_price": position.trailing_stop_price,
             "breakeven_activated": position.breakeven_activated,
-            "band_pct": band_pct,
-            "band_formula_used": band_source,
+            "band_pct": band_info.get("down_band_pct"),
+            "band_formula_used": band_info.get("breathing_method"),
+            "breathing_pct": band_info.get("breathing_pct"),
+            "down_band_pct": band_info.get("down_band_pct"),
+            "breathing_method": band_info.get("breathing_method"),
+            "candle_seconds": band_info.get("candle_seconds"),
+            "lookback_candles": band_info.get("lookback_candles"),
+            "closed_candles": band_info.get("closed_candles"),
+            "trailing_level": exit_diagnostics.get("trailing_level", position.trailing_stop_price),
+            "trailing_exit_threshold": exit_diagnostics.get("trailing_exit_threshold"),
+            "trailing_level_violated": exit_diagnostics.get("trailing_level_violated", False),
+            "trailing_threshold_violated": exit_diagnostics.get("trailing_threshold_violated", False),
+            "trailing_persist_started_at": exit_diagnostics.get("trailing_persist_started_at"),
+            "trailing_persist_elapsed": exit_diagnostics.get("trailing_persist_elapsed"),
+            "stop_loss_sovereign_triggered": exit_diagnostics.get("stop_loss_sovereign_triggered", False),
+            "breakeven_sovereign_triggered": exit_diagnostics.get("breakeven_sovereign_triggered", False),
+            "abb_applied_to_reason": exit_diagnostics.get("abb_applied_to_reason"),
+            "initial_breathing_pct": self.cfg.initial_breathing_pct,
             "exit_reason": exit_reason,
             "onchain_base_reserve": tick.get("onchain_base_reserve"),
             "onchain_quote_reserve": tick.get("onchain_quote_reserve"),
@@ -602,13 +731,12 @@ class AbbPositionMonitor:
 
         now = tick.get("timestamp") or self._now_iso()
         tick_time = self._parse_time(now) or datetime.now().astimezone()
-        reserve_quote = self._safe_float(tick.get("onchain_quote_reserve"))
-        band, band_source, samples = self._compute_band(position, tick_time, price, reserve_quote)
+        band_info = self._compute_band(position, tick_time, price)
         position.ticks += 1
         self._update_protection(position, price, now)
-        exit_reason, pnl_pct, max_pnl = self._evaluate_exit(position, price, band, now)
+        exit_reason, pnl_pct, max_pnl, exit_diagnostics = self._evaluate_exit(position, price, band_info, now)
         position.last_tick = tick
-        self._write_tick(position, tick, band_pct=band * 100, band_source=band_source, exit_reason=exit_reason)
+        self._write_tick(position, tick, band_info=band_info, exit_reason=exit_reason, exit_diagnostics=exit_diagnostics)
 
         if exit_reason:
             trade = AbbClosedTrade(
@@ -642,7 +770,8 @@ class AbbPositionMonitor:
             self._replace_open_position(token_address, None)
             self._log(
                 f"[{LOG_ABB_SELL}] {position.symbol} | reason={exit_reason} | "
-                f"pnl={pnl_pct:.2f}% | band={band * 100:.2f}% | source={band_source}",
+                f"pnl={pnl_pct:.2f}% | down_band={band_info.get('down_band_pct'):.2f}% | "
+                f"source={band_info.get('breathing_method')}",
                 timestamp=now,
             )
             return False
@@ -651,8 +780,9 @@ class AbbPositionMonitor:
         self._log(
             f"[{LOG_ABB_MONITOR}] {position.symbol} | price_onchain={price} | pnl={pnl_pct:.2f}% | "
             f"topo={position.highest_price_onchain} | stop={position.stop_price} | "
-            f"trailing={position.trailing_stop_price} | band={band * 100:.2f}% | "
-            f"source={band_source} | samples={samples}",
+            f"trailing={position.trailing_stop_price} | down_band={band_info.get('down_band_pct'):.2f}% | "
+            f"source={band_info.get('breathing_method')} | closed_candles={band_info.get('closed_candles')} | "
+            f"threshold={exit_diagnostics.get('trailing_exit_threshold')}",
             timestamp=now,
         )
         return True
