@@ -63,7 +63,11 @@ SHADOW_MONITOR_ENABLED = SHADOW_CFG.get("enabled", CFG.get("shadow_monitor_enabl
 RATE_LIMIT_BACKOFF_SECONDS = CFG.get("backoff_on_rate_limit_seconds", 10)
 
 DECISION_WINDOW_MINUTES = CFG.get("decision_window_minutes", 5)
-MIN_TICKS_BEFORE_DECISION = CFG.get("min_ticks_before_decision", 4)
+MIN_TICKS_BEFORE_DECISION = int(CFG.get("min_ticks_before_decision", 4))
+PULLBACK_MIN_TICKS_BEFORE_DECISION = max(2, int(ENTRY_CFG.get(
+    "min_ticks_before_decision",
+    MIN_TICKS_BEFORE_DECISION,
+)))
 
 MIN_PULLBACK_PCT = ENTRY_CFG.get("min_pullback_pct", 2.0)
 MAX_PULLBACK_PCT = ENTRY_CFG.get("max_pullback_pct", 6.0)
@@ -80,6 +84,10 @@ HEALTH_RECENT_TICKS = ENTRY_CFG.get("health_recent_ticks", 6)
 PULLBACK_RECENT_TICKS = ENTRY_CFG.get("pullback_recent_ticks", 24)
 
 MOMENTUM_ENTRY_ENABLED = MOMENTUM_CFG.get("enabled", False)
+MOMENTUM_MIN_TICKS_BEFORE_DECISION = max(2, int(MOMENTUM_CFG.get(
+    "min_ticks_before_decision",
+    MIN_TICKS_BEFORE_DECISION,
+)))
 MOMENTUM_MIN_MOMENTUM_PCT = MOMENTUM_CFG.get("min_momentum_pct", 15.0)
 MOMENTUM_MAX_PULLBACK_FROM_PEAK_PCT = MOMENTUM_CFG.get("max_pullback_from_peak_pct", 3.0)
 MOMENTUM_MIN_LIQUIDITY_GROWTH_PCT = MOMENTUM_CFG.get("min_liquidity_growth_pct", 0.0)
@@ -517,10 +525,14 @@ def get_recent_ticks(history: List[Dict[str, Any]], max_minutes: int) -> List[Di
     max_ticks = int((max_minutes * 60) / POLL_INTERVAL_SECONDS)
     return history[-max_ticks:]
 
-def compute_token_health_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_token_health_score(
+    history: List[Dict[str, Any]],
+    min_ticks_before_decision: Optional[int] = None,
+) -> Dict[str, Any]:
     window = get_recent_ticks(history, DECISION_WINDOW_MINUTES)
+    required_ticks = int(min_ticks_before_decision or MIN_TICKS_BEFORE_DECISION)
 
-    if len(window) < MIN_TICKS_BEFORE_DECISION:
+    if len(window) < required_ticks:
         return {
             "score": 0.0,
             "alive": True,
@@ -665,11 +677,11 @@ def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, A
     if not MOMENTUM_ENTRY_ENABLED:
         return {"entry": False, "reason": "momentum_continuation desabilitado"}
 
-    if len(history) < MIN_TICKS_BEFORE_DECISION:
+    if len(history) < MOMENTUM_MIN_TICKS_BEFORE_DECISION:
         return {"entry": False, "reason": "histórico insuficiente para momentum_continuation"}
 
     prices = [tick["price_usd"] for tick in history if tick.get("price_usd", 0) > 0]
-    if len(prices) < MIN_TICKS_BEFORE_DECISION:
+    if len(prices) < MOMENTUM_MIN_TICKS_BEFORE_DECISION:
         return {"entry": False, "reason": "preços insuficientes para momentum_continuation"}
 
     current = history[-1]
@@ -694,7 +706,7 @@ def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, A
         ((peak_liquidity - current_liquidity) / peak_liquidity) * 100
     )
 
-    health = compute_token_health_score(history)
+    health = compute_token_health_score(history, MOMENTUM_MIN_TICKS_BEFORE_DECISION)
     buy_pressure = current.get("buy_pressure", 0.0)
 
     window_ticks = max(1, int(MOMENTUM_PRICE_FALLING_WINDOW_TICKS))
@@ -740,7 +752,10 @@ def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, A
 
 
 def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < MIN_TICKS_BEFORE_DECISION:
+    if len(history) < PULLBACK_MIN_TICKS_BEFORE_DECISION:
+        momentum = evaluate_momentum_continuation(history)
+        if momentum.get("entry"):
+            return momentum
         return {
             "entry": False,
             "reason": "histórico insuficiente"
@@ -751,7 +766,10 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     prices = [tick["price_usd"] for tick in window if tick["price_usd"] > 0]
     volumes = [tick["volume_m5"] for tick in window if tick["volume_m5"] > 0]
 
-    if len(prices) < MIN_TICKS_BEFORE_DECISION:
+    if len(prices) < PULLBACK_MIN_TICKS_BEFORE_DECISION:
+        momentum = evaluate_momentum_continuation(history)
+        if momentum.get("entry"):
+            return momentum
         return {
             "entry": False,
             "reason": "preços insuficientes"
