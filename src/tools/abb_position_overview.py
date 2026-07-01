@@ -276,6 +276,21 @@ def abb_pnl_for_token(
     return "-"
 
 
+def abb_status_for_token(
+    token: str,
+    abb_closed: Dict[str, Dict[str, Any]],
+    abb_open: Dict[str, Dict[str, Any]],
+    abb_last_tick: Dict[str, Dict[str, Any]],
+) -> str:
+    if abb_closed.get(token) is not None:
+        return "CLOSED"
+    if abb_open.get(token) is not None:
+        return "OPEN"
+    if abb_last_tick.get(token) is not None:
+        return "TICK"
+    return "-"
+
+
 def abb_exit_reason_for_token(token: str, abb_closed: Dict[str, Dict[str, Any]]) -> Optional[str]:
     closed = abb_closed.get(token)
     if closed is None:
@@ -437,6 +452,7 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "pnl_hybrid": hybrid_pnl_for_trade(real) if real else None,
                 "pnl_abb_pct": abb_exit_pnl,
                 "abb_exit_reason": abb_exit_reason,
+                "abb_status": abb_status_for_token(token, abb_closed, abb_open, abb_last_tick),
                 "pnl_abb": abb_pnl_for_token(token, abb_closed, abb_open, abb_last_tick),
                 "ca": token,
             }
@@ -469,6 +485,7 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
         "Pnl DS",
         "Pnl Hibrido",
         "Pnl Position ABB",
+        "Razao Saida ABB",
         "Max PnL ABB",
         "Giveback ABB",
         "CA",
@@ -489,7 +506,8 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
                 str(row.get("entry_reason") or "-"),
                 fmt_pct(row.get("pnl_ds")),
                 fmt_pct(row.get("pnl_hybrid")),
-                str(row.get("pnl_abb") or "-"),
+                fmt_pct(row.get("pnl_abb_pct")),
+                str(row.get("abb_exit_reason") or row.get("abb_status") or "-"),
                 fmt_signed_pct(row.get("max_pnl_abb")),
                 fmt_pct(row.get("giveback_pct")),
                 short_ca(str(row.get("ca") or ""), full=full_ca),
