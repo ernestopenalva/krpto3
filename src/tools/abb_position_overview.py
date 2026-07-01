@@ -276,6 +276,14 @@ def abb_pnl_for_token(
     return "-"
 
 
+def abb_exit_reason_for_token(token: str, abb_closed: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    closed = abb_closed.get(token)
+    if closed is None:
+        return None
+    reason = closed.get("exit_reason")
+    return str(reason) if reason else None
+
+
 def abb_exit_time_for_token(
     token: str,
     abb_closed: Dict[str, Dict[str, Any]],
@@ -408,6 +416,7 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
         abb_exit_price_native = abb_exit_price_for_token(token, abb_closed, abb_last_tick)
         abb_max_pnl = abb_max_pnl_for_token(token, abb_closed, abb_open, abb_last_tick)
         abb_exit_pnl = abb_exit_pnl_for_token(token, abb_closed, abb_last_tick)
+        abb_exit_reason = abb_exit_reason_for_token(token, abb_closed)
         rows.append(
             {
                 "symbol": source.get("symbol") or token[:8],
@@ -426,12 +435,22 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 "entry_reason": signal.get("entry_reason") or real.get("source_signal", {}).get("entry_reason") or "-",
                 "pnl_ds": safe_float(real.get("pnl_pct")),
                 "pnl_hybrid": hybrid_pnl_for_trade(real) if real else None,
+                "pnl_abb_pct": abb_exit_pnl,
+                "abb_exit_reason": abb_exit_reason,
                 "pnl_abb": abb_pnl_for_token(token, abb_closed, abb_open, abb_last_tick),
                 "ca": token,
             }
         )
 
-    rows.sort(key=lambda item: parse_time(item.get("signal_at")) or datetime.min, reverse=not args.asc)
+    rows.sort(
+        key=lambda item: parse_time(item.get("signal_at")) or datetime.min.replace(tzinfo=BRASILIA),
+        reverse=not args.asc,
+    )
+    if args.min_max_pnl_abb is not None:
+        rows = [
+            row for row in rows
+            if row.get("max_pnl_abb") is not None and row["max_pnl_abb"] >= args.min_max_pnl_abb
+        ]
     return rows[: args.limit] if args.limit > 0 else rows
 
 
@@ -488,6 +507,31 @@ def print_table(rows: List[Dict[str, Any]], full_ca: bool = False) -> None:
         print(" | ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
 
 
+def print_winner_study(rows: List[Dict[str, Any]]) -> None:
+    headers = ["Token", "Max PnL", "PnL final", "Giveback", "Razao saida"]
+    table = []
+    for row in rows:
+        table.append(
+            [
+                f"{row['symbol']}/{row['quote']}",
+                fmt_signed_pct(row.get("max_pnl_abb")),
+                fmt_signed_pct(row.get("pnl_abb_pct")),
+                fmt_pct(row.get("giveback_pct")),
+                str(row.get("abb_exit_reason") or "-"),
+            ]
+        )
+
+    widths = [len(header) for header in headers]
+    for row in table:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    print(" | ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("-+-".join("-" * width for width in widths))
+    for row in table:
+        print(" | ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visao consolidada Dex/Hibrido/ABB por token.")
     parser.add_argument("--watchlist-file", type=Path, default=DEFAULT_WATCHLIST_FILE)
@@ -502,14 +546,23 @@ def main() -> None:
     parser.add_argument("--asc", action="store_true")
     parser.add_argument("--only-abb", action="store_true")
     parser.add_argument("--full-ca", action="store_true")
+    parser.add_argument("--min-max-pnl-abb", type=float, default=None)
+    parser.add_argument("--winner-study", action="store_true")
     args = parser.parse_args()
+    if args.winner_study and args.min_max_pnl_abb is None:
+        args.min_max_pnl_abb = 5.0
 
     rows = build_rows(args)
     print("# Visao Position ABB")
     print("precos=USD (ABB convertido de native via cotacao Dex do sinal quando disponivel)")
     print("horario=America/Sao_Paulo")
+    if args.winner_study:
+        print(f"filtro=max_pnl_abb>={args.min_max_pnl_abb:g}%")
     print(f"linhas={len(rows)}")
-    print_table(rows, full_ca=args.full_ca)
+    if args.winner_study:
+        print_winner_study(rows)
+    else:
+        print_table(rows, full_ca=args.full_ca)
 
 
 if __name__ == "__main__":
