@@ -526,7 +526,39 @@ def filter_trades(trades: List[Dict[str, Any]], since: Optional[str], until: Opt
     return result
 
 
-def build_events(args: argparse.Namespace) -> tuple[List[TouchEvent], int, int]:
+def event_has_followup(event: TouchEvent) -> bool:
+    return any(
+        value is not None
+        for value in (event.pnl_t3, event.pnl_t5, event.pnl_t10, event.pnl_t30)
+    )
+
+
+def event_is_censored(event: TouchEvent) -> bool:
+    if event_has_followup(event):
+        return False
+    if event.pnl_at_touch is None or event.min_pnl_after is None or event.max_pnl_after is None:
+        return True
+    return (
+        abs(event.pnl_at_touch - event.min_pnl_after) < 1e-9
+        and abs(event.pnl_at_touch - event.max_pnl_after) < 1e-9
+    )
+
+
+def event_quality_score(event: TouchEvent) -> tuple[int, int, int, str]:
+    followup_count = sum(
+        1
+        for value in (event.pnl_t3, event.pnl_t5, event.pnl_t10, event.pnl_t30)
+        if value is not None
+    )
+    return (
+        0 if event_is_censored(event) else 1,
+        1 if event.source == "shadow" else 0,
+        followup_count,
+        event.touch_time,
+    )
+
+
+def build_events(args: argparse.Namespace) -> tuple[List[TouchEvent], int, int, int]:
     trades = load_json(args.closed_trades_file, [])
     if not isinstance(trades, list):
         trades = []
@@ -537,21 +569,25 @@ def build_events(args: argparse.Namespace) -> tuple[List[TouchEvent], int, int]:
     shadow_dir = None if args.no_shadow else args.shadow_history_dir
     events: List[TouchEvent] = []
     excluded_post_be = 0
+    censored_unlabeled = 0
     sources_seen = 0
-    seen_keys: set[tuple[str, str, str]] = set()
     for trade in trades:
+        trade_events: List[TouchEvent] = []
         for rows, source in rows_for_trade(trade, args.abb_history_dir, shadow_dir):
             sources_seen += 1
             event, excluded = analyze_source(trade, rows, source, args.stop_loss_pct)
             excluded_post_be += excluded
             if event is None:
                 continue
-            key = (event.token_address, event.source, event.touch_time)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            events.append(event)
-    return events, excluded_post_be, sources_seen
+            trade_events.append(event)
+        if not trade_events:
+            continue
+        best = max(trade_events, key=event_quality_score)
+        censored_unlabeled += sum(1 for event in trade_events if event_is_censored(event))
+        if event_is_censored(best) and not args.include_censored:
+            continue
+        events.append(best)
+    return events, excluded_post_be, sources_seen, censored_unlabeled
 
 
 def write_csv(path: Path, events: List[TouchEvent]) -> None:
@@ -628,13 +664,20 @@ def print_wick_runners(events: List[TouchEvent]) -> None:
         )
 
 
-def print_summary(events: List[TouchEvent], excluded_post_be: int, sources_seen: int, output_csv: Path) -> None:
+def print_summary(
+    events: List[TouchEvent],
+    excluded_post_be: int,
+    sources_seen: int,
+    censored_unlabeled: int,
+    output_csv: Path,
+) -> None:
     labels = Counter(event.label for event in events)
     late_crashes = sum(1 for event in events if event.label == "CRASH" and event.late_recovery)
     print("# Stop Touch Health Study")
     print(
         f"fontes_analisadas={sources_seen} | toques_elegiveis={len(events)} | "
-        f"touches_excluded_post_be={excluded_post_be} | csv={output_csv}"
+        f"touches_excluded_post_be={excluded_post_be} | "
+        f"touches_censored_unlabeled={censored_unlabeled} | csv={output_csv}"
     )
     print(
         "labels | "
@@ -663,11 +706,16 @@ def main() -> None:
     parser.add_argument("--until", type=str, default=None)
     parser.add_argument("--last", type=int, default=0)
     parser.add_argument("--stop-loss-pct", type=float, default=5.0)
+    parser.add_argument(
+        "--include-censored",
+        action="store_true",
+        help="Inclui linhas sem serie pos-toque observavel; uso apenas para auditoria.",
+    )
     args = parser.parse_args()
 
-    events, excluded_post_be, sources_seen = build_events(args)
+    events, excluded_post_be, sources_seen, censored_unlabeled = build_events(args)
     write_csv(args.output_csv, events)
-    print_summary(events, excluded_post_be, sources_seen, args.output_csv)
+    print_summary(events, excluded_post_be, sources_seen, censored_unlabeled, args.output_csv)
 
 
 if __name__ == "__main__":
