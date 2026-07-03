@@ -172,6 +172,20 @@ abb_position:
     trailing_persist_seconds: 3
     initial_breathing_pct:
 
+  shadow_variants:
+    enabled: true
+    promotion_rule: "50 trades pareados; maior PnL somado se vencer ABB atual, nao matar mais runners, e nenhum trade perder mais que 3pp alem do pior trade do baseline"
+    variants:
+      - name: S1_gap4
+        trailing_gap_pct: 4
+        persist_stop_seconds: 0
+      - name: S2_stop_persist3
+        trailing_gap_pct: 12
+        persist_stop_seconds: 3
+      - name: S3_gap4_stop_persist3
+        trailing_gap_pct: 4
+        persist_stop_seconds: 3
+
   abb_window_seconds: 120
   abb_multiplier: 0.5
   abb_min_pct: 2.0

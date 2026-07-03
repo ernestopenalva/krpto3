@@ -46,6 +46,13 @@ LOG_ABB_PROFIT_LOCK = "ABB PROFIT LOCK"
 
 
 @dataclass(frozen=True)
+class AbbShadowVariantConfig:
+    name: str
+    trailing_gap_pct: float
+    persist_stop_seconds: int
+
+
+@dataclass(frozen=True)
 class AbbRuntimeConfig:
     enabled: bool
     output_dir: str
@@ -74,6 +81,8 @@ class AbbRuntimeConfig:
     breathing_band_max_pct: float
     trailing_persist_seconds: int
     initial_breathing_pct: Optional[float]
+    shadow_variants_enabled: bool
+    shadow_variants: List[AbbShadowVariantConfig]
 
 
 @dataclass
@@ -105,6 +114,13 @@ class AbbPosition:
     ticks: int = 0
     source_signal: Dict[str, Any] = field(default_factory=dict)
     last_tick: Dict[str, Any] = field(default_factory=dict)
+    baseline_closed: bool = False
+    baseline_exit_time: Optional[str] = None
+    baseline_exit_price_onchain: Optional[float] = None
+    baseline_exit_reason: Optional[str] = None
+    baseline_pnl_pct: Optional[float] = None
+    baseline_max_profit_pct: Optional[float] = None
+    shadow_variants: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -151,6 +167,7 @@ class AbbPositionMonitor:
 
         self.open_positions_file = self.output_dir / "open_positions.json"
         self.closed_trades_file = self.output_dir / "closed_trades.json"
+        self.shadow_closed_trades_file = self.output_dir / "shadow_closed_trades.json"
         self.ignored_signals_file = self.output_dir / "ignored_signals.json"
         self.audit_file = self.output_dir / "abb_market_data_audit.jsonl"
 
@@ -167,9 +184,30 @@ class AbbPositionMonitor:
     def _load_abb_config(self) -> AbbRuntimeConfig:
         raw = self.config.get("abb_position") or {}
         breathing = raw.get("adaptive_breathing_band") or {}
+        shadow_raw = raw.get("shadow_variants") or {}
         position_input = self.position_cfg.get("input_file", "data/token_monitor/buy_signals.json")
         band_min_pct = float(breathing.get("band_min_pct", raw.get("abb_min_pct", 2.0)))
         band_max_pct = float(breathing.get("band_max_pct", raw.get("abb_max_pct", 8.0)))
+        default_variants = [
+            {"name": "S1_gap4", "trailing_gap_pct": 4.0, "persist_stop_seconds": 0},
+            {"name": "S2_stop_persist3", "trailing_gap_pct": float(raw.get("trailing_gap_pct", 12.0)), "persist_stop_seconds": 3},
+            {"name": "S3_gap4_stop_persist3", "trailing_gap_pct": 4.0, "persist_stop_seconds": 3},
+        ]
+        variant_items = shadow_raw.get("variants", default_variants) if isinstance(shadow_raw, dict) else default_variants
+        shadow_variants: List[AbbShadowVariantConfig] = []
+        for item in variant_items if isinstance(variant_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            shadow_variants.append(
+                AbbShadowVariantConfig(
+                    name=name,
+                    trailing_gap_pct=float(item.get("trailing_gap_pct", raw.get("trailing_gap_pct", 12.0))),
+                    persist_stop_seconds=int(item.get("persist_stop_seconds", 0)),
+                )
+            )
         return AbbRuntimeConfig(
             enabled=bool(raw.get("enabled", False)),
             output_dir=str(raw.get("output_dir", "data/position_monitor_abb")),
@@ -198,6 +236,8 @@ class AbbPositionMonitor:
             breathing_band_max_pct=band_max_pct,
             trailing_persist_seconds=int(breathing.get("trailing_persist_seconds", raw.get("persist_seconds", 3))),
             initial_breathing_pct=self._optional_float(breathing.get("initial_breathing_pct")),
+            shadow_variants_enabled=bool(shadow_raw.get("enabled", False)) if isinstance(shadow_raw, dict) else False,
+            shadow_variants=shadow_variants,
         )
 
     def _build_provider(self) -> Optional[OnChainPumpSwapProvider]:
@@ -330,6 +370,13 @@ class AbbPositionMonitor:
         trades.append(asdict(trade))
         self._save_json(self.closed_trades_file, trades)
 
+    def _save_shadow_closed_trade(self, trade: Dict[str, Any]) -> None:
+        trades = self._load_json(self.shadow_closed_trades_file, [])
+        if not isinstance(trades, list):
+            trades = []
+        trades.append(trade)
+        self._save_json(self.shadow_closed_trades_file, trades)
+
     def _log_ignored_signal(self, signal: Dict[str, Any], reason: str) -> None:
         ignored = self._load_json(self.ignored_signals_file, [])
         if not isinstance(ignored, list):
@@ -359,6 +406,42 @@ class AbbPositionMonitor:
             base_mint=position.base_mint,
             quote_mint=position.quote_mint,
         )
+
+    def _initial_shadow_variant_state(self, config: AbbShadowVariantConfig, entry_price: float, now: str) -> Dict[str, Any]:
+        return {
+            "name": config.name,
+            "active": True,
+            "entry_time": now,
+            "entry_price_onchain": entry_price,
+            "highest_price_onchain": entry_price,
+            "highest_price_time": now,
+            "stop_price": entry_price * (1 - self.cfg.stop_loss_pct / 100),
+            "trailing_stop_price": None,
+            "breakeven_activated": False,
+            "stop_condition_started_at": None,
+            "trailing_condition_started_at": None,
+            "exit_time": None,
+            "exit_price_onchain": None,
+            "exit_reason": None,
+            "pnl_pct": None,
+            "max_profit_pct": 0.0,
+            "ticks": 0,
+            "trailing_gap_pct": config.trailing_gap_pct,
+            "persist_stop_seconds": config.persist_stop_seconds,
+            "trailing_persist_seconds": self.cfg.trailing_persist_seconds,
+            "promotion_rule": (
+                "50 paired trades; highest pnl_sum if beats baseline, does not kill more runners, "
+                "and no individual trade loses >3pp beyond baseline worst trade"
+            ),
+        }
+
+    def _initial_shadow_variants(self, entry_price: float, now: str) -> Dict[str, Dict[str, Any]]:
+        if not self.cfg.shadow_variants_enabled:
+            return {}
+        return {
+            config.name: self._initial_shadow_variant_state(config, entry_price, now)
+            for config in self.cfg.shadow_variants
+        }
 
     def _fetch_onchain_tick(self, context: MarketContext) -> Optional[Dict[str, Any]]:
         if self.provider is None:
@@ -434,6 +517,7 @@ class AbbPositionMonitor:
             source_signal={**signal, "abb_entry_tick": tick},
             last_tick=tick,
         )
+        position.shadow_variants = self._initial_shadow_variants(entry_price, now)
         self._replace_open_position(token_address, position)
         entry_down_band_pct = self._clip_down_band_pct(
             (self.cfg.initial_breathing_pct * self.cfg.breathing_band_fraction)
@@ -647,6 +731,181 @@ class AbbPositionMonitor:
             return "TRAILING_STOP", pnl_pct, max_pnl, diagnostics
         return None, pnl_pct, max_pnl, diagnostics
 
+    def _update_shadow_protection(self, state: Dict[str, Any], price: float, now: str) -> None:
+        highest = self._safe_float(state.get("highest_price_onchain")) or price
+        if price > highest:
+            highest = price
+            state["highest_price_onchain"] = price
+            state["highest_price_time"] = now
+
+        entry_price = float(state["entry_price_onchain"])
+        pnl_pct = ((price / entry_price) - 1) * 100
+        best_lock_pct: Optional[float] = None
+        for step in self._profit_lock_steps():
+            trigger = float(step["trigger_pct"])
+            lock = float(step["lock_pct"])
+            if pnl_pct >= trigger and (best_lock_pct is None or lock > best_lock_pct):
+                best_lock_pct = lock
+
+        if best_lock_pct is not None:
+            new_stop = entry_price * (1 + best_lock_pct / 100)
+            current_stop = self._safe_float(state.get("stop_price")) or 0.0
+            if new_stop > current_stop:
+                state["stop_price"] = new_stop
+                state["breakeven_activated"] = True
+
+        max_pnl = ((highest / entry_price) - 1) * 100
+        state["max_profit_pct"] = max_pnl
+        trailing_gap_pct = float(state.get("trailing_gap_pct") or self.cfg.trailing_gap_pct)
+        if max_pnl >= trailing_gap_pct:
+            state["trailing_stop_price"] = highest * (1 - trailing_gap_pct / 100)
+
+    def _evaluate_shadow_exit(
+        self,
+        state: Dict[str, Any],
+        price: float,
+        band_info: Dict[str, Any],
+        now: str,
+    ) -> Tuple[Optional[str], float, float, Dict[str, Any]]:
+        entry_price = float(state["entry_price_onchain"])
+        pnl_pct = ((price / entry_price) - 1) * 100
+        max_pnl = float(state.get("max_profit_pct") or 0.0)
+        diagnostics: Dict[str, Any] = {
+            "stop_condition_started_at": state.get("stop_condition_started_at"),
+            "stop_persist_elapsed": None,
+            "trailing_persist_started_at": state.get("trailing_condition_started_at"),
+            "trailing_persist_elapsed": None,
+            "trailing_exit_threshold": None,
+        }
+
+        if pnl_pct <= -self.cfg.stop_loss_pct:
+            required = int(state.get("persist_stop_seconds") or 0)
+            if required <= 0:
+                state["stop_condition_started_at"] = None
+                state["trailing_condition_started_at"] = None
+                return "STOP_LOSS", pnl_pct, max_pnl, diagnostics
+            if state.get("stop_condition_started_at") is None:
+                state["stop_condition_started_at"] = now
+            diagnostics["stop_condition_started_at"] = state.get("stop_condition_started_at")
+            started = self._parse_time(state.get("stop_condition_started_at"))
+            current = self._parse_time(now)
+            elapsed = (current - started).total_seconds() if started is not None and current is not None else None
+            diagnostics["stop_persist_elapsed"] = elapsed
+            if elapsed is not None and elapsed >= required:
+                state["trailing_condition_started_at"] = None
+                return "STOP_LOSS", pnl_pct, max_pnl, diagnostics
+        else:
+            state["stop_condition_started_at"] = None
+
+        stop_price = self._safe_float(state.get("stop_price"))
+        if state.get("breakeven_activated") and stop_price is not None and price <= stop_price:
+            state["stop_condition_started_at"] = None
+            state["trailing_condition_started_at"] = None
+            return "BREAKEVEN_STOP", pnl_pct, max_pnl, diagnostics
+
+        trailing_level = self._safe_float(state.get("trailing_stop_price"))
+        if trailing_level is None:
+            state["trailing_condition_started_at"] = None
+            return None, pnl_pct, max_pnl, diagnostics
+
+        down_band_pct = float(band_info.get("down_band_pct") or 0.0)
+        threshold = trailing_level * (1 - down_band_pct / 100)
+        diagnostics["trailing_exit_threshold"] = threshold
+        if price > threshold:
+            state["trailing_condition_started_at"] = None
+            return None, pnl_pct, max_pnl, diagnostics
+
+        if state.get("trailing_condition_started_at") is None:
+            state["trailing_condition_started_at"] = now
+        diagnostics["trailing_persist_started_at"] = state.get("trailing_condition_started_at")
+        started = self._parse_time(state.get("trailing_condition_started_at"))
+        current = self._parse_time(now)
+        elapsed = (current - started).total_seconds() if started is not None and current is not None else None
+        diagnostics["trailing_persist_elapsed"] = elapsed
+        required = self.cfg.trailing_persist_seconds
+        if required <= 0 or (elapsed is not None and elapsed >= required):
+            return "TRAILING_STOP", pnl_pct, max_pnl, diagnostics
+        return None, pnl_pct, max_pnl, diagnostics
+
+    def _close_shadow_variant(
+        self,
+        position: AbbPosition,
+        name: str,
+        state: Dict[str, Any],
+        price: float,
+        reason: str,
+        pnl_pct: float,
+        max_pnl: float,
+        now: str,
+        tick: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+    ) -> None:
+        state.update(
+            {
+                "active": False,
+                "exit_time": now,
+                "exit_price_onchain": price,
+                "exit_reason": reason,
+                "pnl_pct": pnl_pct,
+                "max_profit_pct": max_pnl,
+                "last_diagnostics": diagnostics,
+            }
+        )
+        self._save_shadow_closed_trade(
+            {
+                "token_address": position.token_address,
+                "chain_id": position.chain_id,
+                "symbol": position.symbol,
+                "variant": name,
+                "entry_time": state.get("entry_time"),
+                "exit_time": now,
+                "entry_price_onchain": state.get("entry_price_onchain"),
+                "exit_price_onchain": price,
+                "pnl_pct": pnl_pct,
+                "max_profit_pct": max_pnl,
+                "exit_reason": reason,
+                "trailing_gap_pct": state.get("trailing_gap_pct"),
+                "persist_stop_seconds": state.get("persist_stop_seconds"),
+                "baseline_exit_time": position.baseline_exit_time,
+                "baseline_exit_reason": position.baseline_exit_reason,
+                "baseline_pnl_pct": position.baseline_pnl_pct,
+                "baseline_max_profit_pct": position.baseline_max_profit_pct,
+                "delta_vs_baseline_pct": (
+                    pnl_pct - position.baseline_pnl_pct
+                    if position.baseline_pnl_pct is not None
+                    else None
+                ),
+                "ticks": state.get("ticks"),
+                "last_tick": tick,
+                "source_signal": position.source_signal,
+            }
+        )
+
+    def _update_shadow_variants(
+        self,
+        position: AbbPosition,
+        price: float,
+        band_info: Dict[str, Any],
+        now: str,
+        tick: Dict[str, Any],
+    ) -> None:
+        if not position.shadow_variants:
+            return
+        for name, state in position.shadow_variants.items():
+            if not state.get("active", False):
+                continue
+            state["ticks"] = int(state.get("ticks") or 0) + 1
+            self._update_shadow_protection(state, price, now)
+            exit_reason, pnl_pct, max_pnl, diagnostics = self._evaluate_shadow_exit(state, price, band_info, now)
+            state["pnl_pct"] = pnl_pct
+            state["max_profit_pct"] = max_pnl
+            state["last_diagnostics"] = diagnostics
+            if exit_reason:
+                self._close_shadow_variant(position, name, state, price, exit_reason, pnl_pct, max_pnl, now, tick, diagnostics)
+
+    def _has_active_shadow_variants(self, position: AbbPosition) -> bool:
+        return any(bool(state.get("active")) for state in (position.shadow_variants or {}).values())
+
     def _write_tick(
         self,
         position: AbbPosition,
@@ -682,6 +941,12 @@ class AbbPositionMonitor:
             "stop_price": position.stop_price,
             "trailing_stop_price": position.trailing_stop_price,
             "breakeven_activated": position.breakeven_activated,
+            "baseline_closed": position.baseline_closed,
+            "baseline_exit_time": position.baseline_exit_time,
+            "baseline_exit_price_onchain": position.baseline_exit_price_onchain,
+            "baseline_exit_reason": position.baseline_exit_reason,
+            "baseline_pnl_pct": position.baseline_pnl_pct,
+            "baseline_max_profit_pct": position.baseline_max_profit_pct,
             "band_pct": band_info.get("down_band_pct"),
             "band_formula_used": band_info.get("breathing_method"),
             "breathing_pct": band_info.get("breathing_pct"),
@@ -700,6 +965,8 @@ class AbbPositionMonitor:
             "breakeven_sovereign_triggered": exit_diagnostics.get("breakeven_sovereign_triggered", False),
             "abb_applied_to_reason": exit_diagnostics.get("abb_applied_to_reason"),
             "initial_breathing_pct": self.cfg.initial_breathing_pct,
+            "shadow_variants_enabled": self.cfg.shadow_variants_enabled,
+            "shadow_variants": position.shadow_variants,
             "exit_reason": exit_reason,
             "onchain_base_reserve": tick.get("onchain_base_reserve"),
             "onchain_quote_reserve": tick.get("onchain_quote_reserve"),
@@ -733,8 +1000,22 @@ class AbbPositionMonitor:
         tick_time = self._parse_time(now) or datetime.now().astimezone()
         band_info = self._compute_band(position, tick_time, price)
         position.ticks += 1
-        self._update_protection(position, price, now)
-        exit_reason, pnl_pct, max_pnl, exit_diagnostics = self._evaluate_exit(position, price, band_info, now)
+        if not position.baseline_closed:
+            self._update_protection(position, price, now)
+            exit_reason, pnl_pct, max_pnl, exit_diagnostics = self._evaluate_exit(position, price, band_info, now)
+            if exit_reason:
+                position.baseline_closed = True
+                position.baseline_exit_time = now
+                position.baseline_exit_price_onchain = price
+                position.baseline_exit_reason = exit_reason
+                position.baseline_pnl_pct = pnl_pct
+                position.baseline_max_profit_pct = max_pnl
+        else:
+            exit_reason = None
+            pnl_pct = position.baseline_pnl_pct or ((price / position.entry_price_onchain) - 1) * 100
+            max_pnl = position.baseline_max_profit_pct or ((position.highest_price_onchain / position.entry_price_onchain) - 1) * 100
+            exit_diagnostics = {}
+        self._update_shadow_variants(position, price, band_info, now, tick)
         position.last_tick = tick
         self._write_tick(position, tick, band_info=band_info, exit_reason=exit_reason, exit_diagnostics=exit_diagnostics)
 
@@ -767,24 +1048,45 @@ class AbbPositionMonitor:
                 last_tick=tick,
             )
             self._save_closed_trade(trade)
-            self._replace_open_position(token_address, None)
             self._log(
                 f"[{LOG_ABB_SELL}] {position.symbol} | reason={exit_reason} | "
                 f"pnl={pnl_pct:.2f}% | down_band={band_info.get('down_band_pct'):.2f}% | "
                 f"source={band_info.get('breathing_method')}",
                 timestamp=now,
             )
+            if self._has_active_shadow_variants(position):
+                self._replace_open_position(token_address, position)
+                self._log(
+                    f"[{LOG_INFO}] ABB {position.symbol}: baseline fechado; mantendo auditoria shadow ativa.",
+                    timestamp=now,
+                )
+                return True
+            self._replace_open_position(token_address, None)
+            return False
+
+        if position.baseline_closed and not self._has_active_shadow_variants(position):
+            self._replace_open_position(token_address, None)
+            self._log(f"[{LOG_INFO}] ABB {position.symbol}: auditoria shadow encerrada.", timestamp=now)
             return False
 
         self._replace_open_position(token_address, position)
-        self._log(
-            f"[{LOG_ABB_MONITOR}] {position.symbol} | price_onchain={price} | pnl={pnl_pct:.2f}% | "
-            f"topo={position.highest_price_onchain} | stop={position.stop_price} | "
-            f"trailing={position.trailing_stop_price} | down_band={band_info.get('down_band_pct'):.2f}% | "
-            f"source={band_info.get('breathing_method')} | closed_candles={band_info.get('closed_candles')} | "
-            f"threshold={exit_diagnostics.get('trailing_exit_threshold')}",
-            timestamp=now,
-        )
+        active_shadow = sum(1 for state in position.shadow_variants.values() if state.get("active"))
+        if position.baseline_closed:
+            self._log(
+                f"[{LOG_ABB_MONITOR}] {position.symbol} | baseline_fechado={position.baseline_exit_reason} | "
+                f"shadow_ativos={active_shadow} | price_onchain={price} | down_band={band_info.get('down_band_pct'):.2f}% | "
+                f"source={band_info.get('breathing_method')}",
+                timestamp=now,
+            )
+        else:
+            self._log(
+                f"[{LOG_ABB_MONITOR}] {position.symbol} | price_onchain={price} | pnl={pnl_pct:.2f}% | "
+                f"topo={position.highest_price_onchain} | stop={position.stop_price} | "
+                f"trailing={position.trailing_stop_price} | down_band={band_info.get('down_band_pct'):.2f}% | "
+                f"source={band_info.get('breathing_method')} | closed_candles={band_info.get('closed_candles')} | "
+                f"threshold={exit_diagnostics.get('trailing_exit_threshold')} | shadow_ativos={active_shadow}",
+                timestamp=now,
+            )
         return True
 
     def run_loop_for_token(self, token_address: str) -> None:
