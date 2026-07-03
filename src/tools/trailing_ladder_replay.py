@@ -76,6 +76,7 @@ class ReplayResult:
     tolerance_values: List[float]
     min_threshold_distance_pct: Optional[float]
     max_persist_seconds: float
+    has_real_band_data: bool
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -196,6 +197,18 @@ def row_breathing_pct(row: Dict[str, Any]) -> tuple[float, bool]:
     return 4.0, True
 
 
+def row_has_real_band_data(row: Dict[str, Any]) -> bool:
+    return (
+        safe_float(row.get("breathing_pct")) is not None
+        or safe_float(row.get("down_band_pct")) is not None
+        or safe_float(row.get("band_pct")) is not None
+    )
+
+
+def rows_have_real_band_data(rows: List[Dict[str, Any]]) -> bool:
+    return any(row_has_real_band_data(row) for row in rows)
+
+
 def adaptive_tolerance_pct(row: Dict[str, Any], arm: Arm) -> tuple[float, bool]:
     breathing_pct, fallback = row_breathing_pct(row)
     tolerance = breathing_pct * arm.adaptive_k
@@ -260,6 +273,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
         tolerance_values=[],
         min_threshold_distance_pct=None,
         max_persist_seconds=0.0,
+        has_real_band_data=rows_have_real_band_data(rows),
     )
     if not rows:
         return empty
@@ -279,6 +293,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
     tolerance_values: List[float] = []
     min_threshold_distance_pct: Optional[float] = None
     max_persist_seconds = 0.0
+    has_real_band_data = rows_have_real_band_data(rows)
 
     for row in rows:
         price = row_price(row, source)
@@ -322,6 +337,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                 tolerance_values,
                 min_threshold_distance_pct,
                 max_persist_seconds,
+                has_real_band_data,
             )
 
         if current_pnl <= -5.0:
@@ -339,6 +355,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                 tolerance_values,
                 min_threshold_distance_pct,
                 max_persist_seconds,
+                has_real_band_data,
             )
 
         if arm.adaptive:
@@ -394,6 +411,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                     tolerance_values,
                     min_threshold_distance_pct,
                     max_persist_seconds,
+                    has_real_band_data,
                 )
         else:
             trailing_condition_started_at = None
@@ -415,6 +433,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
         tolerance_values,
         min_threshold_distance_pct,
         max_persist_seconds,
+        has_real_band_data,
     )
     result.censored = True
     return result
@@ -434,6 +453,7 @@ def finish_result(
     tolerance_values: List[float],
     min_threshold_distance_pct: Optional[float],
     max_persist_seconds: float,
+    has_real_band_data: bool,
 ) -> ReplayResult:
     giveback = None
     capture = None
@@ -461,6 +481,7 @@ def finish_result(
         tolerance_values=tolerance_values,
         min_threshold_distance_pct=min_threshold_distance_pct,
         max_persist_seconds=max_persist_seconds,
+        has_real_band_data=has_real_band_data,
     )
 
 
@@ -599,9 +620,9 @@ def print_sentinels(results_by_arm: Dict[str, List[ReplayResult]]) -> None:
 
 def filter_recorte(results: List[ReplayResult], recorte: str) -> List[ReplayResult]:
     if recorte == "banda_real":
-        return [item for item in results if not item.band_fallback]
+        return [item for item in results if item.has_real_band_data]
     if recorte == "fallback":
-        return [item for item in results if item.band_fallback]
+        return [item for item in results if not item.has_real_band_data]
     return results
 
 
