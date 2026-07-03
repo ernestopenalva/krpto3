@@ -228,7 +228,9 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
     )
     if not rows:
         return empty
-    entry_price = safe_float(trade.get("entry_price_onchain")) or row_entry(rows[0], source)
+    entry_price = row_entry(rows[0], source)
+    if entry_price is None and source == "abb":
+        entry_price = safe_float(trade.get("entry_price_onchain"))
     if entry_price is None or entry_price <= 0:
         return empty
 
