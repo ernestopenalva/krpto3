@@ -8,6 +8,7 @@ import json
 import math
 from collections import defaultdict
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE_FILE = PROJECT_ROOT / "data" / "position_monitor_abb" / "closed_trades.json"
 DEFAULT_SHADOW_FILE = PROJECT_ROOT / "data" / "position_monitor_abb" / "shadow_closed_trades.json"
+BRASILIA = ZoneInfo("America/Sao_Paulo")
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -43,9 +45,12 @@ def parse_time(value: Any) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BRASILIA)
+    return parsed.astimezone(BRASILIA)
 
 
 def fmt_pct(value: Optional[float]) -> str:
