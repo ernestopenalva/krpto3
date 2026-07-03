@@ -1,3 +1,4 @@
+import atexit
 import json
 import math
 import os
@@ -211,6 +212,7 @@ def dispatch_position_monitor(token_address: str) -> None:
             cwd=PROJECT_ROOT,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
 
@@ -232,6 +234,7 @@ def dispatch_abb_position_monitor(token_address: str) -> None:
             cwd=PROJECT_ROOT,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
 def append_jsonl(path: Path, data: Dict[str, Any]) -> None:
@@ -1013,6 +1016,18 @@ def monitor() -> None:
     latest_ticks = {}
     invalid_price_ticks: Dict[str, int] = {}
 
+    def persist_monitor_status() -> None:
+        save_json(STATUS_FILE, {
+            "updated_at": now_iso(),
+            "mode": "paper",
+            "invalid_price_ticks": sum(invalid_price_ticks.values()),
+            "skipped_invalid_price_ticks": sum(invalid_price_ticks.values()),
+            "invalid_price_ticks_by_token": invalid_price_ticks,
+            "candidates": candidates
+        })
+
+    atexit.register(persist_monitor_status)
+
     while True:
         elapsed_minutes = (time.time() - started_at) / 60
 
@@ -1104,14 +1119,7 @@ def monitor() -> None:
                 candidate["signal_emitted"] = True
                 candidate["status"] = "signal_emitted"
 
-        save_json(STATUS_FILE, {
-            "updated_at": now_iso(),
-            "mode": "paper",
-            "invalid_price_ticks": sum(invalid_price_ticks.values()),
-            "skipped_invalid_price_ticks": sum(invalid_price_ticks.values()),
-            "invalid_price_ticks_by_token": invalid_price_ticks,
-            "candidates": candidates
-        })
+        persist_monitor_status()
 
         active = [c for c in candidates if c["status"] == "monitoring"]
 
@@ -1121,18 +1129,14 @@ def monitor() -> None:
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
-    save_json(STATUS_FILE, {
-        "updated_at": now_iso(),
-        "mode": "paper",
-        "invalid_price_ticks": sum(invalid_price_ticks.values()),
-        "skipped_invalid_price_ticks": sum(invalid_price_ticks.values()),
-        "invalid_price_ticks_by_token": invalid_price_ticks,
-        "candidates": candidates
-    })
+    persist_monitor_status()
 
     log_invalid_price_summary(invalid_price_ticks)
     print("[INFO] Monitoramento encerrado.")
 
 
 if __name__ == "__main__":
-    monitor()
+    try:
+        monitor()
+    except KeyboardInterrupt:
+        print("[INFO] Interrupcao recebida. Monitor encerrado com status salvo.")

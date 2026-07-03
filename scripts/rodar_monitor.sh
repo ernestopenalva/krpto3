@@ -12,6 +12,16 @@ LOGFILE="logs/monitor_$(date +%Y-%m-%d).txt"
 
 source venv/bin/activate
 
+stop_requested=false
+
+shutdown() {
+    stop_requested=true
+    echo ""
+    echo "Encerramento solicitado. Finalizando monitor apos o ciclo atual..."
+}
+
+trap shutdown INT TERM
+
 while true; do
     echo ""
     echo "==============================="
@@ -23,7 +33,19 @@ while true; do
     python -u src/app.py >> "$LOGFILE" 2>&1
 
     echo "Ciclo finalizado em $(date)"
+
+    if [ "$stop_requested" = true ]; then
+        echo "Monitor encerrado em $(date)"
+        exit 0
+    fi
+
     echo "Aguardando 60 segundos..."
 
-    sleep 60
+    sleep 60 &
+    wait $!
+
+    if [ "$stop_requested" = true ]; then
+        echo "Monitor encerrado em $(date)"
+        exit 0
+    fi
 done

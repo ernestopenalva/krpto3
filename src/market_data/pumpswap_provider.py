@@ -166,12 +166,7 @@ class OnChainPumpSwapProvider(MarketDataProvider):
     def _fetch_token_vault(self, token_account: str) -> Optional[TokenVault]:
         balance = self.rpc.get_token_account_balance(token_account)
         account_info = self.rpc.get_account_info(token_account, encoding="jsonParsed")
-        parsed = (
-            (account_info or {})
-            .get("data", {})
-            .get("parsed", {})
-            .get("info", {})
-        )
+        parsed = self._parsed_info(account_info)
         mint = parsed.get("mint")
         owner = (account_info or {}).get("owner") or SPL_TOKEN_PROGRAM_ID
         if not balance or not mint:
@@ -208,14 +203,22 @@ class OnChainPumpSwapProvider(MarketDataProvider):
         return vaults
 
     @staticmethod
+    def _parsed_info(account_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(account_info, dict):
+            return {}
+        data = account_info.get("data") or {}
+        if not isinstance(data, dict):
+            return {}
+        parsed = data.get("parsed") or {}
+        if not isinstance(parsed, dict):
+            return {}
+        info = parsed.get("info") or {}
+        return info if isinstance(info, dict) else {}
+
+    @staticmethod
     def _parse_token_account(account: Dict[str, Any], program_id: str) -> Optional[TokenVault]:
         pubkey = account.get("pubkey")
-        parsed = (
-            (account.get("account") or {})
-            .get("data", {})
-            .get("parsed", {})
-            .get("info", {})
-        )
+        parsed = OnChainPumpSwapProvider._parsed_info(account.get("account") or {})
         mint = parsed.get("mint")
         token_amount = parsed.get("tokenAmount") or {}
         amount_raw = token_amount.get("amount")
