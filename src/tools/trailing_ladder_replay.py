@@ -29,6 +29,7 @@ CURRENT_LADDER = ((5.0, 1.0), (6.0, 3.0), (10.0, 5.0))
 PROPOSED_LADDER = ((3.0, 1.0), (4.0, 2.0), (5.0, 3.0), (7.0, 4.0), (10.0, 5.0))
 SENTINELS = {
     "SUNBULL",
+    "$SUNBULL",
     "yep",
     "Guardians",
     "GENOPACK",
@@ -39,6 +40,7 @@ SENTINELS = {
     "LojakPaul",
     "FableRoom",
 }
+RUNNER_MARGIN_SYMBOLS = {"Ronaldo", "BINDY", "ape", "Figgleton", "back"}
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,10 @@ class Arm:
     ladder_name: str
     ladder: Tuple[Tuple[float, float], ...]
     trailing_gap_pct: float
+    adaptive: bool = False
+    adaptive_k: float = 1.0
+    adaptive_min_pct: float = 2.0
+    adaptive_max_pct: Optional[float] = 8.0
 
 
 @dataclass
@@ -67,6 +73,9 @@ class ReplayResult:
     real_exit_reason: str
     real_pnl_pct: Optional[float]
     timeline: List[Dict[str, Any]]
+    tolerance_values: List[float]
+    min_threshold_distance_pct: Optional[float]
+    max_persist_seconds: float
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -173,6 +182,29 @@ def row_band_pct(row: Dict[str, Any]) -> tuple[float, bool]:
     return value, False
 
 
+def row_breathing_pct(row: Dict[str, Any]) -> tuple[float, bool]:
+    value = safe_float(row.get("breathing_pct"))
+    if value is not None:
+        return value, False
+
+    band_pct = safe_float(row.get("down_band_pct"))
+    if band_pct is None:
+        band_pct = safe_float(row.get("band_pct"))
+    if band_pct is not None:
+        return band_pct * 2.0, False
+
+    return 4.0, True
+
+
+def adaptive_tolerance_pct(row: Dict[str, Any], arm: Arm) -> tuple[float, bool]:
+    breathing_pct, fallback = row_breathing_pct(row)
+    tolerance = breathing_pct * arm.adaptive_k
+    tolerance = max(arm.adaptive_min_pct, tolerance)
+    if arm.adaptive_max_pct is not None:
+        tolerance = min(arm.adaptive_max_pct, tolerance)
+    return tolerance, fallback
+
+
 def load_rows(files: List[Path], source: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for path in files:
@@ -225,6 +257,9 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
         real_exit_reason=str(trade.get("exit_reason") or ""),
         real_pnl_pct=safe_float(trade.get("pnl_pct")),
         timeline=[],
+        tolerance_values=[],
+        min_threshold_distance_pct=None,
+        max_persist_seconds=0.0,
     )
     if not rows:
         return empty
@@ -241,6 +276,9 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
     band_fallback = False
     max_pnl = 0.0
     timeline: List[Dict[str, Any]] = []
+    tolerance_values: List[float] = []
+    min_threshold_distance_pct: Optional[float] = None
+    max_persist_seconds = 0.0
 
     for row in rows:
         price = row_price(row, source)
@@ -281,32 +319,65 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                 max_pnl,
                 band_fallback,
                 timeline,
+                tolerance_values,
+                min_threshold_distance_pct,
+                max_persist_seconds,
             )
 
         if current_pnl <= -5.0:
-            return finish_result(trade, arm, source, rows, row, "STOP_LOSS", current_pnl, max_pnl, band_fallback, timeline)
+            return finish_result(
+                trade,
+                arm,
+                source,
+                rows,
+                row,
+                "STOP_LOSS",
+                current_pnl,
+                max_pnl,
+                band_fallback,
+                timeline,
+                tolerance_values,
+                min_threshold_distance_pct,
+                max_persist_seconds,
+            )
 
-        if max_pnl < arm.trailing_gap_pct:
-            trailing_condition_started_at = None
-            continue
+        if arm.adaptive:
+            if max_pnl <= 0:
+                trailing_condition_started_at = None
+                continue
+            tolerance_pct, fallback = adaptive_tolerance_pct(row, arm)
+            trailing_level = highest_price
+        else:
+            if max_pnl < arm.trailing_gap_pct:
+                trailing_condition_started_at = None
+                continue
+            tolerance_pct, fallback = row_band_pct(row)
+            trailing_level = highest_price * (1.0 - arm.trailing_gap_pct / 100.0)
 
-        trailing_level = highest_price * (1.0 - arm.trailing_gap_pct / 100.0)
-        band_pct, fallback = row_band_pct(row)
         band_fallback = band_fallback or fallback
-        exit_threshold = trailing_level * (1.0 - band_pct / 100.0)
+        if arm.adaptive:
+            tolerance_values.append(tolerance_pct)
+        exit_threshold = trailing_level * (1.0 - tolerance_pct / 100.0)
+        threshold_distance_pct = ((price / exit_threshold) - 1.0) * 100.0
+        if min_threshold_distance_pct is None or threshold_distance_pct < min_threshold_distance_pct:
+            min_threshold_distance_pct = threshold_distance_pct
+
         trailing_condition = price < exit_threshold
         if trailing_condition:
             if trailing_condition_started_at is None:
                 trailing_condition_started_at = ts
-            if (ts - trailing_condition_started_at).total_seconds() >= 3.0:
+            persist_seconds = (ts - trailing_condition_started_at).total_seconds()
+            max_persist_seconds = max(max_persist_seconds, persist_seconds)
+            if persist_seconds >= 3.0:
                 timeline.append(
                     {
                         "event": "TRAILING_EXIT",
                         "time": row.get("timestamp"),
                         "pnl": current_pnl,
                         "trailing_level": trailing_level,
-                        "band_pct": band_pct,
+                        "tolerance_pct": tolerance_pct,
                         "threshold": exit_threshold,
+                        "distance_pct": threshold_distance_pct,
                     }
                 )
                 return finish_result(
@@ -320,6 +391,9 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                     max_pnl,
                     band_fallback,
                     timeline,
+                    tolerance_values,
+                    min_threshold_distance_pct,
+                    max_persist_seconds,
                 )
         else:
             trailing_condition_started_at = None
@@ -338,6 +412,9 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
         max_pnl,
         band_fallback,
         timeline,
+        tolerance_values,
+        min_threshold_distance_pct,
+        max_persist_seconds,
     )
     result.censored = True
     return result
@@ -354,6 +431,9 @@ def finish_result(
     max_pnl: Optional[float],
     band_fallback: bool,
     timeline: List[Dict[str, Any]],
+    tolerance_values: List[float],
+    min_threshold_distance_pct: Optional[float],
+    max_persist_seconds: float,
 ) -> ReplayResult:
     giveback = None
     capture = None
@@ -378,6 +458,9 @@ def finish_result(
         real_exit_reason=str(trade.get("exit_reason") or ""),
         real_pnl_pct=safe_float(trade.get("pnl_pct")),
         timeline=timeline,
+        tolerance_values=tolerance_values,
+        min_threshold_distance_pct=min_threshold_distance_pct,
+        max_persist_seconds=max_persist_seconds,
     )
 
 
@@ -389,7 +472,11 @@ def percentile(values: List[float], pct: float) -> Optional[float]:
     return ordered[index]
 
 
-def summarize(results: List[ReplayResult], baseline: Optional[List[ReplayResult]] = None) -> Dict[str, Any]:
+def summarize(
+    results: List[ReplayResult],
+    baseline: Optional[List[ReplayResult]] = None,
+    arm_label: Optional[str] = None,
+) -> Dict[str, Any]:
     usable = [item for item in results if item.exit_pnl_pct is not None]
     pnls = [item.exit_pnl_pct for item in usable if item.exit_pnl_pct is not None]
     wins = [pnl for pnl in pnls if pnl > 0]
@@ -405,6 +492,7 @@ def summarize(results: List[ReplayResult], baseline: Optional[List[ReplayResult]
         if (item.max_pnl_pct or 0) >= 10 and (item.exit_pnl_pct or 0) < 3
     ]
     exit_reasons = Counter(item.exit_reason for item in usable)
+    tolerances = [value for item in usable for value in item.tolerance_values]
     loser_conversion = 0
     if baseline is not None:
         by_token = {item.token_address: item for item in baseline}
@@ -418,7 +506,7 @@ def summarize(results: List[ReplayResult], baseline: Optional[List[ReplayResult]
             ):
                 loser_conversion += 1
     return {
-        "arm": usable[0].arm if usable else "-",
+        "arm": arm_label or (usable[0].arm if usable else "-"),
         "trades": len(usable),
         "censored": sum(1 for item in results if item.censored),
         "band_fallback": sum(1 for item in results if item.band_fallback),
@@ -433,6 +521,8 @@ def summarize(results: List[ReplayResult], baseline: Optional[List[ReplayResult]
         "runners_mortos": len(runners_mortos),
         "loser_conversion": loser_conversion,
         "exit_reasons": exit_reasons,
+        "tolerance_avg": sum(tolerances) / len(tolerances) if tolerances else None,
+        "tolerance_p90": percentile(tolerances, 0.90),
     }
 
 
@@ -440,7 +530,7 @@ def print_summary(title: str, summaries: List[Dict[str, Any]]) -> None:
     print(f"\n## {title}")
     print(
         "arm | trades | pnl_sum | avg | med | win | p10 | p90 | giveback_med | "
-        "runner_capture | runners_mortos | loser_conv | exits | cens/bandfb"
+        "runner_capture | runners_mortos | loser_conv | tol_avg/p90 | exits | cens/bandfb"
     )
     for item in summaries:
         exits = ",".join(f"{key}:{value}" for key, value in sorted(item["exit_reasons"].items()))
@@ -449,7 +539,8 @@ def print_summary(title: str, summaries: List[Dict[str, Any]]) -> None:
             f"{fmt_pct(item['pnl_avg'])} | {fmt_pct(item['pnl_median'])} | "
             f"{fmt_pct(item['win_rate'])} | {fmt_pct(item['p10'])} | {fmt_pct(item['p90'])} | "
             f"{fmt_pct(item['giveback_median'])} | {fmt_pct(item['runner_capture'])} | "
-            f"{item['runners_mortos']} | {item['loser_conversion']} | {exits} | "
+            f"{item['runners_mortos']} | {item['loser_conversion']} | "
+            f"{fmt_pct(item['tolerance_avg'])}/{fmt_pct(item['tolerance_p90'])} | {exits} | "
             f"{item['censored']}/{item['band_fallback']}"
         )
 
@@ -506,6 +597,91 @@ def print_sentinels(results_by_arm: Dict[str, List[ReplayResult]]) -> None:
             print("sem_dados")
 
 
+def filter_recorte(results: List[ReplayResult], recorte: str) -> List[ReplayResult]:
+    if recorte == "banda_real":
+        return [item for item in results if not item.band_fallback]
+    if recorte == "fallback":
+        return [item for item in results if item.band_fallback]
+    return results
+
+
+def print_v2_summaries(results_by_arm: Dict[str, List[ReplayResult]], baseline_label: str) -> None:
+    recortes = (
+        ("todos", "Todos"),
+        ("banda_real", "So Banda Real"),
+        ("fallback", "So Fallback"),
+    )
+    for recorte, title in recortes:
+        baseline = filter_recorte(results_by_arm[baseline_label], recorte)
+        summaries = []
+        for arm, results in results_by_arm.items():
+            filtered = filter_recorte(results, recorte)
+            summaries.append(summarize(filtered, baseline if arm != baseline_label else None, arm))
+        print_summary(f"V2 - {title}", summaries)
+
+
+def print_runner_margin(results_by_arm: Dict[str, List[ReplayResult]]) -> None:
+    print("\n## Margem Dos 5 Maiores Runners")
+    by_arm_symbol = {
+        arm: {item.symbol.lower(): item for item in results}
+        for arm, results in results_by_arm.items()
+    }
+    for symbol in sorted(RUNNER_MARGIN_SYMBOLS, key=str.lower):
+        print(f"\n### {symbol}")
+        found = False
+        for arm, rows in by_arm_symbol.items():
+            item = rows.get(symbol.lower())
+            if item is None:
+                continue
+            found = True
+            print(
+                f"{arm} | exit={fmt_pct(item.exit_pnl_pct)} {item.exit_reason} | "
+                f"max={fmt_pct(item.max_pnl_pct)} | min_dist={fmt_pct(item.min_threshold_distance_pct)} | "
+                f"persist_max={fmt_num(item.max_persist_seconds)}s | band_fallback={item.band_fallback}"
+            )
+        if not found:
+            print("sem_dados")
+
+
+def v2_arms() -> List[Arm]:
+    return [
+        Arm("G12", "current", CURRENT_LADDER, 12.0),
+        Arm("G7", "current", CURRENT_LADDER, 7.0),
+        Arm("G6", "current", CURRENT_LADDER, 6.0),
+        Arm("G5", "current", CURRENT_LADDER, 5.0),
+        Arm("G4", "current", CURRENT_LADDER, 4.0),
+        Arm("G3", "current", CURRENT_LADDER, 3.0),
+        Arm("ADAP_k1_cap8", "current", CURRENT_LADDER, 0.0, True, 1.0, 2.0, 8.0),
+        Arm("ADAP_k1_cap14", "current", CURRENT_LADDER, 0.0, True, 1.0, 2.0, 14.0),
+        Arm("ADAP_k15_cap14", "current", CURRENT_LADDER, 0.0, True, 1.5, 2.0, 14.0),
+        Arm("ADAP_k2_cap14", "current", CURRENT_LADDER, 0.0, True, 2.0, 3.0, 14.0),
+        Arm("ADAP_k15_nocap", "current", CURRENT_LADDER, 0.0, True, 1.5, 2.0, None),
+    ]
+
+
+def run_v2(args: argparse.Namespace, trades: List[Dict[str, Any]], trade_rows: List[tuple[Dict[str, Any], List[Dict[str, Any]], str]]) -> None:
+    arms = v2_arms()
+    results_by_arm = {
+        arm.label: [replay_trade(trade, rows, source, arm) for trade, rows, source in trade_rows]
+        for arm in arms
+    }
+
+    print("# Trailing Ladder Replay v2")
+    print(
+        f"trades_fechados={len(trades)} | com_serie={len(trade_rows)} | "
+        f"fonte_shadow_habilitada={not args.no_shadow} | timezone=America/Sao_Paulo"
+    )
+    print(
+        "v2=offline | producao/config_inalteradas | ladder=current(5->1,6->3,10->5) | "
+        "persist_trailing=3s"
+    )
+
+    print_v2_summaries(results_by_arm, "G12")
+    print_pair_diffs(results_by_arm, "G12", args.limit)
+    print_runner_margin(results_by_arm)
+    print_sentinels(results_by_arm)
+
+
 def parse_since_until(trades: List[Dict[str, Any]], since: Optional[str], until: Optional[str]) -> List[Dict[str, Any]]:
     since_dt = parse_time(since)
     until_dt = parse_time(until)
@@ -534,6 +710,7 @@ def main() -> None:
     parser.add_argument("--until", type=str, default=None)
     parser.add_argument("--last", type=int, default=0)
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--v2", action="store_true", help="Executa curva estendida e gaps adaptativos.")
     args = parser.parse_args()
 
     payload = load_json(args.closed_trades_file, [])
@@ -549,6 +726,10 @@ def main() -> None:
         if rows:
             trade_rows.append((trade, rows, source))
 
+    if args.v2:
+        run_v2(args, trades, trade_rows)
+        return
+
     arms = [
         Arm("A_baseline", "current", CURRENT_LADDER, 12.0),
         Arm("B_ladder", "proposed", PROPOSED_LADDER, 12.0),
@@ -561,7 +742,7 @@ def main() -> None:
     }
     baseline = results_by_arm["A_baseline"]
     summaries = [
-        summarize(results_by_arm[arm.label], baseline if arm.label != "A_baseline" else None)
+        summarize(results_by_arm[arm.label], baseline if arm.label != "A_baseline" else None, arm.label)
         for arm in arms
     ]
 
@@ -578,7 +759,7 @@ def main() -> None:
         arm.label: [replay_trade(trade, rows, source, arm) for trade, rows, source in trade_rows]
         for arm in curve_arms
     }
-    curve_summaries = [summarize(curve_results[arm.label], baseline) for arm in curve_arms]
+    curve_summaries = [summarize(curve_results[arm.label], baseline, arm.label) for arm in curve_arms]
     print_summary("Curva Exploratoria De Gap", curve_summaries)
 
     print_pair_diffs(results_by_arm, "A_baseline", args.limit)
