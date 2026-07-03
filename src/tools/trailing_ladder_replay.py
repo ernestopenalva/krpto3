@@ -320,16 +320,14 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                     }
                 )
 
-        # Classificacao corrigida: se o lock ja estava armado, ele e soberano
-        # sobre a razao da saida mesmo que o tick esteja abaixo do stop loss.
-        if best_lock_pct > 0 and price <= stop_price:
+        if current_pnl <= -5.0:
             return finish_result(
                 trade,
                 arm,
                 source,
                 rows,
                 row,
-                "BREAKEVEN_STOP",
+                "STOP_LOSS",
                 current_pnl,
                 max_pnl,
                 band_fallback,
@@ -340,14 +338,14 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                 has_real_band_data,
             )
 
-        if current_pnl <= -5.0:
+        if best_lock_pct > 0 and price <= stop_price:
             return finish_result(
                 trade,
                 arm,
                 source,
                 rows,
                 row,
-                "STOP_LOSS",
+                "BREAKEVEN_STOP",
                 current_pnl,
                 max_pnl,
                 band_fallback,
@@ -397,13 +395,14 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                         "distance_pct": threshold_distance_pct,
                     }
                 )
+                exit_reason = "STOP_LOSS" if current_pnl <= -5.0 else "TRAILING_STOP"
                 return finish_result(
                     trade,
                     arm,
                     source,
                     rows,
                     row,
-                    "TRAILING_STOP",
+                    exit_reason,
                     current_pnl,
                     max_pnl,
                     band_fallback,

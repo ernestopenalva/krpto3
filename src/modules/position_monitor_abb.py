@@ -801,7 +801,8 @@ class AbbPositionMonitor:
         if state.get("breakeven_activated") and stop_price is not None and price <= stop_price:
             state["stop_condition_started_at"] = None
             state["trailing_condition_started_at"] = None
-            return "BREAKEVEN_STOP", pnl_pct, max_pnl, diagnostics
+            reason = "STOP_LOSS" if pnl_pct <= -self.cfg.stop_loss_pct else "BREAKEVEN_STOP"
+            return reason, pnl_pct, max_pnl, diagnostics
 
         trailing_level = self._safe_float(state.get("trailing_stop_price"))
         if trailing_level is None:
@@ -824,7 +825,8 @@ class AbbPositionMonitor:
         diagnostics["trailing_persist_elapsed"] = elapsed
         required = self.cfg.trailing_persist_seconds
         if required <= 0 or (elapsed is not None and elapsed >= required):
-            return "TRAILING_STOP", pnl_pct, max_pnl, diagnostics
+            reason = "STOP_LOSS" if pnl_pct <= -self.cfg.stop_loss_pct else "TRAILING_STOP"
+            return reason, pnl_pct, max_pnl, diagnostics
         return None, pnl_pct, max_pnl, diagnostics
 
     def _close_shadow_variant(

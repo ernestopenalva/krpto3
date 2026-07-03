@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -82,6 +82,20 @@ def runners_mortos(rows: List[Dict[str, Any]]) -> int:
     )
 
 
+def normalized_exit_reason(row: Dict[str, Any]) -> str:
+    pnl = safe_float(row.get("pnl_pct"))
+    if pnl is not None and pnl <= -5.0:
+        return "STOP_LOSS"
+    return str(row.get("exit_reason") or "-")
+
+
+def exit_counts(rows: List[Dict[str, Any]]) -> str:
+    counts = Counter(normalized_exit_reason(row) for row in rows)
+    if not counts:
+        return "-"
+    return ",".join(f"{reason}:{count}" for reason, count in sorted(counts.items()))
+
+
 def summarize_variant(name: str, baseline_rows: List[Dict[str, Any]], shadow_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     baseline_pnls = [safe_float(row.get("pnl_pct")) for row in baseline_rows]
     shadow_pnls = [safe_float(row.get("pnl_pct")) for row in shadow_rows]
@@ -125,6 +139,8 @@ def summarize_variant(name: str, baseline_rows: List[Dict[str, Any]], shadow_row
         "shadow_runner_kills": shadow_runner_kills,
         "baseline_worst": baseline_worst,
         "shadow_worst": shadow_worst,
+        "baseline_exit_counts": exit_counts(baseline_rows),
+        "shadow_exit_counts": exit_counts(shadow_rows),
         "worst_guard_ok": worst_guard_ok,
         "promote_ok": promote_ok,
     }
@@ -150,7 +166,7 @@ def main() -> None:
 
     print("# ABB Shadow Variants Report")
     print("criterio=50 pares; maior pnl_sum se vencer baseline; runner_kills <= baseline; worst_shadow >= worst_baseline - 3pp")
-    print("variant | pairs | baseline_sum | shadow_sum | delta_sum | base_avg | shadow_avg | delta_med | runners base/shadow | worst base/shadow | worst_guard | promove")
+    print("variant | pairs | baseline_sum | shadow_sum | delta_sum | base_avg | shadow_avg | delta_med | runners base/shadow | exits base/shadow | worst base/shadow | worst_guard | promove")
     summaries = []
     for variant, rows in sorted(shadows_by_variant.items()):
         if args.last > 0:
@@ -167,6 +183,7 @@ def main() -> None:
             f"{fmt_pct(item['baseline_avg'])} | {fmt_pct(item['shadow_avg'])} | "
             f"{fmt_pct(item['delta_median'])} | "
             f"{item['baseline_runner_kills']}/{item['shadow_runner_kills']} | "
+            f"{item['baseline_exit_counts']}/{item['shadow_exit_counts']} | "
             f"{fmt_pct(item['baseline_worst'])}/{fmt_pct(item['shadow_worst'])} | "
             f"{'sim' if item['worst_guard_ok'] else 'nao'} | "
             f"{'SIM' if item['promote_ok'] else 'nao'}"
