@@ -292,6 +292,28 @@ def candidate_price(row: Dict[str, Any]) -> Optional[float]:
     )
 
 
+def signal_native_to_usd_ratio(source_signal: Dict[str, Any]) -> Optional[float]:
+    signal_usd = first_float(source_signal.get("entry_price_usd"), source_signal.get("price_usd"))
+    signal_native = first_float(source_signal.get("entry_price_native"), source_signal.get("price_native"))
+    snapshot = source_signal.get("snapshot") if isinstance(source_signal.get("snapshot"), dict) else {}
+    signal_usd = first_float(signal_usd, snapshot.get("price_usd"), snapshot.get("priceUsd"))
+    signal_native = first_float(signal_native, snapshot.get("price_native"))
+    if signal_usd is None or signal_native is None or signal_native <= 0:
+        return None
+    return signal_usd / signal_native
+
+
+def price_in_usd(native_or_usd_price: Optional[float], source: str, source_signal: Dict[str, Any]) -> Optional[float]:
+    if native_or_usd_price is None:
+        return None
+    if source != "abb":
+        return native_or_usd_price
+    ratio = signal_native_to_usd_ratio(source_signal)
+    if ratio is None:
+        return first_float(source_signal.get("entry_price_usd"), source_signal.get("price_usd"))
+    return native_or_usd_price * ratio
+
+
 def build_trade_row(
     trade: Dict[str, Any],
     replay: Any,
@@ -329,16 +351,20 @@ def build_trade_row(
     max_pnl = safe_float(getattr(replay, "max_pnl_pct", None))
     giveback = safe_float(getattr(replay, "giveback_pct", None))
 
-    entry_price = first_float(
+    position_entry_price = first_float(
         row_entry(entry_snapshot, source),
         row_entry(rows[0], source) if rows else None,
         trade.get("entry_price_onchain"),
         trade.get("entry_price"),
+    )
+    entry_price = first_float(
+        price_in_usd(position_entry_price, source, source_signal),
         source_signal.get("entry_price_usd"),
         source_signal.get("price_usd"),
+        position_entry_price,
     )
     monitor_price = first_float(monitor_first.get("price_usd"), candidate_price(scanner), watch.get("scanner_price_usd"), watch.get("price_usd"))
-    price_at_entry_row = row_price(entry_snapshot, source)
+    price_at_entry_row = price_in_usd(row_price(entry_snapshot, source), source, source_signal)
     runup = pct_change(monitor_price, price_at_entry_row or entry_price)
 
     tick_frequency, avg_tick_interval, tick_count = tick_stats_before(rows, entry_time)
@@ -386,12 +412,12 @@ def build_trade_row(
     )
     fdv = first_float(entry_tick.get("fdv"), entry_snapshot.get("fdv"), source_signal.get("fdv"), nested(source_signal, ("snapshot", "fdv")))
     min_pnl = None
-    if entry_price is not None and entry_price > 0:
+    if position_entry_price is not None and position_entry_price > 0:
         pnls = []
         for row in rows:
             price = row_price(row, source)
             if price is not None and price > 0:
-                pnls.append(((price / entry_price) - 1.0) * 100.0)
+                pnls.append(((price / position_entry_price) - 1.0) * 100.0)
         min_pnl = min(pnls) if pnls else None
 
     entry_reason = first_value(signal.get("entry_reason"), source_signal.get("entry_reason"), trade.get("entry_reason"))
@@ -590,8 +616,16 @@ def build_thresholds(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 )
             )
     records.extend(build_combo_thresholds(rows))
-    records.sort(key=lambda row: (-(safe_float(row.get("pnl_sum")) or -10**12), -(safe_float(row.get("crashes_cut_pct")) or 0), safe_float(row.get("runners_lost")) or 0))
-    return records
+    unique_records: List[Dict[str, Any]] = []
+    seen_rules = set()
+    for record in records:
+        key = (record.get("kind"), record.get("rule"))
+        if key in seen_rules:
+            continue
+        seen_rules.add(key)
+        unique_records.append(record)
+    unique_records.sort(key=lambda row: (-(safe_float(row.get("pnl_sum")) or -10**12), -(safe_float(row.get("crashes_cut_pct")) or 0), safe_float(row.get("runners_lost")) or 0))
+    return unique_records
 
 
 def feature_cut(rows: List[Dict[str, Any]], feature: str, pct: float, op: str) -> tuple[str, Callable[[Dict[str, Any]], bool]]:
