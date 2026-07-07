@@ -96,21 +96,44 @@ def exit_counts(rows: List[Dict[str, Any]]) -> str:
     return ",".join(f"{reason}:{count}" for reason, count in sorted(counts.items()))
 
 
-def summarize_variant(name: str, baseline_rows: List[Dict[str, Any]], shadow_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    baseline_pnls = [safe_float(row.get("pnl_pct")) for row in baseline_rows]
-    shadow_pnls = [safe_float(row.get("pnl_pct")) for row in shadow_rows]
-    pairs = [
-        (base, shadow)
-        for base, shadow in zip(baseline_pnls, shadow_pnls)
-        if base is not None and shadow is not None
+def paired_detail(base: Dict[str, Any], shadow: Dict[str, Any]) -> Dict[str, Any]:
+    baseline_pnl = safe_float(base.get("pnl_pct"))
+    shadow_pnl = safe_float(shadow.get("pnl_pct"))
+    return {
+        "symbol": shadow.get("symbol") or base.get("symbol") or "?",
+        "token_address": shadow.get("token_address") or base.get("token_address") or "",
+        "variant": shadow.get("variant") or "unknown",
+        "entry_time": shadow.get("entry_time") or base.get("entry_time"),
+        "baseline_pnl": baseline_pnl,
+        "shadow_pnl": shadow_pnl,
+        "delta": None if baseline_pnl is None or shadow_pnl is None else shadow_pnl - baseline_pnl,
+        "baseline_max": safe_float(base.get("max_profit_pct")),
+        "shadow_max": safe_float(shadow.get("max_profit_pct")),
+        "baseline_reason": normalized_exit_reason(base),
+        "shadow_reason": normalized_exit_reason(shadow),
+    }
+
+
+def summarize_variant(
+    name: str,
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    unpaired_count: int,
+) -> Dict[str, Any]:
+    details = [paired_detail(base, shadow) for base, shadow in pairs]
+    valid = [
+        item
+        for item in details
+        if item["baseline_pnl"] is not None and item["shadow_pnl"] is not None
     ]
-    baseline_values = [base for base, _ in pairs]
-    shadow_values = [shadow for _, shadow in pairs]
-    deltas = [shadow - base for base, shadow in pairs]
+    baseline_values = [item["baseline_pnl"] for item in valid]
+    shadow_values = [item["shadow_pnl"] for item in valid]
+    deltas = [item["delta"] for item in valid if item["delta"] is not None]
     baseline_sum = sum(baseline_values) if baseline_values else None
     shadow_sum = sum(shadow_values) if shadow_values else None
     baseline_worst = min(baseline_values) if baseline_values else None
     shadow_worst = min(shadow_values) if shadow_values else None
+    baseline_rows = [base for base, _shadow in pairs]
+    shadow_rows = [shadow for _base, shadow in pairs]
     baseline_runner_kills = runners_mortos(baseline_rows)
     shadow_runner_kills = runners_mortos(shadow_rows)
     worst_guard_ok = (
@@ -119,7 +142,7 @@ def summarize_variant(name: str, baseline_rows: List[Dict[str, Any]], shadow_row
         and shadow_worst >= baseline_worst - 3.0
     )
     promote_ok = (
-        len(pairs) >= 50
+        len(valid) >= 50
         and shadow_sum is not None
         and baseline_sum is not None
         and shadow_sum > baseline_sum
@@ -128,7 +151,8 @@ def summarize_variant(name: str, baseline_rows: List[Dict[str, Any]], shadow_row
     )
     return {
         "variant": name,
-        "pairs": len(pairs),
+        "pairs": len(valid),
+        "unpaired": unpaired_count,
         "baseline_sum": baseline_sum,
         "shadow_sum": shadow_sum,
         "delta_sum": None if baseline_sum is None or shadow_sum is None else shadow_sum - baseline_sum,
@@ -143,7 +167,55 @@ def summarize_variant(name: str, baseline_rows: List[Dict[str, Any]], shadow_row
         "shadow_exit_counts": exit_counts(shadow_rows),
         "worst_guard_ok": worst_guard_ok,
         "promote_ok": promote_ok,
+        "details": details,
     }
+
+
+def print_detail_section(title: str, rows: List[Dict[str, Any]], limit: int) -> None:
+    print()
+    print(f"## {title}")
+    if not rows:
+        print("-")
+        return
+    for row in rows[:limit]:
+        print(
+            f"{row['symbol']} | {row['token_address']} | "
+            f"base {fmt_pct(row['baseline_pnl'])} {row['baseline_reason']} max={fmt_pct(row['baseline_max'])} | "
+            f"{row['variant']} {fmt_pct(row['shadow_pnl'])} {row['shadow_reason']} max={fmt_pct(row['shadow_max'])} | "
+            f"delta {fmt_pct(row['delta'])}"
+        )
+
+
+def print_details(summaries: List[Dict[str, Any]], limit: int) -> None:
+    for item in summaries:
+        details = [
+            row
+            for row in item.get("details", [])
+            if row.get("delta") is not None
+        ]
+        worst = sorted(
+            [row for row in details if row["delta"] <= -3.0],
+            key=lambda row: row["delta"],
+        )
+        runner_cuts = sorted(
+            [
+                row
+                for row in details
+                if (row.get("baseline_max") or 0.0) >= 30.0
+                and (row.get("shadow_max") or 0.0) + 1.0 < (row.get("baseline_max") or 0.0)
+            ],
+            key=lambda row: (row.get("shadow_max") or 0.0) - (row.get("baseline_max") or 0.0),
+        )
+        best = sorted(
+            [row for row in details if row["delta"] >= 10.0],
+            key=lambda row: row["delta"],
+            reverse=True,
+        )
+        print()
+        print(f"# Details {item['variant']}")
+        print_detail_section("Piores deltas <= -3pp", worst, limit)
+        print_detail_section("Possiveis runners podados: baseline max >=30 e shadow max menor", runner_cuts, limit)
+        print_detail_section("Maiores melhoras >= +10pp", best, limit)
 
 
 def main() -> None:
@@ -152,6 +224,8 @@ def main() -> None:
     parser.add_argument("--shadow-file", type=Path, default=DEFAULT_SHADOW_FILE)
     parser.add_argument("--since", type=str, default=None)
     parser.add_argument("--last", type=int, default=0)
+    parser.add_argument("--details", action="store_true", help="Mostra piores deltas, runners podados e maiores melhoras por variante.")
+    parser.add_argument("--details-limit", type=int, default=30)
     args = parser.parse_args()
 
     baseline = load_json(args.baseline_file, [])
@@ -161,24 +235,26 @@ def main() -> None:
     baseline_by_key = {trade_key(row): row for row in baseline}
     shadows_by_variant: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in shadow:
-        if trade_key(row) in baseline_by_key:
-            shadows_by_variant[str(row.get("variant") or "unknown")].append(row)
+        shadows_by_variant[str(row.get("variant") or "unknown")].append(row)
 
     print("# ABB Shadow Variants Report")
     print("criterio=50 pares; maior pnl_sum se vencer baseline; runner_kills <= baseline; worst_shadow >= worst_baseline - 3pp")
-    print("variant | pairs | baseline_sum | shadow_sum | delta_sum | base_avg | shadow_avg | delta_med | runners base/shadow | exits base/shadow | worst base/shadow | worst_guard | promove")
+    print("variant | pairs | unpaired | baseline_sum | shadow_sum | delta_sum | base_avg | shadow_avg | delta_med | runners base/shadow | exits base/shadow | worst base/shadow | worst_guard | promove")
     summaries = []
     for variant, rows in sorted(shadows_by_variant.items()):
         if args.last > 0:
             rows = rows[-args.last:]
-        paired_baseline = [baseline_by_key[trade_key(row)] for row in rows if trade_key(row) in baseline_by_key]
-        paired_shadow = [row for row in rows if trade_key(row) in baseline_by_key]
-        summaries.append(summarize_variant(variant, paired_baseline, paired_shadow))
+        paired = [
+            (baseline_by_key[trade_key(row)], row)
+            for row in rows
+            if trade_key(row) in baseline_by_key
+        ]
+        summaries.append(summarize_variant(variant, paired, unpaired_count=len(rows) - len(paired)))
 
     summaries.sort(key=lambda item: item["delta_sum"] if item["delta_sum"] is not None else float("-inf"), reverse=True)
     for item in summaries:
         print(
-            f"{item['variant']} | {item['pairs']} | {fmt_pct(item['baseline_sum'])} | "
+            f"{item['variant']} | {item['pairs']} | {item['unpaired']} | {fmt_pct(item['baseline_sum'])} | "
             f"{fmt_pct(item['shadow_sum'])} | {fmt_pct(item['delta_sum'])} | "
             f"{fmt_pct(item['baseline_avg'])} | {fmt_pct(item['shadow_avg'])} | "
             f"{fmt_pct(item['delta_median'])} | "
@@ -188,6 +264,8 @@ def main() -> None:
             f"{'sim' if item['worst_guard_ok'] else 'nao'} | "
             f"{'SIM' if item['promote_ok'] else 'nao'}"
         )
+    if args.details:
+        print_details(summaries, args.details_limit)
 
 
 if __name__ == "__main__":
