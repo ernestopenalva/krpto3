@@ -8,7 +8,7 @@ import json
 import math
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -53,6 +53,8 @@ class Arm:
     adaptive_k: float = 1.0
     adaptive_min_pct: float = 2.0
     adaptive_max_pct: Optional[float] = 8.0
+    trailing_persist_seconds: float = 3.0
+    stop_persist_seconds: float = 0.0
 
 
 @dataclass
@@ -287,6 +289,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
     stop_price = entry_price * 0.95
     best_lock_pct = 0.0
     trailing_condition_started_at: Optional[datetime] = None
+    stop_condition_started_at: Optional[datetime] = None
     band_fallback = False
     max_pnl = 0.0
     timeline: List[Dict[str, Any]] = []
@@ -321,22 +324,45 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                 )
 
         if current_pnl <= -5.0:
-            return finish_result(
-                trade,
-                arm,
-                source,
-                rows,
-                row,
-                "STOP_LOSS",
-                current_pnl,
-                max_pnl,
-                band_fallback,
-                timeline,
-                tolerance_values,
-                min_threshold_distance_pct,
-                max_persist_seconds,
-                has_real_band_data,
-            )
+            if arm.stop_persist_seconds <= 0:
+                return finish_result(
+                    trade,
+                    arm,
+                    source,
+                    rows,
+                    row,
+                    "STOP_LOSS",
+                    current_pnl,
+                    max_pnl,
+                    band_fallback,
+                    timeline,
+                    tolerance_values,
+                    min_threshold_distance_pct,
+                    max_persist_seconds,
+                    has_real_band_data,
+                )
+            if stop_condition_started_at is None:
+                stop_condition_started_at = ts
+            stop_persist_seconds = (ts - stop_condition_started_at).total_seconds()
+            if stop_persist_seconds >= arm.stop_persist_seconds:
+                return finish_result(
+                    trade,
+                    arm,
+                    source,
+                    rows,
+                    row,
+                    "STOP_LOSS",
+                    current_pnl,
+                    max_pnl,
+                    band_fallback,
+                    timeline,
+                    tolerance_values,
+                    min_threshold_distance_pct,
+                    max_persist_seconds,
+                    has_real_band_data,
+                )
+        else:
+            stop_condition_started_at = None
 
         if best_lock_pct > 0 and price <= stop_price:
             return finish_result(
@@ -383,7 +409,7 @@ def replay_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]], source: str,
                 trailing_condition_started_at = ts
             persist_seconds = (ts - trailing_condition_started_at).total_seconds()
             max_persist_seconds = max(max_persist_seconds, persist_seconds)
-            if persist_seconds >= 3.0:
+            if persist_seconds >= arm.trailing_persist_seconds:
                 timeline.append(
                     {
                         "event": "TRAILING_EXIT",
@@ -679,8 +705,15 @@ def v2_arms() -> List[Arm]:
     ]
 
 
+def apply_persist(arms: List[Arm], trailing_seconds: float, stop_seconds: float) -> List[Arm]:
+    return [
+        replace(arm, trailing_persist_seconds=trailing_seconds, stop_persist_seconds=stop_seconds)
+        for arm in arms
+    ]
+
+
 def run_v2(args: argparse.Namespace, trades: List[Dict[str, Any]], trade_rows: List[tuple[Dict[str, Any], List[Dict[str, Any]], str]]) -> None:
-    arms = v2_arms()
+    arms = apply_persist(v2_arms(), args.trailing_persist_seconds, args.stop_persist_seconds)
     results_by_arm = {
         arm.label: [replay_trade(trade, rows, source, arm) for trade, rows, source in trade_rows]
         for arm in arms
@@ -693,7 +726,8 @@ def run_v2(args: argparse.Namespace, trades: List[Dict[str, Any]], trade_rows: L
     )
     print(
         "v2=offline | producao/config_inalteradas | ladder=current(5->1,6->3,10->5) | "
-        "persist_trailing=3s"
+        f"persist_trailing={arms[0].trailing_persist_seconds:g}s | "
+        f"persist_stop={arms[0].stop_persist_seconds:g}s"
     )
 
     print_v2_summaries(results_by_arm, "G12")
@@ -731,6 +765,18 @@ def main() -> None:
     parser.add_argument("--last", type=int, default=0)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--v2", action="store_true", help="Executa curva estendida e gaps adaptativos.")
+    parser.add_argument(
+        "--trailing-persist-seconds",
+        type=float,
+        default=3.0,
+        help="Segundos exigidos abaixo do threshold do trailing antes de sair. Use 0 para trail instantaneo.",
+    )
+    parser.add_argument(
+        "--stop-persist-seconds",
+        type=float,
+        default=0.0,
+        help="Segundos exigidos abaixo do stop loss antes de sair. Use 3 para simular as variantes S2/S3.",
+    )
     args = parser.parse_args()
 
     payload = load_json(args.closed_trades_file, [])
@@ -750,12 +796,12 @@ def main() -> None:
         run_v2(args, trades, trade_rows)
         return
 
-    arms = [
+    arms = apply_persist([
         Arm("A_baseline", "current", CURRENT_LADDER, 12.0),
         Arm("B_ladder", "proposed", PROPOSED_LADDER, 12.0),
         Arm("C_gap", "current", CURRENT_LADDER, 6.0),
         Arm("D_full", "proposed", PROPOSED_LADDER, 6.0),
-    ]
+    ], args.trailing_persist_seconds, args.stop_persist_seconds)
     results_by_arm = {
         arm.label: [replay_trade(trade, rows, source, arm) for trade, rows, source in trade_rows]
         for arm in arms
@@ -769,12 +815,18 @@ def main() -> None:
     print("# Trailing Ladder Replay")
     print(
         f"trades_fechados={len(trades)} | com_serie={len(trade_rows)} | "
-        f"fonte_shadow_habilitada={not args.no_shadow} | timezone=America/Sao_Paulo"
+        f"fonte_shadow_habilitada={not args.no_shadow} | timezone=America/Sao_Paulo | "
+        f"persist_trailing={args.trailing_persist_seconds:g}s | "
+        f"persist_stop={args.stop_persist_seconds:g}s"
     )
     print_summary("4 Bracos Principais", summaries)
 
     winning_ladder = PROPOSED_LADDER if summaries[1]["pnl_sum"] and summaries[0]["pnl_sum"] and summaries[1]["pnl_sum"] > summaries[0]["pnl_sum"] else CURRENT_LADDER
-    curve_arms = [Arm(f"curve_gap_{gap:g}", "winning_ladder", winning_ladder, gap) for gap in (6.0, 8.0, 10.0, 12.0)]
+    curve_arms = apply_persist(
+        [Arm(f"curve_gap_{gap:g}", "winning_ladder", winning_ladder, gap) for gap in (6.0, 8.0, 10.0, 12.0)],
+        args.trailing_persist_seconds,
+        args.stop_persist_seconds,
+    )
     curve_results = {
         arm.label: [replay_trade(trade, rows, source, arm) for trade, rows, source in trade_rows]
         for arm in curve_arms
