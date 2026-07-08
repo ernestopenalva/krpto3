@@ -60,6 +60,40 @@ PERCENTILES = (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
 OUTCOME_ORDER = ("RUNNER", "CRASH", "FAILED_AFTER_PROMISE", "SMALL_WIN", "NEUTRAL")
 REPORT_LABELS = ("RUNNER", "CRASH", "FAILED_AFTER_PROMISE", "SMALL_WIN")
 MIN_FEATURE_COUNT = 3
+OVERFIT_PRONE_FEATURES = {"hour_of_day", "day_of_week", "price_start_monitor", "price_entry"}
+DEX_ENTRY_FEATURES = [
+    "runup_start_to_entry_pct",
+    "pullback_pct",
+    "bounce_ratio",
+    "momentum_pct",
+    "price_change_short_pct",
+    "liquidity_usd",
+    "quote_liquidity",
+    "quote_reserve",
+    "base_reserve",
+    "market_cap",
+    "fdv",
+    "liquidity_to_marketcap",
+    "txns_recent",
+    "buys",
+    "sells",
+    "buy_pressure",
+    "volume_short",
+    "health_score",
+    "codex_score",
+    "holder_count",
+    "top_holder_pct",
+    "divergence_ds_onchain_pct",
+]
+OPERATIONAL_CONTEXT_FEATURES = {
+    "scanner_to_monitor_seconds",
+    "monitor_to_entry_seconds",
+    "hour_of_day",
+    "day_of_week",
+    "tick_frequency_per_min",
+    "avg_tick_interval_seconds",
+    "ticks_before_entry",
+}
 NUMERIC_FEATURES = [
     "scanner_to_monitor_seconds",
     "monitor_to_entry_seconds",
@@ -565,6 +599,7 @@ def threshold_record(rows: List[Dict[str, Any]], passed: List[Dict[str, Any]], r
         "feature": feature,
         "threshold": threshold,
         "rule": rule,
+        "overfit_prone": feature in OVERFIT_PRONE_FEATURES or "hour_of_day" in rule or "day_of_week" in rule,
         "trades_pass": len(passed),
         "pnl_sum": summary["pnl_sum"],
         "pnl_avg": summary["pnl_avg"],
@@ -682,8 +717,15 @@ def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> 
 
 def print_label_summary(rows: List[Dict[str, Any]]) -> None:
     counts = Counter(row.get("label_outcome") for row in rows)
+    entry_times = sorted(parse_time(row.get("entry_time")) for row in rows if parse_time(row.get("entry_time")) is not None)
     print("\n## Contagem Geral")
     print(f"trades_analisados={len(rows)} | features_suficientes={sum(1 for row in rows if row.get('features_sufficient'))}")
+    if entry_times:
+        print(
+            "periodo_entradas="
+            f"{entry_times[0].isoformat(timespec='seconds')} ate {entry_times[-1].isoformat(timespec='seconds')} "
+            "| timezone=America/Sao_Paulo"
+        )
     print("labels=" + ", ".join(f"{label}:{counts.get(label, 0)}" for label in OUTCOME_ORDER))
     entry_counts = Counter(row.get("tipo_entrada") or "-" for row in rows)
     print("tipo_entrada=" + ", ".join(f"{key}:{value}" for key, value in sorted(entry_counts.items())))
@@ -718,15 +760,63 @@ def print_feature_outcome_table(rows: List[Dict[str, Any]], limit_features: int 
         print(f"{feature} | " + " | ".join(parts))
 
 
-def is_strong_candidate(row: Dict[str, Any], baseline_pnl_sum: Optional[float]) -> bool:
+def print_dex_entry_focus(rows: List[Dict[str, Any]], thresholds: List[Dict[str, Any]], limit: int) -> None:
+    print("\n## Foco Dex/Entrada")
+    print("objetivo=features_observaveis_na_entrada_para_separar_RUNNER_de_CRASH")
+    populated = [feature for feature in DEX_ENTRY_FEATURES if len(numeric_values(rows, feature)) >= 10]
+    if not populated:
+        print("sem_features_dex_suficientes")
+        return
+
+    print("cobertura_features_dex=" + ", ".join(f"{feature}:{len(numeric_values(rows, feature))}" for feature in populated))
+    print("contraste_runner_vs_crash:")
+    for feature in populated:
+        runner_stats = feature_stats([row for row in rows if row.get("label_outcome") == "RUNNER"], feature)
+        crash_stats = feature_stats([row for row in rows if row.get("label_outcome") == "CRASH"], feature)
+        if not runner_stats["n"] or not crash_stats["n"]:
+            continue
+        runner_med = runner_stats["median"]
+        crash_med = crash_stats["median"]
+        delta = None if runner_med is None or crash_med is None else runner_med - crash_med
+        print(
+            f"- {feature}: runner_med={fmt_num(runner_med)} | crash_med={fmt_num(crash_med)} | "
+            f"delta={fmt_num(delta)} | n_runner={int(runner_stats['n'] or 0)} | n_crash={int(crash_stats['n'] or 0)}"
+        )
+
+    dex_thresholds = [
+        row
+        for row in thresholds
+        if row.get("feature") in DEX_ENTRY_FEATURES and not row.get("overfit_prone")
+    ]
+    strong_dex = [row for row in dex_thresholds if safe_float(row.get("pnl_sum")) is not None and safe_float(row.get("pnl_sum")) > 0 and safe_float(row.get("pnl_median")) is not None and safe_float(row.get("pnl_median")) > 0]
+    print("melhores_cortes_dex_exploratorios:")
+    for row in (strong_dex or dex_thresholds)[:limit]:
+        print(
+            f"- {row['rule']} | pass={row['trades_pass']} | pnl_sum={fmt_pct(safe_float(row['pnl_sum']))} | "
+            f"pnl_med={fmt_pct(safe_float(row['pnl_median']))} | runners_pres={fmt_num(safe_float(row['runners_preserved_pct']))}% | "
+            f"crashes_cut={row['crashes_cut']}"
+        )
+
+
+def is_strong_candidate(row: Dict[str, Any], baseline: Dict[str, Optional[float]]) -> bool:
     preserved = safe_float(row.get("runners_preserved_pct"))
     crashes_cut = safe_float(row.get("crashes_cut"))
+    crashes_cut_pct = safe_float(row.get("crashes_cut_pct"))
     pnl_sum = safe_float(row.get("pnl_sum"))
-    if preserved is None or crashes_cut is None or pnl_sum is None:
+    pnl_median = safe_float(row.get("pnl_median"))
+    baseline_pnl_sum = baseline.get("pnl_sum")
+    baseline_pnl_median = baseline.get("pnl_median")
+    if row.get("overfit_prone"):
         return False
-    if preserved < 70 or crashes_cut <= 0:
+    if preserved is None or crashes_cut is None or crashes_cut_pct is None or pnl_sum is None or pnl_median is None:
+        return False
+    if pnl_sum <= 0 or pnl_median <= 0:
+        return False
+    if preserved < 70 or crashes_cut <= 0 or crashes_cut_pct < 25:
         return False
     if baseline_pnl_sum is not None and pnl_sum <= baseline_pnl_sum:
+        return False
+    if baseline_pnl_median is not None and pnl_median <= baseline_pnl_median:
         return False
     return True
 
@@ -735,7 +825,8 @@ def print_threshold_summary(rows: List[Dict[str, Any]], thresholds: List[Dict[st
     print("\n## Cortes Simples E Combos")
     baseline = summarize_pnls([row for row in rows if row.get("features_sufficient")])
     print(f"baseline_features_suficientes: n={int(baseline['n'] or 0)} | pnl_sum={fmt_pct(baseline['pnl_sum'])} | pnl_med={fmt_pct(baseline['pnl_median'])}")
-    strong = [row for row in thresholds if is_strong_candidate(row, baseline["pnl_sum"])]
+    print("criterio_sinal_forte=pnl_sum>0, mediana>0, preserva>=70% runners, corta>=25% crashes, melhora baseline, exclui calendario/preco_raw")
+    strong = [row for row in thresholds if is_strong_candidate(row, baseline)]
     if strong:
         print("sinais_fortes_exploratorios:")
         for row in strong[:limit]:
@@ -748,9 +839,10 @@ def print_threshold_summary(rows: List[Dict[str, Any]], thresholds: List[Dict[st
         print("nenhum_sinal_forte_pelos_criterios_v1")
     print("top_exploratorio_por_pnl_sum:")
     for row in thresholds[:limit]:
+        marker = " | cautela=overfit" if row.get("overfit_prone") else ""
         print(
             f"- {row['rule']} | kind={row['kind']} | pass={row['trades_pass']} | pnl_sum={fmt_pct(safe_float(row['pnl_sum']))} | "
-            f"pnl_med={fmt_pct(safe_float(row['pnl_median']))} | runners_lost={row['runners_lost']} | crashes_cut={row['crashes_cut']}"
+            f"pnl_med={fmt_pct(safe_float(row['pnl_median']))} | runners_lost={row['runners_lost']} | crashes_cut={row['crashes_cut']}{marker}"
         )
 
 
@@ -813,6 +905,7 @@ def main() -> None:
         "feature",
         "threshold",
         "rule",
+        "overfit_prone",
         "trades_pass",
         "pnl_sum",
         "pnl_avg",
@@ -834,7 +927,9 @@ def main() -> None:
     print(f"thresholds_csv={args.thresholds_csv}")
     print("nota=n<100 e exploratorio; nao recomendar mudanca de producao ainda; sem ML nesta v1")
     print_label_summary(rows)
-    print_feature_outcome_table([row for row in rows if row.get("features_sufficient")])
+    sufficient_rows = [row for row in rows if row.get("features_sufficient")]
+    print_feature_outcome_table(sufficient_rows)
+    print_dex_entry_focus(sufficient_rows, thresholds, args.limit)
     print_threshold_summary(rows, thresholds, args.limit)
     print_by_entry_type(rows, thresholds, max(3, args.limit // 2))
 
