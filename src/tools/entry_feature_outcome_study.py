@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 from collections import Counter, defaultdict
@@ -160,6 +161,14 @@ def by_token(payload: Any) -> Dict[str, Dict[str, Any]]:
     return {token_key(row): row for row in rows if isinstance(row, dict) and token_key(row)}
 
 
+def by_token_with_source(payload: Any, source_file: Path) -> Dict[str, Dict[str, Any]]:
+    result = by_token(payload)
+    for row in result.values():
+        row.setdefault("_source_file", str(source_file))
+        row.setdefault("_source_line", None)
+    return result
+
+
 def nested(row: Dict[str, Any], *paths: Sequence[str]) -> Any:
     for path in paths:
         current: Any = row
@@ -241,21 +250,65 @@ def first_monitor_ticks_by_token(history_dir: Path) -> Dict[str, Dict[str, Any]]
     if not history_dir.exists():
         return result
     for path in history_dir.glob("*.jsonl"):
-        for row in iter_jsonl(path):
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                row.setdefault("_source_file", str(path))
+                row.setdefault("_source_line", line_no)
+                break
+            else:
+                continue
             token = token_key(row)
             if token:
                 result[token] = row
-            break
     return result
 
 
-def normalize_entry_type(value: Any) -> str:
+def normalize_entry_type(value: Any) -> Optional[str]:
     text = str(value or "").upper()
     if "PULLBACK" in text or "RECOVERY" in text:
         return "PULLBACK_RECOVERY"
     if "MOMENTUM" in text or text in {"MC", "MOMENTUM_CONTINUATION"}:
         return "MOMENTUM_CONTINUATION"
-    return text or "-"
+    return None
+
+
+def classify_entry_type(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for candidate in candidates:
+        raw_value = candidate.get("value")
+        if raw_value in (None, ""):
+            continue
+        normalized = normalize_entry_type(raw_value)
+        if normalized is None:
+            continue
+        raw_text = str(raw_value).strip()
+        upper = raw_text.upper()
+        exact_values = {"MOMENTUM_CONTINUATION", "PULLBACK_RECOVERY", "MC"}
+        confidence = "exact" if upper in exact_values else "inferred"
+        return {
+            "tipo_entrada": normalized,
+            "tipo_entrada_source_field": candidate.get("field") or "",
+            "tipo_entrada_raw_value": raw_text,
+            "source_file": candidate.get("source_file") or "",
+            "source_line": candidate.get("source_line"),
+            "classification_confidence": confidence,
+        }
+    return {
+        "tipo_entrada": "UNKNOWN",
+        "tipo_entrada_source_field": "",
+        "tipo_entrada_raw_value": "",
+        "source_file": "",
+        "source_line": None,
+        "classification_confidence": "unknown",
+    }
 
 
 def label_outcome(pnl_final: Optional[float], max_pnl: Optional[float]) -> str:
@@ -357,6 +410,7 @@ def build_trade_row(
     watch: Dict[str, Any],
     scanner: Dict[str, Any],
     monitor_first: Dict[str, Any],
+    closed_trades_file: Path,
 ) -> Dict[str, Any]:
     token = token_key(trade)
     source_signal = trade.get("source_signal") if isinstance(trade.get("source_signal"), dict) else {}
@@ -454,14 +508,53 @@ def build_trade_row(
                 pnls.append(((price / position_entry_price) - 1.0) * 100.0)
         min_pnl = min(pnls) if pnls else None
 
-    entry_reason = first_value(signal.get("entry_reason"), source_signal.get("entry_reason"), trade.get("entry_reason"))
+    signal_reason_raw = first_value(signal.get("entry_reason"), signal.get("reason"), signal.get("tipo_entrada"))
+    monitor_reason_raw = first_value(monitor_first.get("entry_reason"), monitor_first.get("reason"), monitor_first.get("tipo_entrada"))
+    source_signal_reason_raw = first_value(source_signal.get("entry_reason"), source_signal.get("reason"), source_signal.get("tipo_entrada"))
+    trade_reason_raw = first_value(trade.get("entry_reason"), trade.get("tipo_entrada"), trade.get("reason"))
+    entry_reason = first_value(signal_reason_raw, source_signal_reason_raw, trade_reason_raw, monitor_reason_raw)
+    entry_type_audit = classify_entry_type(
+        [
+            {
+                "value": signal_reason_raw,
+                "field": "signals.entry_reason",
+                "source_file": signal.get("_source_file"),
+                "source_line": signal.get("_source_line"),
+            },
+            {
+                "value": source_signal_reason_raw,
+                "field": "closed_trade.source_signal.entry_reason",
+                "source_file": str(closed_trades_file),
+                "source_line": None,
+            },
+            {
+                "value": trade_reason_raw,
+                "field": "closed_trade.entry_reason",
+                "source_file": str(closed_trades_file),
+                "source_line": None,
+            },
+            {
+                "value": monitor_reason_raw,
+                "field": "monitor_history.reason",
+                "source_file": monitor_first.get("_source_file"),
+                "source_line": monitor_first.get("_source_line"),
+            },
+        ]
+    )
     out = {
         "symbol": first_value(trade.get("symbol"), signal.get("symbol"), watch.get("symbol"), token[:8]),
         "token_address": token,
         "entry_time": entry_time.isoformat(timespec="seconds") if entry_time else "",
         "source": source,
-        "tipo_entrada": normalize_entry_type(entry_reason),
+        "tipo_entrada": entry_type_audit["tipo_entrada"],
+        "tipo_entrada_source_field": entry_type_audit["tipo_entrada_source_field"],
+        "tipo_entrada_raw_value": entry_type_audit["tipo_entrada_raw_value"],
         "entry_reason_raw": entry_reason or "",
+        "signal_reason_raw": signal_reason_raw or "",
+        "monitor_reason_raw": monitor_reason_raw or "",
+        "source_file": entry_type_audit["source_file"],
+        "source_line": entry_type_audit["source_line"],
+        "classification_confidence": entry_type_audit["classification_confidence"],
         "scanner_to_monitor_seconds": (monitor_time - scanner_time).total_seconds() if scanner_time and monitor_time else None,
         "monitor_to_entry_seconds": (entry_time - monitor_time).total_seconds() if entry_time and monitor_time else None,
         "hour_of_day": entry_time.hour + (entry_time.minute / 60.0) if entry_time else None,
@@ -525,7 +618,7 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if args.last > 0:
         trades = trades[-args.last :]
 
-    signals = by_token(load_json(args.signals_file, []))
+    signals = by_token_with_source(load_json(args.signals_file, []), args.signals_file)
     watchlist = normalize_watchlist(load_json(args.watchlist_file, {}))
     scanner_candidates = by_token(load_json(args.scanner_candidates_file, []))
     monitor_first = first_monitor_ticks_by_token(args.monitor_history_dir)
@@ -548,6 +641,7 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 watchlist.get(token, {}),
                 scanner_candidates.get(token, {}),
                 monitor_first.get(token, {}),
+                args.closed_trades_file,
             )
         )
     return rows_out
@@ -735,6 +829,36 @@ def print_label_summary(rows: List[Dict[str, Any]]) -> None:
         print(f"{label}: n={len(items)} | pnl_avg={fmt_pct(summary['pnl_avg'])} | pnl_med={fmt_pct(summary['pnl_median'])}")
 
 
+def print_classification_audit(rows: List[Dict[str, Any]]) -> None:
+    print("\n## Auditoria Tipo Entrada")
+    type_counts = Counter(str(row.get("tipo_entrada") or "UNKNOWN") for row in rows)
+    confidence_counts = Counter(str(row.get("classification_confidence") or "unknown") for row in rows)
+    print("contagem_tipo_entrada=" + (", ".join(f"{key}:{value}" for key, value in sorted(type_counts.items())) or "n/a"))
+    print("contagem_confidence=" + (", ".join(f"{key}:{value}" for key, value in sorted(confidence_counts.items())) or "n/a"))
+
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(str(row.get("tipo_entrada") or "UNKNOWN"), str(row.get("classification_confidence") or "unknown"))].append(row)
+
+    print("matriz_tipo_x_confidence:")
+    for (entry_type, confidence), items in sorted(grouped.items()):
+        summary = summarize_pnls(items)
+        labels = Counter(str(row.get("label_outcome") or "n/a") for row in items)
+        label_text = ",".join(f"{label}:{labels.get(label, 0)}" for label in OUTCOME_ORDER if labels.get(label, 0))
+        print(
+            f"- {entry_type} x {confidence}: trades={len(items)} | "
+            f"pnl_sum={fmt_pct(summary['pnl_sum'])} | pnl_med={fmt_pct(summary['pnl_median'])} | "
+            f"labels={label_text or 'n/a'}"
+        )
+
+    risky = [row for row in rows if row.get("classification_confidence") in {"fallback", "unknown"}]
+    if risky:
+        print(
+            "ALERTA: ha trades com classification_confidence fallback/unknown; "
+            "nao concluir sobre MC/Pullback antes de auditar essas linhas."
+        )
+
+
 def print_feature_outcome_table(rows: List[Dict[str, Any]], limit_features: int = 18) -> None:
     print("\n## Features Por Outcome")
     populated = sorted(
@@ -859,6 +983,68 @@ def print_by_entry_type(rows: List[Dict[str, Any]], thresholds: List[Dict[str, A
             print(f"- {row['rule']} | pass={row['trades_pass']} | pnl_sum={fmt_pct(safe_float(row['pnl_sum']))} | runners_lost={row['runners_lost']} | crashes_cut={row['crashes_cut']}")
 
 
+def print_manual_sample(rows: List[Dict[str, Any]], entry_type: str, limit: int = 30) -> None:
+    print(f"\n## Amostra Manual {entry_type}")
+    selected = sorted(
+        [row for row in rows if row.get("tipo_entrada") == entry_type],
+        key=lambda row: parse_time(row.get("entry_time")) or datetime.min.replace(tzinfo=BRASILIA),
+    )[:limit]
+    if not selected:
+        print("sem_trades")
+        return
+    print("symbol | entry_time | pnl_final | max_pnl | exit_reason | raw | confidence | source_file")
+    for row in selected:
+        print(
+            f"{row.get('symbol') or '-'} | {row.get('entry_time') or '-'} | "
+            f"{fmt_pct(safe_float(row.get('pnl_final')))} | {fmt_pct(safe_float(row.get('max_pnl')))} | "
+            f"{row.get('exit_reason') or '-'} | {row.get('tipo_entrada_raw_value') or '-'} | "
+            f"{row.get('classification_confidence') or '-'} | {row.get('source_file') or '-'}"
+        )
+
+
+def print_historical_comparison(args: argparse.Namespace) -> None:
+    print("\n## Comparacao Historica Disponivel")
+    candidates = []
+    studies_dir = PROJECT_ROOT / "data" / "studies"
+    if studies_dir.exists():
+        for path in studies_dir.rglob("*.csv"):
+            if path.resolve() == args.trades_csv.resolve():
+                continue
+            try:
+                with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    fieldnames = set(reader.fieldnames or [])
+                    if "tipo_entrada" not in fieldnames:
+                        continue
+                    pnl_field = "pnl_final" if "pnl_final" in fieldnames else "abb_pnl" if "abb_pnl" in fieldnames else None
+                    if pnl_field is None:
+                        continue
+                    rows = list(reader)
+            except OSError:
+                continue
+            groups: Dict[str, List[float]] = defaultdict(list)
+            for row in rows:
+                entry_type = str(row.get("tipo_entrada") or row.get("entry_reason") or "UNKNOWN")
+                pnl = safe_float(row.get(pnl_field))
+                if pnl is not None:
+                    groups[entry_type].append(pnl)
+            if groups:
+                candidates.append((path, pnl_field, groups))
+
+    if not candidates:
+        print("nenhum_csv_historico_estruturado_com_tipo_entrada_e_pnl_encontrado_em_data/studies")
+        print("nota=para comparar com a fase antiga, precisamos de output antigo com tipo_entrada e pnl pareavel.")
+        return
+
+    for path, pnl_field, groups in candidates:
+        print(f"{path} | pnl_field={pnl_field}")
+        for entry_type, values in sorted(groups.items(), key=lambda item: len(item[1]), reverse=True):
+            print(
+                f"- {entry_type}: trades={len(values)} | pnl_sum={fmt_pct(sum(values))} | "
+                f"pnl_avg={fmt_pct(mean(values) if values else None)} | pnl_med={fmt_pct(median(values) if values else None)}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Estudo offline de features de entrada versus outcomes do ABB/S3.")
     parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_ABB_CLOSED_TRADES_FILE)
@@ -885,7 +1071,14 @@ def main() -> None:
         "entry_time",
         "source",
         "tipo_entrada",
+        "tipo_entrada_source_field",
+        "tipo_entrada_raw_value",
         "entry_reason_raw",
+        "signal_reason_raw",
+        "monitor_reason_raw",
+        "source_file",
+        "source_line",
+        "classification_confidence",
         *NUMERIC_FEATURES,
         "exit_reason",
         "label_outcome",
@@ -927,11 +1120,15 @@ def main() -> None:
     print(f"thresholds_csv={args.thresholds_csv}")
     print("nota=n<100 e exploratorio; nao recomendar mudanca de producao ainda; sem ML nesta v1")
     print_label_summary(rows)
+    print_classification_audit(rows)
     sufficient_rows = [row for row in rows if row.get("features_sufficient")]
     print_feature_outcome_table(sufficient_rows)
     print_dex_entry_focus(sufficient_rows, thresholds, args.limit)
     print_threshold_summary(rows, thresholds, args.limit)
     print_by_entry_type(rows, thresholds, max(3, args.limit // 2))
+    print_historical_comparison(args)
+    print_manual_sample(rows, "MOMENTUM_CONTINUATION")
+    print_manual_sample(rows, "PULLBACK_RECOVERY")
 
 
 if __name__ == "__main__":
