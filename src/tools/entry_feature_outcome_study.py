@@ -10,6 +10,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -47,7 +48,25 @@ DEFAULT_SIGNALS_FILE = PROJECT_ROOT / "data" / "token_monitor" / "buy_signals.js
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "studies" / "entry_feature_outcome"
 DEFAULT_TRADES_CSV = DEFAULT_OUTPUT_DIR / "trades.csv"
 DEFAULT_THRESHOLDS_CSV = DEFAULT_OUTPUT_DIR / "thresholds.csv"
+DEFAULT_TEMPORAL_CSV = DEFAULT_OUTPUT_DIR / "temporal_by_entry_type.csv"
+DEFAULT_GIT_TIMELINE_CSV = DEFAULT_OUTPUT_DIR / "git_timeline.csv"
 
+S1_ARM = Arm(
+    "S1_gap4",
+    "current",
+    CURRENT_LADDER,
+    trailing_gap_pct=4.0,
+    trailing_persist_seconds=3.0,
+    stop_persist_seconds=0.0,
+)
+S2_ARM = Arm(
+    "S2_stop_persist3",
+    "current",
+    CURRENT_LADDER,
+    trailing_gap_pct=12.0,
+    trailing_persist_seconds=3.0,
+    stop_persist_seconds=3.0,
+)
 S3_ARM = Arm(
     "S3_gap4_stop_persist3",
     "current",
@@ -56,6 +75,7 @@ S3_ARM = Arm(
     trailing_persist_seconds=3.0,
     stop_persist_seconds=3.0,
 )
+OUTCOME_ARMS = (S1_ARM, S2_ARM, S3_ARM)
 
 PERCENTILES = (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
 OUTCOME_ORDER = ("RUNNER", "CRASH", "FAILED_AFTER_PROMISE", "SMALL_WIN", "NEUTRAL")
@@ -214,6 +234,8 @@ def percentile(values: Sequence[float], pct: float) -> Optional[float]:
 def parse_since_until(rows: List[Dict[str, Any]], since: Optional[str], until: Optional[str]) -> List[Dict[str, Any]]:
     since_dt = parse_time(since)
     until_dt = parse_time(until)
+    if until_dt is not None and until and len(until.strip()) == 10:
+        until_dt = until_dt + timedelta(days=1) - timedelta(microseconds=1)
     if since_dt is None and until_dt is None:
         return rows
     result = []
@@ -404,6 +426,7 @@ def price_in_usd(native_or_usd_price: Optional[float], source: str, source_signa
 def build_trade_row(
     trade: Dict[str, Any],
     replay: Any,
+    replay_by_arm: Dict[str, Any],
     rows: List[Dict[str, Any]],
     source: str,
     signal: Dict[str, Any],
@@ -593,6 +616,15 @@ def build_trade_row(
         "chain": first_value(trade.get("chain_id"), source_signal.get("chain_id"), entry_snapshot.get("chain_id")),
         "dex": first_value(trade.get("dex_id"), source_signal.get("dex_id"), source_signal.get("dexId"), entry_snapshot.get("dex_id")),
         "pnl_final": pnl_final,
+        "outcome_original_pnl": safe_float(trade.get("pnl_pct")),
+        "outcome_original_exit_reason": trade.get("exit_reason") or "",
+        "outcome_original_max_pnl": safe_float(trade.get("max_profit_pct")),
+        "outcome_S1_gap4_pnl": safe_float(getattr(replay_by_arm.get(S1_ARM.label), "exit_pnl_pct", None)),
+        "outcome_S1_gap4_exit_reason": getattr(replay_by_arm.get(S1_ARM.label), "exit_reason", "") or "",
+        "outcome_S2_persist3_pnl": safe_float(getattr(replay_by_arm.get(S2_ARM.label), "exit_pnl_pct", None)),
+        "outcome_S2_persist3_exit_reason": getattr(replay_by_arm.get(S2_ARM.label), "exit_reason", "") or "",
+        "outcome_S3_gap4_persist3_pnl": pnl_final,
+        "outcome_S3_gap4_persist3_exit_reason": getattr(replay, "exit_reason", "") or "",
         "exit_reason": getattr(replay, "exit_reason", "") or trade.get("exit_reason") or "",
         "max_pnl": max_pnl,
         "giveback": giveback,
@@ -630,11 +662,13 @@ def build_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
         if not rows:
             continue
         replay = replay_trade(trade, rows, source, S3_ARM)
+        replay_by_arm = {arm.label: replay_trade(trade, rows, source, arm) for arm in OUTCOME_ARMS}
         token = token_key(trade)
         rows_out.append(
             build_trade_row(
                 trade,
                 replay,
+                replay_by_arm,
                 rows,
                 source,
                 signals.get(token, {}),
@@ -1045,6 +1079,247 @@ def print_historical_comparison(args: argparse.Namespace) -> None:
             )
 
 
+def median_or_none(values: List[float]) -> Optional[float]:
+    return median(values) if values else None
+
+
+def avg_or_none(values: List[float]) -> Optional[float]:
+    return mean(values) if values else None
+
+
+def window_bounds(entry_time: datetime, mode: str, window_days: int) -> Tuple[datetime, datetime]:
+    day_start = entry_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    if mode == "weekly":
+        start = day_start - timedelta(days=day_start.weekday())
+        return start, start + timedelta(days=7)
+    if mode == "ndays":
+        anchor = datetime(1970, 1, 1, tzinfo=entry_time.tzinfo)
+        days_since_anchor = (day_start.date() - anchor.date()).days
+        start = anchor + timedelta(days=(days_since_anchor // max(1, window_days)) * max(1, window_days))
+        return start, start + timedelta(days=max(1, window_days))
+    return day_start, day_start + timedelta(days=1)
+
+
+def summarize_temporal_group(window_start: datetime, window_end: datetime, entry_type: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    pnls = numeric_values(items, "pnl_final")
+    max_pnls = numeric_values(items, "max_pnl")
+    time_in_position = numeric_values(items, "time_in_position_seconds")
+    monitor_to_entry = numeric_values(items, "monitor_to_entry_seconds")
+    runups = numeric_values(items, "runup_start_to_entry_pct")
+    liquidity = numeric_values(items, "liquidity_usd")
+    buy_pressure = numeric_values(items, "buy_pressure")
+    labels = Counter(str(row.get("label_outcome") or "NEUTRAL") for row in items)
+    return {
+        "window_start": window_start.isoformat(timespec="seconds"),
+        "window_end": window_end.isoformat(timespec="seconds"),
+        "tipo_entrada": entry_type,
+        "n": len(items),
+        "pnl_sum": sum(pnls) if pnls else None,
+        "pnl_avg": avg_or_none(pnls),
+        "pnl_med": median_or_none(pnls),
+        "win_rate": (sum(1 for pnl in pnls if pnl > 0) / len(pnls) * 100.0) if pnls else None,
+        "runners": labels.get("RUNNER", 0),
+        "crashes": labels.get("CRASH", 0),
+        "failed_after_promise": labels.get("FAILED_AFTER_PROMISE", 0),
+        "small_win": labels.get("SMALL_WIN", 0),
+        "neutral": labels.get("NEUTRAL", 0),
+        "avg_max_pnl": avg_or_none(max_pnls),
+        "med_max_pnl": median_or_none(max_pnls),
+        "avg_time_in_position": avg_or_none(time_in_position),
+        "med_monitor_to_entry_seconds": median_or_none(monitor_to_entry),
+        "med_runup_start_to_entry_pct": median_or_none(runups),
+        "med_liquidity_usd": median_or_none(liquidity),
+        "med_buy_pressure": median_or_none(buy_pressure),
+    }
+
+
+def build_temporal_records(rows: List[Dict[str, Any]], mode: str, window_days: int) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    bounds: Dict[Tuple[str, str], Tuple[datetime, datetime]] = {}
+    for row in rows:
+        entry_dt = parse_time(row.get("entry_time"))
+        if entry_dt is None:
+            continue
+        start, end = window_bounds(entry_dt, mode, window_days)
+        window_key = start.isoformat(timespec="seconds")
+        entry_type = str(row.get("tipo_entrada") or "UNKNOWN")
+        grouped[(window_key, end.isoformat(timespec="seconds"), entry_type)].append(row)
+        bounds[(window_key, end.isoformat(timespec="seconds"))] = (start, end)
+
+    records = []
+    for (start_key, end_key, entry_type), items in sorted(grouped.items()):
+        start, end = bounds[(start_key, end_key)]
+        records.append(summarize_temporal_group(start, end, entry_type, items))
+    return records
+
+
+def summarize_window_total(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    labels = Counter(str(row.get("label_outcome") or "NEUTRAL") for row in items)
+    pnls = numeric_values(items, "pnl_final")
+    return {
+        "total_trades": len(items),
+        "pnl_sum": sum(pnls) if pnls else None,
+        "pnl_med": median_or_none(pnls),
+        "win_rate": (sum(1 for pnl in pnls if pnl > 0) / len(pnls) * 100.0) if pnls else None,
+        "RUNNER": labels.get("RUNNER", 0),
+        "CRASH": labels.get("CRASH", 0),
+        "FAILED_AFTER_PROMISE": labels.get("FAILED_AFTER_PROMISE", 0),
+        "SMALL_WIN": labels.get("SMALL_WIN", 0),
+    }
+
+
+def read_git_timeline(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+def commits_near(path: Path, target: datetime, hours: int = 48) -> List[Dict[str, Any]]:
+    commits = []
+    for row in read_git_timeline(path):
+        commit_dt = parse_time(row.get("date"))
+        if commit_dt is None:
+            continue
+        delta_hours = abs((commit_dt - target).total_seconds()) / 3600.0
+        if delta_hours <= hours:
+            row = dict(row)
+            row["_delta_hours"] = delta_hours
+            commits.append(row)
+    return sorted(commits, key=lambda row: row.get("_delta_hours", 9999))
+
+
+def print_temporal_report(rows: List[Dict[str, Any]], temporal_records: List[Dict[str, Any]], args: argparse.Namespace) -> None:
+    print("# Entry Feature Outcome Temporal Compare")
+    print(f"window={args.window} | window_days={args.window_days} | outcome_primary={S3_ARM.label}")
+    print(f"temporal_csv={args.temporal_csv}")
+    print("criterio=localizar quando a curva de MC mudou; nao concluir que MC e ruim por uma janela recente.")
+
+    rows_by_window: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        entry_dt = parse_time(row.get("entry_time"))
+        if entry_dt is None:
+            continue
+        start, _end = window_bounds(entry_dt, args.window, args.window_days)
+        rows_by_window[start.isoformat(timespec="seconds")].append(row)
+
+    records_by_window_type = {
+        (record["window_start"], record["tipo_entrada"]): record
+        for record in temporal_records
+    }
+    for window_start in sorted(rows_by_window):
+        items = rows_by_window[window_start]
+        entry_dt = parse_time(window_start)
+        if entry_dt is None:
+            continue
+        start, end = window_bounds(entry_dt, args.window, args.window_days)
+        total = summarize_window_total(items)
+        print(
+            f"\n{start.isoformat(timespec='seconds')} ate {end.isoformat(timespec='seconds')} | "
+            f"trades={total['total_trades']} | pnl_sum={fmt_pct(total['pnl_sum'])} | "
+            f"pnl_med={fmt_pct(total['pnl_med'])} | win={fmt_num(total['win_rate'])}% | "
+            f"RUNNER={total['RUNNER']} CRASH={total['CRASH']} FAILED={total['FAILED_AFTER_PROMISE']} SMALL_WIN={total['SMALL_WIN']}"
+        )
+        for entry_type in ("MOMENTUM_CONTINUATION", "PULLBACK_RECOVERY", "UNKNOWN"):
+            record = records_by_window_type.get((window_start, entry_type))
+            if not record:
+                continue
+            print(
+                f"- {entry_type}: n={record['n']} | pnl_sum={fmt_pct(safe_float(record['pnl_sum']))} | "
+                f"pnl_med={fmt_pct(safe_float(record['pnl_med']))} | runners={record['runners']} | crashes={record['crashes']}"
+            )
+
+    print_turning_points(temporal_records, args.git_timeline_csv)
+    print_outcome_comparison_by_window(rows, args)
+
+
+def print_turning_points(temporal_records: List[Dict[str, Any]], git_timeline_csv: Path) -> None:
+    print("\n## Turning Point Candidates MC")
+    mc_records = [
+        record for record in temporal_records
+        if record.get("tipo_entrada") == "MOMENTUM_CONTINUATION" and int(record.get("n") or 0) > 0
+    ]
+    if len(mc_records) < 2:
+        print("dados_insuficientes")
+        return
+    previous = None
+    found = False
+    for record in sorted(mc_records, key=lambda row: row["window_start"]):
+        if previous is None:
+            previous = record
+            continue
+        prev_n = int(previous.get("n") or 0)
+        cur_n = int(record.get("n") or 0)
+        prev_med = safe_float(previous.get("pnl_med"))
+        cur_med = safe_float(record.get("pnl_med"))
+        prev_sum = safe_float(previous.get("pnl_sum"))
+        cur_sum = safe_float(record.get("pnl_sum"))
+        prev_crash_rate = (int(previous.get("crashes") or 0) / prev_n * 100.0) if prev_n else None
+        cur_crash_rate = (int(record.get("crashes") or 0) / cur_n * 100.0) if cur_n else None
+        prev_runner_rate = (int(previous.get("runners") or 0) / prev_n * 100.0) if prev_n else None
+        cur_runner_rate = (int(record.get("runners") or 0) / cur_n * 100.0) if cur_n else None
+        reasons = []
+        if prev_med is not None and cur_med is not None and prev_med >= 0 > cur_med:
+            reasons.append("mediana_pos_para_neg")
+        if prev_sum is not None and cur_sum is not None and prev_sum >= 0 > cur_sum:
+            reasons.append("pnl_sum_pos_para_neg")
+        if prev_crash_rate is not None and cur_crash_rate is not None and cur_crash_rate - prev_crash_rate >= 25:
+            reasons.append("crash_rate_saltou")
+        if prev_runner_rate is not None and cur_runner_rate is not None and prev_runner_rate - cur_runner_rate >= 25:
+            reasons.append("runner_rate_caiu")
+        if reasons:
+            found = True
+            print(
+                f"- {record['window_start']} | motivos={','.join(reasons)} | "
+                f"prev_pnl={fmt_pct(prev_sum)} med={fmt_pct(prev_med)} crash={fmt_num(prev_crash_rate)}% runner={fmt_num(prev_runner_rate)}% | "
+                f"cur_pnl={fmt_pct(cur_sum)} med={fmt_pct(cur_med)} crash={fmt_num(cur_crash_rate)}% runner={fmt_num(cur_runner_rate)}%"
+            )
+            target = parse_time(record.get("window_start"))
+            if target is not None:
+                nearby = commits_near(git_timeline_csv, target, hours=48)
+                if nearby:
+                    print("  commits_proximos_48h:")
+                    for commit in nearby[:8]:
+                        print(
+                            f"  - {commit.get('date')} {commit.get('hash')} {commit.get('subject')} "
+                            f"| files={commit.get('files_changed')}"
+                        )
+                elif git_timeline_csv.exists():
+                    print("  commits_proximos_48h=nenhum")
+        previous = record
+    if not found:
+        print("nenhum_turning_point_simples_detectado")
+
+
+def print_outcome_comparison_by_window(rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
+    print("\n## Outcomes Disponiveis Por Janela E Tipo")
+    outcome_fields = [
+        ("original", "outcome_original_pnl"),
+        ("S1_gap4", "outcome_S1_gap4_pnl"),
+        ("S2_persist3", "outcome_S2_persist3_pnl"),
+        ("S3_gap4_persist3", "outcome_S3_gap4_persist3_pnl"),
+    ]
+    rows_by_window_type: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        entry_dt = parse_time(row.get("entry_time"))
+        if entry_dt is None:
+            continue
+        start, _end = window_bounds(entry_dt, args.window, args.window_days)
+        rows_by_window_type[(start.isoformat(timespec="seconds"), str(row.get("tipo_entrada") or "UNKNOWN"))].append(row)
+    for (window_start, entry_type), items in sorted(rows_by_window_type.items()):
+        parts = []
+        for label, field in outcome_fields:
+            values = numeric_values(items, field)
+            if values:
+                parts.append(f"{label}={fmt_pct(sum(values))}/med={fmt_pct(median(values))}")
+            else:
+                parts.append(f"{label}=indisponivel")
+        print(f"- {window_start} | {entry_type} | n={len(items)} | " + " | ".join(parts))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Estudo offline de features de entrada versus outcomes do ABB/S3.")
     parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_ABB_CLOSED_TRADES_FILE)
@@ -1057,14 +1332,18 @@ def main() -> None:
     parser.add_argument("--signals-file", type=Path, default=DEFAULT_SIGNALS_FILE)
     parser.add_argument("--trades-csv", type=Path, default=DEFAULT_TRADES_CSV)
     parser.add_argument("--thresholds-csv", type=Path, default=DEFAULT_THRESHOLDS_CSV)
+    parser.add_argument("--temporal-csv", type=Path, default=DEFAULT_TEMPORAL_CSV)
+    parser.add_argument("--git-timeline-csv", type=Path, default=DEFAULT_GIT_TIMELINE_CSV)
     parser.add_argument("--since", type=str, default=None)
     parser.add_argument("--until", type=str, default=None)
     parser.add_argument("--last", type=int, default=0)
     parser.add_argument("--limit", type=int, default=12)
+    parser.add_argument("--compare-windows", action="store_true")
+    parser.add_argument("--window", choices=("daily", "weekly", "ndays"), default="daily")
+    parser.add_argument("--window-days", type=int, default=7)
     args = parser.parse_args()
 
     rows = build_rows(args)
-    thresholds = build_thresholds(rows)
     trade_fields = [
         "symbol",
         "token_address",
@@ -1080,6 +1359,15 @@ def main() -> None:
         "source_line",
         "classification_confidence",
         *NUMERIC_FEATURES,
+        "outcome_original_pnl",
+        "outcome_original_exit_reason",
+        "outcome_original_max_pnl",
+        "outcome_S1_gap4_pnl",
+        "outcome_S1_gap4_exit_reason",
+        "outcome_S2_persist3_pnl",
+        "outcome_S2_persist3_exit_reason",
+        "outcome_S3_gap4_persist3_pnl",
+        "outcome_S3_gap4_persist3_exit_reason",
         "exit_reason",
         "label_outcome",
         "features_numeric_count",
@@ -1093,6 +1381,37 @@ def main() -> None:
         "freeze_authority_disabled",
         "ds_stale_or_frozen",
     ]
+    write_csv(args.trades_csv, rows, trade_fields)
+
+    if args.compare_windows:
+        temporal_records = build_temporal_records(rows, args.window, args.window_days)
+        temporal_fields = [
+            "window_start",
+            "window_end",
+            "tipo_entrada",
+            "n",
+            "pnl_sum",
+            "pnl_avg",
+            "pnl_med",
+            "win_rate",
+            "runners",
+            "crashes",
+            "failed_after_promise",
+            "small_win",
+            "neutral",
+            "avg_max_pnl",
+            "med_max_pnl",
+            "avg_time_in_position",
+            "med_monitor_to_entry_seconds",
+            "med_runup_start_to_entry_pct",
+            "med_liquidity_usd",
+            "med_buy_pressure",
+        ]
+        write_csv(args.temporal_csv, temporal_records, temporal_fields)
+        print_temporal_report(rows, temporal_records, args)
+        return
+
+    thresholds = build_thresholds(rows)
     threshold_fields = [
         "kind",
         "feature",
@@ -1110,7 +1429,6 @@ def main() -> None:
         "crashes_cut_pct",
         "runners_lost",
     ]
-    write_csv(args.trades_csv, rows, trade_fields)
     write_csv(args.thresholds_csv, thresholds, threshold_fields)
 
     print("# Entry Feature Outcome Study")
