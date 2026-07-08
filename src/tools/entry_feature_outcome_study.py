@@ -50,6 +50,7 @@ DEFAULT_TRADES_CSV = DEFAULT_OUTPUT_DIR / "trades.csv"
 DEFAULT_THRESHOLDS_CSV = DEFAULT_OUTPUT_DIR / "thresholds.csv"
 DEFAULT_TEMPORAL_CSV = DEFAULT_OUTPUT_DIR / "temporal_by_entry_type.csv"
 DEFAULT_GIT_TIMELINE_CSV = DEFAULT_OUTPUT_DIR / "git_timeline.csv"
+DEFAULT_RUNNER_CRASH_CSV = DEFAULT_OUTPUT_DIR / "runner_crash_feature_contrast.csv"
 
 S1_ARM = Arm(
     "S1_gap4",
@@ -115,6 +116,35 @@ OPERATIONAL_CONTEXT_FEATURES = {
     "avg_tick_interval_seconds",
     "ticks_before_entry",
 }
+RUNNER_CRASH_FOCUS_FEATURES = [
+    "runup_start_to_entry_pct",
+    "pullback_pct",
+    "bounce_ratio",
+    "momentum_pct",
+    "price_change_short_pct",
+    "liquidity_usd",
+    "quote_liquidity",
+    "quote_reserve",
+    "base_reserve",
+    "market_cap",
+    "fdv",
+    "liquidity_to_marketcap",
+    "txns_recent",
+    "buys",
+    "sells",
+    "buy_pressure",
+    "volume_short",
+    "tick_frequency_per_min",
+    "avg_tick_interval_seconds",
+    "ticks_before_entry",
+    "monitor_to_entry_seconds",
+    "scanner_to_monitor_seconds",
+    "health_score",
+    "codex_score",
+    "holder_count",
+    "top_holder_pct",
+    "divergence_ds_onchain_pct",
+]
 NUMERIC_FEATURES = [
     "scanner_to_monitor_seconds",
     "monitor_to_entry_seconds",
@@ -956,6 +986,187 @@ def print_dex_entry_focus(rows: List[Dict[str, Any]], thresholds: List[Dict[str,
         )
 
 
+def unique_preserving_order(values: Sequence[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def ratio_or_none(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def runner_crash_threshold_candidate(rows: List[Dict[str, Any]], feature: str) -> Dict[str, Any]:
+    values = numeric_values(rows, feature)
+    if len(set(values)) < 2:
+        return {}
+    total_runners = sum(1 for row in rows if row.get("label_outcome") == "RUNNER")
+    total_crashes = sum(1 for row in rows if row.get("label_outcome") == "CRASH")
+    if not total_runners or not total_crashes:
+        return {}
+
+    candidates: List[Dict[str, Any]] = []
+    for pct in PERCENTILES:
+        threshold = percentile(values, pct)
+        if threshold is None:
+            continue
+        for op in (">=", "<="):
+            if op == ">=":
+                passed = [row for row in rows if safe_float(row.get(feature)) is not None and safe_float(row.get(feature)) >= threshold]
+            else:
+                passed = [row for row in rows if safe_float(row.get(feature)) is not None and safe_float(row.get(feature)) <= threshold]
+            summary = summarize_pnls(passed)
+            pass_runners = sum(1 for row in passed if row.get("label_outcome") == "RUNNER")
+            pass_crashes = sum(1 for row in passed if row.get("label_outcome") == "CRASH")
+            runners_preserved_pct = pass_runners / total_runners * 100.0
+            crashes_cut_pct = (total_crashes - pass_crashes) / total_crashes * 100.0
+            runners_lost_pct = 100.0 - runners_preserved_pct
+            # The score favors crash removal only when it does not pay for it by discarding many runners.
+            score = crashes_cut_pct - (runners_lost_pct * 1.25)
+            candidates.append(
+                {
+                    "best_rule": f"{feature} {op} {fmt_num(threshold)}",
+                    "best_threshold_percentile": f"p{int(pct * 100)}",
+                    "best_trades_pass": len(passed),
+                    "best_pnl_sum": summary["pnl_sum"],
+                    "best_pnl_median": summary["pnl_median"],
+                    "best_win_rate": summary["win_rate"],
+                    "best_runners_preserved": pass_runners,
+                    "best_runners_preserved_pct": runners_preserved_pct,
+                    "best_crashes_cut": total_crashes - pass_crashes,
+                    "best_crashes_cut_pct": crashes_cut_pct,
+                    "best_runners_lost": total_runners - pass_runners,
+                    "_score": score,
+                }
+            )
+    if not candidates:
+        return {}
+    return max(
+        candidates,
+        key=lambda row: (
+            safe_float(row.get("_score")) or -10**12,
+            safe_float(row.get("best_pnl_median")) or -10**12,
+            safe_float(row.get("best_pnl_sum")) or -10**12,
+        ),
+    )
+
+
+def signal_strength(record: Dict[str, Any], min_group_n: int) -> str:
+    runner_n = int(record.get("runner_n") or 0)
+    crash_n = int(record.get("crash_n") or 0)
+    preserved = safe_float(record.get("best_runners_preserved_pct"))
+    crashes_cut = safe_float(record.get("best_crashes_cut_pct"))
+    pnl_median = safe_float(record.get("best_pnl_median"))
+    if runner_n < min_group_n or crash_n < min_group_n:
+        return "low_n"
+    if preserved is None or crashes_cut is None:
+        return "no_threshold"
+    if preserved >= 70 and crashes_cut >= 35 and pnl_median is not None and pnl_median > 0:
+        return "strong_exploratory"
+    if preserved >= 70 and crashes_cut >= 25:
+        return "watch"
+    return "weak"
+
+
+def build_runner_crash_contrasts(rows: List[Dict[str, Any]], min_group_n: int) -> List[Dict[str, Any]]:
+    rows = [row for row in rows if row.get("features_sufficient")]
+    scopes: List[Tuple[str, str, List[Dict[str, Any]]]] = [("ALL", "ALL", rows)]
+    for entry_type in ("MOMENTUM_CONTINUATION", "PULLBACK_RECOVERY"):
+        scopes.append((entry_type, entry_type, [row for row in rows if row.get("tipo_entrada") == entry_type]))
+
+    records: List[Dict[str, Any]] = []
+    for scope, entry_type, scope_rows in scopes:
+        if not scope_rows:
+            continue
+        for feature in unique_preserving_order(RUNNER_CRASH_FOCUS_FEATURES):
+            runner_rows = [row for row in scope_rows if row.get("label_outcome") == "RUNNER" and safe_float(row.get(feature)) is not None]
+            crash_rows = [row for row in scope_rows if row.get("label_outcome") == "CRASH" and safe_float(row.get(feature)) is not None]
+            runner_stats = feature_stats(runner_rows, feature)
+            crash_stats = feature_stats(crash_rows, feature)
+            runner_med = runner_stats["median"]
+            crash_med = crash_stats["median"]
+            if runner_stats["n"] == 0 or crash_stats["n"] == 0:
+                continue
+
+            threshold = runner_crash_threshold_candidate(scope_rows, feature)
+            record: Dict[str, Any] = {
+                "scope": scope,
+                "tipo_entrada": entry_type,
+                "feature": feature,
+                "feature_n": len(numeric_values(scope_rows, feature)),
+                "runner_n": int(runner_stats["n"] or 0),
+                "runner_median": runner_med,
+                "runner_p25": runner_stats["p25"],
+                "runner_p75": runner_stats["p75"],
+                "crash_n": int(crash_stats["n"] or 0),
+                "crash_median": crash_med,
+                "crash_p25": crash_stats["p25"],
+                "crash_p75": crash_stats["p75"],
+                "median_delta_runner_minus_crash": None if runner_med is None or crash_med is None else runner_med - crash_med,
+                "median_ratio_runner_over_crash": ratio_or_none(runner_med, crash_med),
+                "runner_direction": "higher" if runner_med is not None and crash_med is not None and runner_med > crash_med else "lower_or_equal",
+            }
+            for key, value in threshold.items():
+                if key != "_score":
+                    record[key] = value
+            record["signal_strength"] = signal_strength(record, min_group_n)
+            records.append(record)
+
+    strength_rank = {"strong_exploratory": 0, "watch": 1, "weak": 2, "low_n": 3, "no_threshold": 4}
+    records.sort(
+        key=lambda row: (
+            strength_rank.get(str(row.get("signal_strength")), 9),
+            -(safe_float(row.get("best_crashes_cut_pct")) or 0),
+            -(safe_float(row.get("best_runners_preserved_pct")) or 0),
+            -(abs(safe_float(row.get("median_delta_runner_minus_crash")) or 0)),
+        )
+    )
+    return records
+
+
+def print_runner_crash_focus(records: List[Dict[str, Any]], csv_path: Path, limit: int) -> None:
+    print("\n## Runner Vs Crash - Features De Entrada")
+    print(f"runner_crash_csv={csv_path}")
+    print("criterio=contraste por tipo de entrada; exploratorio; nao aplicar em producao sem validacao fora da amostra")
+    if not records:
+        print("sem_contrastes_runner_crash_suficientes")
+        return
+
+    by_scope: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_scope[str(record.get("scope") or "ALL")].append(record)
+
+    for scope in ("ALL", "MOMENTUM_CONTINUATION", "PULLBACK_RECOVERY"):
+        items = by_scope.get(scope, [])
+        if not items:
+            continue
+        print(f"\n{scope}:")
+        shown = 0
+        for record in items:
+            if record.get("signal_strength") == "low_n" and shown >= max(3, limit // 3):
+                continue
+            print(
+                f"- {record['feature']} | strength={record.get('signal_strength')} | "
+                f"runner_med={fmt_num(safe_float(record.get('runner_median')))} n={record.get('runner_n')} | "
+                f"crash_med={fmt_num(safe_float(record.get('crash_median')))} n={record.get('crash_n')} | "
+                f"delta={fmt_num(safe_float(record.get('median_delta_runner_minus_crash')))} | "
+                f"best={record.get('best_rule') or '-'} | "
+                f"pres_runner={fmt_num(safe_float(record.get('best_runners_preserved_pct')))}% | "
+                f"corta_crash={fmt_num(safe_float(record.get('best_crashes_cut_pct')))}% | "
+                f"pnl_med_pass={fmt_pct(safe_float(record.get('best_pnl_median')))}"
+            )
+            shown += 1
+            if shown >= limit:
+                break
+
+
 def is_strong_candidate(row: Dict[str, Any], baseline: Dict[str, Optional[float]]) -> bool:
     preserved = safe_float(row.get("runners_preserved_pct"))
     crashes_cut = safe_float(row.get("crashes_cut"))
@@ -1334,6 +1545,8 @@ def main() -> None:
     parser.add_argument("--thresholds-csv", type=Path, default=DEFAULT_THRESHOLDS_CSV)
     parser.add_argument("--temporal-csv", type=Path, default=DEFAULT_TEMPORAL_CSV)
     parser.add_argument("--git-timeline-csv", type=Path, default=DEFAULT_GIT_TIMELINE_CSV)
+    parser.add_argument("--runner-crash-csv", type=Path, default=DEFAULT_RUNNER_CRASH_CSV)
+    parser.add_argument("--runner-crash-min-n", type=int, default=3)
     parser.add_argument("--since", type=str, default=None)
     parser.add_argument("--until", type=str, default=None)
     parser.add_argument("--last", type=int, default=0)
@@ -1412,6 +1625,7 @@ def main() -> None:
         return
 
     thresholds = build_thresholds(rows)
+    runner_crash_records = build_runner_crash_contrasts(rows, args.runner_crash_min_n)
     threshold_fields = [
         "kind",
         "feature",
@@ -1430,18 +1644,50 @@ def main() -> None:
         "runners_lost",
     ]
     write_csv(args.thresholds_csv, thresholds, threshold_fields)
+    runner_crash_fields = [
+        "scope",
+        "tipo_entrada",
+        "feature",
+        "feature_n",
+        "runner_n",
+        "runner_median",
+        "runner_p25",
+        "runner_p75",
+        "crash_n",
+        "crash_median",
+        "crash_p25",
+        "crash_p75",
+        "median_delta_runner_minus_crash",
+        "median_ratio_runner_over_crash",
+        "runner_direction",
+        "best_rule",
+        "best_threshold_percentile",
+        "best_trades_pass",
+        "best_pnl_sum",
+        "best_pnl_median",
+        "best_win_rate",
+        "best_runners_preserved",
+        "best_runners_preserved_pct",
+        "best_crashes_cut",
+        "best_crashes_cut_pct",
+        "best_runners_lost",
+        "signal_strength",
+    ]
+    write_csv(args.runner_crash_csv, runner_crash_records, runner_crash_fields)
 
     print("# Entry Feature Outcome Study")
     print("modo=offline | producao/config/monitor/position_inalterados")
     print(f"outcome={S3_ARM.label} | timezone=America/Sao_Paulo")
     print(f"trades_csv={args.trades_csv}")
     print(f"thresholds_csv={args.thresholds_csv}")
+    print(f"runner_crash_csv={args.runner_crash_csv}")
     print("nota=n<100 e exploratorio; nao recomendar mudanca de producao ainda; sem ML nesta v1")
     print_label_summary(rows)
     print_classification_audit(rows)
     sufficient_rows = [row for row in rows if row.get("features_sufficient")]
     print_feature_outcome_table(sufficient_rows)
     print_dex_entry_focus(sufficient_rows, thresholds, args.limit)
+    print_runner_crash_focus(runner_crash_records, args.runner_crash_csv, args.limit)
     print_threshold_summary(rows, thresholds, args.limit)
     print_by_entry_type(rows, thresholds, max(3, args.limit // 2))
     print_historical_comparison(args)
