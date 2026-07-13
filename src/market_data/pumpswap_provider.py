@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from .alchemy_prices_provider import AlchemyPricesProvider
 from .provider import MarketDataProvider
 from .solana_rpc import SolanaRpcClient
 from .types import MarketContext, MarketDataUnavailableError, MarketTick
@@ -14,6 +15,7 @@ from .types import MarketContext, MarketDataUnavailableError, MarketTick
 SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEiB8LQnQjJp2MRXKx4dqq"
 PUMPSWAP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
 BASE_MINT_OFFSET = 43
 QUOTE_MINT_OFFSET = 75
 LP_MINT_OFFSET = 107
@@ -46,8 +48,14 @@ class PoolLayout:
 class OnChainPumpSwapProvider(MarketDataProvider):
     source = "onchain_pumpswap"
 
-    def __init__(self, rpc_url: str, timeout_seconds: int = 15) -> None:
+    def __init__(
+        self,
+        rpc_url: str,
+        timeout_seconds: int = 15,
+        usd_prices: Optional[AlchemyPricesProvider] = None,
+    ) -> None:
         self.rpc = SolanaRpcClient(rpc_url=rpc_url, timeout_seconds=timeout_seconds)
+        self.usd_prices = usd_prices
 
     def get_position_tick(self, context: MarketContext) -> Optional[MarketTick]:
         return self.get_pool_tick(context)
@@ -82,6 +90,13 @@ class OnChainPumpSwapProvider(MarketDataProvider):
             return self._unresolved_tick(
                 context,
                 "pool_mint_mismatch",
+                slot=slot,
+                raw={"pool_layout": self._pool_layout_to_raw(pool_layout)},
+            )
+        if self.usd_prices is not None and pool_layout.quote_mint != WRAPPED_SOL_MINT:
+            return self._unresolved_tick(
+                context,
+                "unsupported_usd_quote_mint",
                 slot=slot,
                 raw={"pool_layout": self._pool_layout_to_raw(pool_layout)},
             )
@@ -120,14 +135,37 @@ class OnChainPumpSwapProvider(MarketDataProvider):
 
         price_native_decimal = quote_vault.amount / base_vault.amount
         liquidity_native_decimal = quote_vault.amount * Decimal("2")
+        price_usd: Optional[float] = None
+        sol_usd_raw: Optional[Dict[str, Any]] = None
+        if self.usd_prices is not None:
+            try:
+                sol_usd = self.usd_prices.get_usd_price("SOL")
+            except MarketDataUnavailableError as exc:
+                return self._unresolved_tick(
+                    context,
+                    "sol_usd_unavailable",
+                    slot=slot,
+                    raw={
+                        "detail": str(exc),
+                        "base_reserve": str(base_vault.amount),
+                        "quote_reserve": str(quote_vault.amount),
+                    },
+                )
+            price_usd = float(price_native_decimal) * sol_usd.value
+            sol_usd_raw = {
+                "value": sol_usd.value,
+                "source": sol_usd.source,
+                "last_updated_at": sol_usd.last_updated_at,
+                "age_seconds": sol_usd.age_seconds,
+            }
 
         return MarketTick(
             timestamp=self._now_iso(),
             source=self.source,
             symbol=context.symbol,
             token_address=context.token_address,
-            price=None,
-            price_usd=None,
+            price=price_usd,
+            price_usd=price_usd,
             price_native=float(price_native_decimal),
             liquidity_usd=None,
             dex_id=context.dex_id or "pumpswap",
@@ -141,6 +179,7 @@ class OnChainPumpSwapProvider(MarketDataProvider):
                 "base_reserve": str(base_vault.amount),
                 "quote_reserve": str(quote_vault.amount),
                 "liquidity_native": str(liquidity_native_decimal),
+                "sol_usd": sol_usd_raw,
                 "base_vault": self._vault_to_raw(base_vault),
                 "quote_vault": self._vault_to_raw(quote_vault),
             },

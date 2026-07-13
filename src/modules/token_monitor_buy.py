@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -18,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.project_env import load_project_env
+from src.modules.position_monitor_abb import AbbPositionMonitor
 
 load_project_env()
 
@@ -34,8 +34,6 @@ CFG = CONFIG.get("token_monitor_buy", {})
 ENTRY_CFG = CFG.get("entry", {})
 MOMENTUM_CFG = CFG.get("momentum_entry", {})
 POSITION_CFG = CONFIG.get("position_monitor", {})
-SHADOW_CFG = CONFIG.get("shadow_monitor", {})
-ABB_POSITION_CFG = CONFIG.get("abb_position", {})
 
 
 # =========================
@@ -49,18 +47,14 @@ HISTORY_DIR = OUTPUT_DIR / "history"
 BUY_SIGNALS_FILE = OUTPUT_DIR / "buy_signals.json"
 STATUS_FILE = OUTPUT_DIR / "monitor_status.json"
 PROCESSED_TOKENS_FILE = OUTPUT_DIR / "processed_tokens.json"
-SHADOW_WATCHLIST_FILE = OUTPUT_DIR / "shadow_watchlist.json"
-SHADOW_WATCHLIST_LOCK_FILE = OUTPUT_DIR / "shadow_watchlist.lock"
 WATCHLIST_FILE = Path("data/watchlist/watchlist.json")
 OPEN_POSITIONS_FILE = Path(POSITION_CFG.get("output_dir", "data/position_monitor")) / "open_positions.json"
-POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor.py"
-ABB_POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor_abb.py"
+POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor_abb.py"
 LOGS_DIR = PROJECT_ROOT / "logs"
 
 POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
 MAX_MONITORING_MINUTES = CFG.get("max_monitoring_minutes", 15)
 MAX_MONITORED_TOKENS = CFG.get("max_monitored_tokens", 5)
-SHADOW_MONITOR_ENABLED = SHADOW_CFG.get("enabled", CFG.get("shadow_monitor_enabled", False))
 RATE_LIMIT_BACKOFF_SECONDS = CFG.get("backoff_on_rate_limit_seconds", 10)
 
 DECISION_WINDOW_MINUTES = CFG.get("decision_window_minutes", 5)
@@ -90,6 +84,7 @@ MOMENTUM_MIN_TICKS_BEFORE_DECISION = max(2, int(MOMENTUM_CFG.get(
     MIN_TICKS_BEFORE_DECISION,
 )))
 MOMENTUM_MIN_MOMENTUM_PCT = MOMENTUM_CFG.get("min_momentum_pct", 15.0)
+MOMENTUM_MAX_RUNUP_PCT = float(MOMENTUM_CFG.get("max_runup_pct", 12.0))
 MOMENTUM_MAX_PULLBACK_FROM_PEAK_PCT = MOMENTUM_CFG.get("max_pullback_from_peak_pct", 3.0)
 MOMENTUM_MIN_LIQUIDITY_GROWTH_PCT = MOMENTUM_CFG.get("min_liquidity_growth_pct", 0.0)
 MOMENTUM_MAX_LIQUIDITY_DROP_PCT = MOMENTUM_CFG.get("max_liquidity_drop_pct", 5.0)
@@ -197,7 +192,10 @@ def can_open_position(max_positions: int) -> bool:
     return len(open_positions) < max_positions
 
 
-def dispatch_position_monitor(token_address: str) -> None:
+def dispatch_position_monitor(token_address: str) -> bool:
+    position_monitor = AbbPositionMonitor()
+    if not position_monitor.open_position_for_token(token_address):
+        return False
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOGS_DIR / f"position_{datetime.now().strftime('%Y-%m-%d')}.txt"
     with log_file.open("a", encoding="utf-8") as log_handle:
@@ -214,28 +212,8 @@ def dispatch_position_monitor(token_address: str) -> None:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+    return True
 
-
-def dispatch_abb_position_monitor(token_address: str) -> None:
-    if not bool(ABB_POSITION_CFG.get("enabled", False)):
-        return
-
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOGS_DIR / f"position_abb_{datetime.now().strftime('%Y-%m-%d')}.txt"
-    with log_file.open("a", encoding="utf-8") as log_handle:
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-u",
-                str(ABB_POSITION_MONITOR_SCRIPT),
-                "--token",
-                token_address,
-            ],
-            cwd=PROJECT_ROOT,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
 
 def append_jsonl(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,94 +283,6 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-# =========================
-# EXPERIMENTO GRAIL
-# Funcionalidade temporária para coleta de dados.
-# Pode ser removida após conclusão do estudo.
-# =========================
-
-@contextmanager
-def shadow_watchlist_lock():
-    SHADOW_WATCHLIST_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.time() + 0.5
-
-    while True:
-        try:
-            descriptor = os.open(SHADOW_WATCHLIST_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(descriptor)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - SHADOW_WATCHLIST_LOCK_FILE.stat().st_mtime > 30:
-                    SHADOW_WATCHLIST_LOCK_FILE.unlink(missing_ok=True)
-                    continue
-            except FileNotFoundError:
-                continue
-            if time.time() >= deadline:
-                raise TimeoutError("shadow watchlist ocupada")
-            time.sleep(0.01)
-
-    try:
-        yield
-    finally:
-        SHADOW_WATCHLIST_LOCK_FILE.unlink(missing_ok=True)
-
-
-def should_start_shadow_monitoring(reason: Optional[str]) -> bool:
-    if not reason:
-        return False
-
-    normalized_reason = reason.lower()
-    return (
-        "pullback fora da faixa" in normalized_reason
-        or "tempo maximo de monitoramento atingido sem sinal" in normalized_reason
-    )
-
-
-def add_to_shadow_watchlist(
-    candidate: Dict[str, Any],
-    tick: Optional[Dict[str, Any]],
-    reason: Optional[str],
-) -> None:
-    if not SHADOW_MONITOR_ENABLED or not tick or not should_start_shadow_monitoring(reason):
-        return
-
-    with shadow_watchlist_lock():
-        shadow_watchlist = load_json(SHADOW_WATCHLIST_FILE, default={})
-        if not isinstance(shadow_watchlist, dict):
-            shadow_watchlist = {}
-
-        token_address = candidate["token_address"]
-        if token_address in shadow_watchlist:
-            return
-
-        shadow_watchlist[token_address] = {
-            "token_address": token_address,
-            "symbol": candidate.get("symbol"),
-            "chain_id": candidate.get("chain_id"),
-            "pair_address": candidate.get("pair_address"),
-            "timestamp_descarte": tick["timestamp"],
-            "preco_descarte": tick["price_usd"],
-            "liquidity_descarte": tick["liquidity_usd"],
-            "buy_pressure_descarte": tick["buy_pressure"],
-            "motivo_descarte": reason,
-        }
-        save_json_atomic(SHADOW_WATCHLIST_FILE, shadow_watchlist)
-
-    print(f"[SHADOW] {candidate.get('symbol', token_address[:6])} adicionado ao monitoramento observacional.")
-
-
-def safely_add_to_shadow_watchlist(
-    candidate: Dict[str, Any],
-    tick: Optional[Dict[str, Any]],
-    reason: Optional[str],
-) -> None:
-    try:
-        add_to_shadow_watchlist(candidate, tick, reason)
-    except Exception as exc:
-        print(f"[SHADOW][ERRO] Falha ao adicionar token: {exc}")
 
 
 # =========================
@@ -721,6 +611,9 @@ def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, A
         "entry_reason": "MOMENTUM_CONTINUATION",
         "motivo_entrada": "momentum_continuation",
         "runup_since_first_tick_pct": runup_since_first_tick_pct,
+        "runup_start_to_entry_pct": runup_since_first_tick_pct,
+        "price_start_monitor": first_price,
+        "price_entry_candidate": current_price,
         "pullback_from_peak_pct": pullback_from_peak_pct,
         "liquidity_growth_pct": liquidity_growth_pct,
         "liquidity_drop_pct": liquidity_drop_pct,
@@ -745,6 +638,15 @@ def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, A
         return {"entry": False, "reason": "buy pressure insuficiente para momentum", "metrics": metrics}
     if price_falling_blocked:
         return {"entry": False, "reason": "preço caindo na janela de momentum", "metrics": metrics}
+    if runup_since_first_tick_pct > MOMENTUM_MAX_RUNUP_PCT:
+        return {
+            "entry": False,
+            "blocked": True,
+            "block_reason": "MC_RUNUP_TOO_EXTENDED",
+            "reason": "MC_RUNUP_TOO_EXTENDED",
+            "entry_reason": "MOMENTUM_CONTINUATION",
+            "metrics": metrics,
+        }
 
     return {
         "entry": True,
@@ -759,6 +661,8 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         momentum = evaluate_momentum_continuation(history)
         if momentum.get("entry"):
             return momentum
+        if momentum.get("blocked"):
+            return momentum
         return {
             "entry": False,
             "reason": "histórico insuficiente"
@@ -772,6 +676,8 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if len(prices) < PULLBACK_MIN_TICKS_BEFORE_DECISION:
         momentum = evaluate_momentum_continuation(history)
         if momentum.get("entry"):
+            return momentum
+        if momentum.get("blocked"):
             return momentum
         return {
             "entry": False,
@@ -834,6 +740,8 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not pullback_ok:
         momentum = evaluate_momentum_continuation(history)
         if momentum.get("entry"):
+            return momentum
+        if momentum.get("blocked"):
             return momentum
         return {
             "entry": False,
@@ -1013,7 +921,6 @@ def monitor() -> None:
     print("[INFO] Modo: PAPER / sem compra real.")
 
     started_at = time.time()
-    latest_ticks = {}
     invalid_price_ticks: Dict[str, int] = {}
 
     def persist_monitor_status() -> None:
@@ -1040,7 +947,6 @@ def monitor() -> None:
                     candidate["discard_reason"] = reason
                     update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
                     register_processed_token(candidate, "descartado_monitor", reason)
-                    safely_add_to_shadow_watchlist(candidate, latest_ticks.get(candidate["token_address"]), reason)
                     print(f"[DESCARTE] {candidate['symbol']}: {reason}")
             break
 
@@ -1068,8 +974,6 @@ def monitor() -> None:
                 )
                 continue
 
-            latest_ticks[candidate["token_address"]] = tick
-
             history_file = HISTORY_DIR / f"{candidate['symbol']}_{candidate['token_address'][:8]}.jsonl"
             append_jsonl(history_file, tick)
 
@@ -1088,16 +992,37 @@ def monitor() -> None:
                 f"{evaluation.get('reason')}"
             )
 
+            if evaluation.get("blocked"):
+                metrics = evaluation.get("metrics") or {}
+                print(
+                    f"[{tick['timestamp']}] [ENTRY BLOCK] "
+                    f"symbol={candidate['symbol']} | token_address={candidate['token_address']} | "
+                    f"block_reason={evaluation.get('block_reason')} | "
+                    f"feature=runup_start_to_entry_pct | "
+                    f"value={metrics.get('runup_start_to_entry_pct')} | limit={MOMENTUM_MAX_RUNUP_PCT} | "
+                    f"price_start_monitor={metrics.get('price_start_monitor')} | "
+                    f"price_entry_candidate={metrics.get('price_entry_candidate')}"
+                )
+                continue
+
             if evaluation.get("discard"):
                 candidate["status"] = "discarded"
                 candidate["discard_reason"] = evaluation.get("reason")
                 update_watchlist_status(candidate["token_address"], "descartado_monitor", candidate["discard_reason"])
                 register_processed_token(candidate, "descartado_monitor", candidate["discard_reason"])
-                safely_add_to_shadow_watchlist(candidate, tick, candidate["discard_reason"])
                 print(f"[DESCARTE] {candidate['symbol']}: {candidate['discard_reason']}")
                 continue
 
             if evaluation.get("entry") and not candidate["signal_emitted"]:
+                metrics = evaluation.setdefault("metrics", {})
+                valid_prices = [item.get("price_usd") for item in history if is_valid_price(item.get("price_usd"))]
+                if valid_prices:
+                    metrics.setdefault("price_start_monitor", valid_prices[0])
+                    metrics.setdefault("price_entry_candidate", tick["price_usd"])
+                    metrics.setdefault(
+                        "runup_start_to_entry_pct",
+                        ((tick["price_usd"] / valid_prices[0]) - 1) * 100,
+                    )
                 max_open_positions = int(POSITION_CFG.get("max_open_positions", 2))
                 if not can_open_position(max_open_positions):
                     reason = f"limite de posições abertas atingido ({max_open_positions})"
@@ -1112,8 +1037,17 @@ def monitor() -> None:
                     continue
 
                 register_buy_signal(candidate, tick, evaluation)
-                dispatch_position_monitor(candidate["token_address"])
-                dispatch_abb_position_monitor(candidate["token_address"])
+                if not dispatch_position_monitor(candidate["token_address"]):
+                    reason = "POSITION_ONCHAIN_ENTRY_UNAVAILABLE"
+                    candidate["status"] = "discarded"
+                    candidate["discard_reason"] = reason
+                    update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
+                    register_processed_token(candidate, "descartado_monitor", reason)
+                    print(
+                        f"[SINAL SEM POSICAO] {candidate['symbol']} | token_address={candidate['token_address']} | "
+                        f"block_reason={reason} | provider=onchain_pumpswap+alchemy_prices"
+                    )
+                    continue
                 update_watchlist_status(candidate["token_address"], "comprado", evaluation.get("reason"))
                 register_processed_token(candidate, "comprado", evaluation.get("reason"))
                 candidate["signal_emitted"] = True

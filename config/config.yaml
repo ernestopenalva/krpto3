@@ -51,7 +51,6 @@ token_monitor_buy:
   poll_interval_seconds: 5
   max_monitoring_minutes: 15
   max_monitored_tokens: 5
-  shadow_monitor_minutes: 60
   backoff_on_rate_limit_seconds: 10
 
   decision_window_minutes: 5
@@ -61,6 +60,7 @@ token_monitor_buy:
     enabled: true
     min_ticks_before_decision: 3
     min_momentum_pct: 4.0
+    max_runup_pct: 12.0
     max_pullback_from_peak_pct: 3.0
     min_liquidity_growth_pct: 0.0
     max_liquidity_drop_pct: 5.0
@@ -87,80 +87,24 @@ token_monitor_buy:
 position_monitor:
   enabled: true
   mode: PAPER
+  source: onchain_usd
+  provider: pumpswap
+  sol_usd_provider: alchemy_prices
   input_file: "data/token_monitor/buy_signals.json"
   output_dir: "data/position_monitor"
 
   poll_interval_seconds: 1
   max_open_positions: 2
-  backoff_on_rate_limit_seconds: 1
-  staleness_threshold_pct: 2.0  # descarta se preço caiu mais de X% desde o sinal
-
-  liquidity_exit:
-    enabled: true
-    drop_from_open_pct: 8.0
-    drop_from_peak_pct: 12.0
-    window_ticks: 2
-    max_pnl_for_exit_pct: 3.0
-
-  stop_loss_pct: 5
-  breakeven_trigger_pct: 3
-  breakeven_profit_pct: 1
-  trailing_stop_pct: 4
-
-  profit_lock_steps:
-    - trigger_pct: 3
-      lock_pct: 1
-    - trigger_pct: 6
-      lock_pct: 3
-    - trigger_pct: 10
-      lock_pct: 5
-
-  collect_metrics:
-    volume_m5: true
-    liquidity_usd: true
-    buy_pressure: true
-
-  onchain_audit:
-    enabled: true
-    provider: pumpswap
-    timeout_seconds: 15
-    write_global_file: true
-    candidates:
-      be5_baseline:
-        enabled: true
-        stop_loss_pct: 5
-        persist_stop_seconds: 5
-        breakeven_trigger_pct: 5
-        trailing_gap_pct: 12
-        persist_seconds: 3
-        arm_persist_seconds: 0
-        hard_instant_threshold_pct: 10
-
-    hybrid_dex_gate:
-      enabled: true
-      candidate_name: hybrid_dex_gate
-      dex_arm_pct: 2
-      onchain_stop_pct: 5
-      onchain_disarm_pct: 2
-      disable_after_dex_breakeven: true
-
-abb_position:
-  enabled: true
-  source: onchain
-  provider: pumpswap
-  output_dir: "data/position_monitor_abb"
-  poll_interval_seconds: 1
   timeout_seconds: 15
-
+  sol_usd_cache_seconds: 60
+  sol_usd_max_staleness_seconds: 120
   stop_loss_pct: 5
-  hard_instant_threshold_pct: 10
   breakeven_trigger_pct: 5
-  trailing_gap_pct: 12
-  profit_lock_enabled: true
-
-  persist_stop_seconds: 5
+  trailing_gap_pct: 4
+  persist_stop_seconds: 3
   persist_seconds: 3
   arm_persist_seconds: 0
+  profit_lock_enabled: true
 
   adaptive_breathing_band:
     enabled: true
@@ -172,31 +116,11 @@ abb_position:
     trailing_persist_seconds: 3
     initial_breathing_pct:
 
-  shadow_variants:
-    enabled: true
-    promotion_rule: "50 trades pareados; maior PnL somado se vencer ABB atual, nao matar mais runners, e nenhum trade perder mais que 3pp alem do pior trade do baseline"
-    variants:
-      - name: S1_gap4
-        trailing_gap_pct: 4
-        persist_stop_seconds: 0
-      - name: S2_stop_persist3
-        trailing_gap_pct: 12
-        persist_stop_seconds: 3
-      - name: S3_gap4_stop_persist3
-        trailing_gap_pct: 4
-        persist_stop_seconds: 3
-
   abb_window_seconds: 120
   abb_multiplier: 0.5
   abb_min_pct: 2.0
   abb_max_pct: 8.0
   abb_fallback: reserve_ratio
-
-shadow_monitor:
-  enabled: false
-  poll_interval_seconds: 10
-  max_active_tokens: 5
-  backoff_on_rate_limit_seconds: 30
 
 position_sizing:
   mode: fixed_fake_usd

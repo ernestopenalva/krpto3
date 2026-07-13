@@ -177,6 +177,12 @@ class PositionMonitor:
         position_cfg = self.config.get("position_monitor", {})
         sizing_cfg = self.config.get("position_sizing", {})
 
+        if str(position_cfg.get("source", "dexscreener")).lower() == "onchain_usd":
+            raise RuntimeError(
+                "Position Dexscreener legado desativado. "
+                "Use src/modules/position_monitor_abb.py para o runtime oficial ABB/S3."
+            )
+
         self.enabled = bool(position_cfg.get("enabled", True))
         self.mode = str(position_cfg.get("mode", "PAPER")).upper()
         self.poll_interval_seconds = int(position_cfg.get("poll_interval_seconds", 15))

@@ -73,6 +73,23 @@ def filter_since(rows: List[Dict[str, Any]], since: Optional[str]) -> List[Dict[
     return filtered
 
 
+def row_time(row: Dict[str, Any]) -> datetime:
+    return (
+        parse_time(row.get("entry_time"))
+        or parse_time(row.get("exit_time"))
+        or datetime.max.replace(tzinfo=BRASILIA)
+    )
+
+
+def variant_sort_key(name: str) -> Tuple[int, str]:
+    order = {
+        "S1_gap4": 1,
+        "S2_stop_persist3": 2,
+        "S3_gap4_stop_persist3": 3,
+    }
+    return order.get(name, 99), name
+
+
 def runners_mortos(rows: List[Dict[str, Any]]) -> int:
     return sum(
         1
@@ -218,6 +235,102 @@ def print_details(summaries: List[Dict[str, Any]], limit: int) -> None:
         print_detail_section("Maiores melhoras >= +10pp", best, limit)
 
 
+def print_summary_table(summaries: List[Dict[str, Any]]) -> None:
+    print(
+        "variant | pairs | unpaired | baseline_sum | shadow_sum | delta_sum | "
+        "base_avg | shadow_avg | delta_med | runners base/shadow | exits base/shadow | "
+        "worst base/shadow | worst_guard | promove"
+    )
+    for item in summaries:
+        print(
+            f"{item['variant']} | {item['pairs']} | {item['unpaired']} | {fmt_pct(item['baseline_sum'])} | "
+            f"{fmt_pct(item['shadow_sum'])} | {fmt_pct(item['delta_sum'])} | "
+            f"{fmt_pct(item['baseline_avg'])} | {fmt_pct(item['shadow_avg'])} | "
+            f"{fmt_pct(item['delta_median'])} | "
+            f"{item['baseline_runner_kills']}/{item['shadow_runner_kills']} | "
+            f"{item['baseline_exit_counts']}/{item['shadow_exit_counts']} | "
+            f"{fmt_pct(item['baseline_worst'])}/{fmt_pct(item['shadow_worst'])} | "
+            f"{'sim' if item['worst_guard_ok'] else 'nao'} | "
+            f"{'SIM' if item['promote_ok'] else 'nao'}"
+        )
+
+
+def build_summaries(
+    baseline_by_key: Dict[Tuple[str, str], Dict[str, Any]],
+    shadows_by_variant: Dict[str, List[Dict[str, Any]]],
+    last: int = 0,
+) -> List[Dict[str, Any]]:
+    summaries = []
+    for variant, rows in sorted(shadows_by_variant.items(), key=lambda item: variant_sort_key(item[0])):
+        rows = sorted(rows, key=row_time)
+        if last > 0:
+            rows = rows[-last:]
+        paired = [
+            (baseline_by_key[trade_key(row)], row)
+            for row in rows
+            if trade_key(row) in baseline_by_key
+        ]
+        summaries.append(summarize_variant(variant, paired, unpaired_count=len(rows) - len(paired)))
+    summaries.sort(key=lambda item: item["delta_sum"] if item["delta_sum"] is not None else float("-inf"), reverse=True)
+    return summaries
+
+
+def print_evolution(
+    baseline_rows: List[Dict[str, Any]],
+    baseline_by_key: Dict[Tuple[str, str], Dict[str, Any]],
+    shadows_by_variant: Dict[str, List[Dict[str, Any]]],
+    step: int,
+    last: int,
+) -> None:
+    shadow_by_variant_key: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+    shadow_keys = set()
+    for variant, rows in shadows_by_variant.items():
+        by_key = {trade_key(row): row for row in rows}
+        shadow_by_variant_key[variant] = by_key
+        shadow_keys.update(by_key)
+
+    ordered_keys = [
+        trade_key(row)
+        for row in sorted(baseline_rows, key=row_time)
+        if trade_key(row) in shadow_keys
+    ]
+    if last > 0:
+        ordered_keys = ordered_keys[-last:]
+    if not ordered_keys:
+        print("\n## Evolucao")
+        print("sem_pares")
+        return
+
+    step = max(1, step)
+    checkpoints = list(range(step, len(ordered_keys) + 1, step))
+    if checkpoints[-1] != len(ordered_keys):
+        checkpoints.append(len(ordered_keys))
+
+    print("\n## Evolucao Por Pares Fechados")
+    print(
+        "checkpoint | variant | pairs | unpaired | baseline_sum | shadow_sum | delta_sum | "
+        "base_avg | shadow_avg | runners base/shadow | worst base/shadow | promove"
+    )
+    for checkpoint in checkpoints:
+        selected_keys = ordered_keys[:checkpoint]
+        for variant in sorted(shadow_by_variant_key, key=variant_sort_key):
+            variant_rows = shadow_by_variant_key[variant]
+            pairs = [
+                (baseline_by_key[key], variant_rows[key])
+                for key in selected_keys
+                if key in baseline_by_key and key in variant_rows
+            ]
+            summary = summarize_variant(variant, pairs, unpaired_count=len(selected_keys) - len(pairs))
+            print(
+                f"{checkpoint} | {summary['variant']} | {summary['pairs']} | {summary['unpaired']} | "
+                f"{fmt_pct(summary['baseline_sum'])} | {fmt_pct(summary['shadow_sum'])} | "
+                f"{fmt_pct(summary['delta_sum'])} | {fmt_pct(summary['baseline_avg'])} | "
+                f"{fmt_pct(summary['shadow_avg'])} | {summary['baseline_runner_kills']}/{summary['shadow_runner_kills']} | "
+                f"{fmt_pct(summary['baseline_worst'])}/{fmt_pct(summary['shadow_worst'])} | "
+                f"{'SIM' if summary['promote_ok'] else 'nao'}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Resume variantes shadow do ABB com criterio pre-registrado.")
     parser.add_argument("--baseline-file", type=Path, default=DEFAULT_BASELINE_FILE)
@@ -226,6 +339,8 @@ def main() -> None:
     parser.add_argument("--last", type=int, default=0)
     parser.add_argument("--details", action="store_true", help="Mostra piores deltas, runners podados e maiores melhoras por variante.")
     parser.add_argument("--details-limit", type=int, default=30)
+    parser.add_argument("--evolution", action="store_true", help="Mostra checkpoints acumulados por pares fechados.")
+    parser.add_argument("--evolution-step", type=int, default=10)
     args = parser.parse_args()
 
     baseline = load_json(args.baseline_file, [])
@@ -239,31 +354,10 @@ def main() -> None:
 
     print("# ABB Shadow Variants Report")
     print("criterio=50 pares; maior pnl_sum se vencer baseline; runner_kills <= baseline; worst_shadow >= worst_baseline - 3pp")
-    print("variant | pairs | unpaired | baseline_sum | shadow_sum | delta_sum | base_avg | shadow_avg | delta_med | runners base/shadow | exits base/shadow | worst base/shadow | worst_guard | promove")
-    summaries = []
-    for variant, rows in sorted(shadows_by_variant.items()):
-        if args.last > 0:
-            rows = rows[-args.last:]
-        paired = [
-            (baseline_by_key[trade_key(row)], row)
-            for row in rows
-            if trade_key(row) in baseline_by_key
-        ]
-        summaries.append(summarize_variant(variant, paired, unpaired_count=len(rows) - len(paired)))
-
-    summaries.sort(key=lambda item: item["delta_sum"] if item["delta_sum"] is not None else float("-inf"), reverse=True)
-    for item in summaries:
-        print(
-            f"{item['variant']} | {item['pairs']} | {item['unpaired']} | {fmt_pct(item['baseline_sum'])} | "
-            f"{fmt_pct(item['shadow_sum'])} | {fmt_pct(item['delta_sum'])} | "
-            f"{fmt_pct(item['baseline_avg'])} | {fmt_pct(item['shadow_avg'])} | "
-            f"{fmt_pct(item['delta_median'])} | "
-            f"{item['baseline_runner_kills']}/{item['shadow_runner_kills']} | "
-            f"{item['baseline_exit_counts']}/{item['shadow_exit_counts']} | "
-            f"{fmt_pct(item['baseline_worst'])}/{fmt_pct(item['shadow_worst'])} | "
-            f"{'sim' if item['worst_guard_ok'] else 'nao'} | "
-            f"{'SIM' if item['promote_ok'] else 'nao'}"
-        )
+    summaries = build_summaries(baseline_by_key, shadows_by_variant, args.last)
+    print_summary_table(summaries)
+    if args.evolution:
+        print_evolution(baseline, baseline_by_key, shadows_by_variant, args.evolution_step, args.last)
     if args.details:
         print_details(summaries, args.details_limit)
 
