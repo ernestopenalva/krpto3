@@ -10,7 +10,7 @@ import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -93,12 +93,19 @@ def fmt_price_usd(value: Optional[float]) -> str:
 
 
 def to_subscript(value: int) -> str:
-    return str(value).translate(str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉"))
+    digits = "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089"
+    return str(value).translate(str.maketrans("0123456789", digits))
 
 
 def entry_type(row: Dict[str, Any]) -> str:
     signal = row.get("source_signal") if isinstance(row.get("source_signal"), dict) else {}
-    return str(row.get("entry_reason") or signal.get("entry_reason") or "UNKNOWN")
+    return str(
+        row.get("entry_type")
+        or signal.get("entry_type")
+        or row.get("entry_reason")
+        or signal.get("entry_reason")
+        or "UNKNOWN"
+    )
 
 
 def price_usd(row: Dict[str, Any], name: str) -> Optional[float]:
@@ -156,20 +163,79 @@ def display_table(rows: List[Dict[str, Any]]) -> None:
         print(line(values))
 
 
-def print_summary(rows: List[Dict[str, Any]], source: Path) -> None:
-    pnls = [value for row in rows if (value := safe_float(row.get("pnl_pct"))) is not None]
-    types = Counter(entry_type(row) for row in rows)
+def pnl_values(rows: List[Dict[str, Any]]) -> List[float]:
+    return [value for row in rows if (value := safe_float(row.get("pnl_pct"))) is not None]
+
+
+def pnl_summary(rows: List[Dict[str, Any]]) -> str:
+    values = pnl_values(rows)
+    return (
+        f"quantidade={len(rows)} | pnl_total={fmt_pct(sum(values) if values else None)}"
+        f" | pnl_medio={fmt_pct(mean(values) if values else None)}"
+    )
+
+
+def print_detail(rows: List[Dict[str, Any]]) -> None:
+    pnls = pnl_values(rows)
     exits = Counter(str(row.get("exit_reason") or "UNKNOWN") for row in rows)
+    providers = Counter(str(row.get("provider") or "UNKNOWN") for row in rows)
+    durations = [value for row in rows if (value := safe_float(row.get("time_in_position_seconds"))) is not None]
+    ticks = [value for row in rows if (value := safe_float(row.get("ticks"))) is not None]
+    divergences = [value for row in rows if (value := safe_float(row.get("entry_divergence_pct"))) is not None]
+    max_pnls = [value for row in rows if (value := safe_float(row.get("max_profit_pct"))) is not None]
+    stopped = [row for row in rows if str(row.get("exit_reason")) == "STOP_LOSS"]
+    stop_pnls = pnl_values(stopped)
+    protected = [row for row in rows if bool(row.get("breakeven_activated"))]
+    runners = [row for row in rows if (safe_float(row.get("max_profit_pct")) or float("-inf")) >= 10.0]
+    winners = [value for value in pnls if value > 0]
+
+    print("\n## Detalhe")
+    print(
+        "resultado"
+        f" | pnl_mediano={fmt_pct(median(pnls) if pnls else None)}"
+        f" | win_rate={(len(winners) / len(pnls) * 100) if pnls else 0:.1f}%"
+        f" | melhor={fmt_pct(max(pnls) if pnls else None)}"
+        f" | pior={fmt_pct(min(pnls) if pnls else None)}"
+    )
+    exit_parts = []
+    for reason, count in sorted(exits.items()):
+        matching = [row for row in rows if str(row.get("exit_reason") or "UNKNOWN") == reason]
+        exit_parts.append(f"{reason}: n={count}, pnl_total={fmt_pct(sum(pnl_values(matching)))}")
+    print("saidas | " + " | ".join(exit_parts))
+    print(
+        "stop_loss"
+        f" | n={len(stopped)}"
+        f" | pnl_medio={fmt_pct(mean(stop_pnls) if stop_pnls else None)}"
+        f" | pior={fmt_pct(min(stop_pnls) if stop_pnls else None)}"
+        f" | abaixo_de_-7%={sum(value < -7.0 for value in stop_pnls)}"
+    )
+    print(
+        "protecao"
+        f" | breakeven/profit_lock_armado={len(protected)}"
+        f" | runners_max>=+10%={len(runners)}"
+        f" | max_pnl_mediano={fmt_pct(median(max_pnls) if max_pnls else None)}"
+    )
+    print(
+        "operacao"
+        f" | tempo_mediano={median(durations) if durations else 0:.1f}s"
+        f" | ticks_medianos={median(ticks) if ticks else 0:.0f}"
+        f" | divergencia_entrada_mediana={fmt_pct(median(divergences) if divergences else None)}"
+    )
+    print("provider | " + " | ".join(f"{provider}: {count}" for provider, count in sorted(providers.items())))
+
+
+def print_summary(rows: List[Dict[str, Any]], source: Path, *, detail: bool) -> None:
+    pnls = pnl_values(rows)
+    momentum = [row for row in rows if entry_type(row) == "MOMENTUM_CONTINUATION"]
+    pullback = [row for row in rows if entry_type(row) == "PULLBACK_RECOVERY"]
 
     print("# Closed Position Report")
     print(f"fonte={source}")
-    print(f"quantidade_de_tokens={len(rows)}")
-    print(f"pnl_medio={fmt_pct(mean(pnls) if pnls else None)}")
-    print(f"MC={types.get('MOMENTUM_CONTINUATION', 0)}")
-    print(f"pullback={types.get('PULLBACK_RECOVERY', 0)}")
-    print(f"stop_loss={exits.get('STOP_LOSS', 0)}")
-    print(f"be={exits.get('BREAKEVEN_STOP', 0)}")
-    print(f"trailing_stop={exits.get('TRAILING_STOP', 0)}")
+    print(f"geral | quantidade={len(rows)} | pnl_total={fmt_pct(sum(pnls) if pnls else None)} | pnl_medio={fmt_pct(mean(pnls) if pnls else None)}")
+    print(f"MC | {pnl_summary(momentum)}")
+    print(f"Pullback | {pnl_summary(pullback)}")
+    if detail:
+        print_detail(rows)
 
 
 def main() -> None:
@@ -178,13 +244,14 @@ def main() -> None:
     parser.add_argument("--since", help="Inicio em YYYY-MM-DD ou ISO; filtro pela saida.")
     parser.add_argument("--until", help="Fim em YYYY-MM-DD ou ISO; filtro pela saida.")
     parser.add_argument("--limit", type=int, default=0, help="0 mostra todos; valor positivo mostra os mais recentes.")
+    parser.add_argument("--detail", action="store_true", help="Mostra diagnostico de saidas, protecao e qualidade operacional.")
     args = parser.parse_args()
 
     since = parse_boundary(args.since)
     until = parse_boundary(args.until, end_of_day=True)
     rows = [row for row in load_json(args.file) if in_period(row, since, until)]
     rows.sort(key=lambda row: parse_time(row.get("exit_time")) or datetime.min.replace(tzinfo=BRASILIA), reverse=True)
-    print_summary(rows, args.file)
+    print_summary(rows, args.file, detail=args.detail)
     if not rows:
         print("\nNenhum trade fechado no filtro selecionado.")
         return
