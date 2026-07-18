@@ -352,6 +352,7 @@ def build_giveback_rows(trades: List[Dict[str, Any]], audit_file: Path) -> List[
                 "threshold_pnl": threshold_pnl,
                 "start_pnl": start_pnl,
                 "gap_abb_giveback_pp": max_pnl - threshold_pnl if max_pnl is not None and threshold_pnl is not None else None,
+                "breach_giveback_pp": threshold_pnl - start_pnl if threshold_pnl is not None and start_pnl is not None else None,
                 "persistence_giveback_pp": start_pnl - final_pnl if start_pnl is not None and final_pnl is not None else None,
                 "band_pct": safe_float((start_audit or exit_audit or {}).get("down_band_pct")),
                 "persist_elapsed_seconds": safe_float((exit_audit or {}).get("trailing_persist_elapsed")),
@@ -378,6 +379,7 @@ def print_giveback_study(rows: List[Dict[str, Any]], audit_file: Path, limit: in
     giveback_values = [row["giveback_pp"] for row in givebacks if row["giveback_pp"] is not None]
     relative_values = [row["giveback_from_peak_pct"] for row in givebacks if row["giveback_from_peak_pct"] is not None]
     gap_abb_values = [row["gap_abb_giveback_pp"] for row in exact]
+    breach_values = [row["breach_giveback_pp"] for row in exact]
     persistence_values = [row["persistence_giveback_pp"] for row in exact]
 
     print("\n## Giveback do Trailing")
@@ -386,6 +388,7 @@ def print_giveback_study(rows: List[Dict[str, Any]], audit_file: Path, limit: in
     print("giveback_total | " + values_summary(giveback_values))
     print("giveback_relativo_ao_pico | " + values_summary(relative_values))
     print("ate_limiar_gap_mais_abb | " + values_summary(gap_abb_values))
+    print("do_limiar_ate_primeiro_tick_abaixo | " + values_summary(breach_values))
     print("durante_persistencia | " + values_summary(persistence_values))
 
     buckets: Dict[str, List[Dict[str, Any]]] = {}
@@ -401,7 +404,7 @@ def print_giveback_study(rows: List[Dict[str, Any]], audit_file: Path, limit: in
     if limit > 0:
         selected = selected[:limit]
     headers = [
-        "TOKEN", "MAX", "SAIDA", "DEVOLVEU", "ATE LIMIAR", "DURANTE PERSIST",
+        "TOKEN", "MAX", "SAIDA", "DEVOLVEU", "ATE LIMIAR", "SALTO", "DURANTE PERSIST",
         "LIMIAR", "INICIO PERSIST", "PERSIST", "BANDA", "AUDIT",
     ]
     rendered = []
@@ -414,6 +417,7 @@ def print_giveback_study(rows: List[Dict[str, Any]], audit_file: Path, limit: in
                 fmt_pct(row["final_pnl"]),
                 f"{row['giveback_pp']:.2f}pp" if row["giveback_pp"] is not None else "-",
                 f"{row['gap_abb_giveback_pp']:.2f}pp" if row["gap_abb_giveback_pp"] is not None else "-",
+                f"{row['breach_giveback_pp']:.2f}pp" if row["breach_giveback_pp"] is not None else "-",
                 f"{row['persistence_giveback_pp']:.2f}pp" if row["persistence_giveback_pp"] is not None else "-",
                 fmt_pct(row["threshold_pnl"]),
                 fmt_pct(row["start_pnl"]),

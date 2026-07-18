@@ -49,7 +49,12 @@ class GivebackStudyTests(unittest.TestCase):
         self.assertAlmostEqual(result["giveback_pp"], 20.0)
         self.assertAlmostEqual(result["threshold_pnl"], 41.12)
         self.assertAlmostEqual(result["gap_abb_giveback_pp"], 8.88)
+        self.assertAlmostEqual(result["breach_giveback_pp"], 0.12)
         self.assertAlmostEqual(result["persistence_giveback_pp"], 11.0)
+        self.assertAlmostEqual(
+            result["gap_abb_giveback_pp"] + result["breach_giveback_pp"] + result["persistence_giveback_pp"],
+            result["giveback_pp"],
+        )
 
 
 if __name__ == "__main__":
