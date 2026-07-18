@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 BRASILIA = ZoneInfo("America/Sao_Paulo")
 DEFAULT_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
+DEFAULT_AUDIT_FILE = PROJECT_ROOT / "data" / "position_monitor" / "position_market_data_audit.jsonl"
 
 
 def load_json(path: Path) -> List[Dict[str, Any]]:
@@ -32,6 +33,25 @@ def load_json(path: Path) -> List[Dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return []
     return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+def load_jsonl(path: Path, token_addresses: set[str]) -> Dict[str, List[Dict[str, Any]]]:
+    rows_by_token: Dict[str, List[Dict[str, Any]]] = {address: [] for address in token_addresses}
+    if not path.exists():
+        return rows_by_token
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                token_address = row.get("token_address") if isinstance(row, dict) else None
+                if token_address in rows_by_token:
+                    rows_by_token[token_address].append(row)
+    except OSError:
+        pass
+    return rows_by_token
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -163,6 +183,21 @@ def display_table(rows: List[Dict[str, Any]]) -> None:
         print(line(values))
 
 
+def format_table(headers: List[str], rendered: List[List[str]]) -> None:
+    widths = [len(header) for header in headers]
+    for values in rendered:
+        for index, value in enumerate(values):
+            widths[index] = max(widths[index], len(value))
+
+    def line(values: List[str]) -> str:
+        return " | ".join(value.ljust(widths[index]) for index, value in enumerate(values))
+
+    print(line(headers))
+    print("-+-".join("-" * width for width in widths))
+    for values in rendered:
+        print(line(values))
+
+
 def pnl_values(rows: List[Dict[str, Any]]) -> List[float]:
     return [value for row in rows if (value := safe_float(row.get("pnl_pct"))) is not None]
 
@@ -238,6 +273,160 @@ def print_summary(rows: List[Dict[str, Any]], source: Path, *, detail: bool) -> 
         print_detail(rows)
 
 
+def values_summary(values: List[float]) -> str:
+    if not values:
+        return "media=- | mediana=- | p25=- | p75=- | pior=-"
+    ordered = sorted(values)
+
+    def percentile(percent: float) -> float:
+        index = (len(ordered) - 1) * percent
+        lower = math.floor(index)
+        upper = math.ceil(index)
+        if lower == upper:
+            return ordered[lower]
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+
+    return (
+        f"media={mean(values):.2f}pp | mediana={median(values):.2f}pp"
+        f" | p25={percentile(0.25):.2f}pp | p75={percentile(0.75):.2f}pp"
+        f" | pior={max(values):.2f}pp"
+    )
+
+
+def audit_rows_for_trade(trade: Dict[str, Any], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    entry_time = parse_time(trade.get("entry_time"))
+    exit_time = parse_time(trade.get("exit_time"))
+    if entry_time is None or exit_time is None:
+        return []
+    selected = []
+    for row in rows:
+        timestamp = parse_time(row.get("timestamp"))
+        if timestamp is not None and entry_time <= timestamp <= exit_time:
+            selected.append(row)
+    return selected
+
+
+def build_giveback_rows(trades: List[Dict[str, Any]], audit_file: Path) -> List[Dict[str, Any]]:
+    trailing = [trade for trade in trades if str(trade.get("exit_reason")) == "TRAILING_STOP"]
+    token_addresses = {str(trade.get("token_address")) for trade in trailing if trade.get("token_address")}
+    audits_by_token = load_jsonl(audit_file, token_addresses)
+    result: List[Dict[str, Any]] = []
+
+    for trade in trailing:
+        max_pnl = safe_float(trade.get("max_profit_pct"))
+        final_pnl = safe_float(trade.get("pnl_pct"))
+        token_address = str(trade.get("token_address") or "")
+        audit_rows = audit_rows_for_trade(trade, audits_by_token.get(token_address, []))
+        exit_audit = next((row for row in reversed(audit_rows) if row.get("exit_reason") == "TRAILING_STOP"), None)
+        started_at = exit_audit.get("trailing_persist_started_at") if exit_audit else None
+        start_audit = None
+        if started_at:
+            started_time = parse_time(started_at)
+            candidates = [
+                row for row in audit_rows
+                if row.get("trailing_persist_started_at")
+                and parse_time(row.get("trailing_persist_started_at")) == started_time
+            ]
+            if candidates:
+                start_audit = min(candidates, key=lambda row: parse_time(row.get("timestamp")) or datetime.max.replace(tzinfo=BRASILIA))
+
+        threshold_price = safe_float((start_audit or exit_audit or {}).get("trailing_exit_threshold"))
+        entry_price = safe_float(trade.get("entry_price_usd"))
+        threshold_pnl = ((threshold_price / entry_price) - 1) * 100 if threshold_price and entry_price else None
+        start_pnl = safe_float((start_audit or {}).get("pnl_pct"))
+        quality = "exact" if start_audit and threshold_pnl is not None and start_pnl is not None else "missing_audit"
+        if audit_rows and quality != "exact":
+            quality = "incomplete_audit"
+
+        relative_giveback = None
+        if max_pnl is not None and final_pnl is not None:
+            relative_giveback = (1 - ((1 + final_pnl / 100) / (1 + max_pnl / 100))) * 100
+
+        result.append(
+            {
+                "trade": trade,
+                "max_pnl": max_pnl,
+                "final_pnl": final_pnl,
+                "giveback_pp": max_pnl - final_pnl if max_pnl is not None and final_pnl is not None else None,
+                "giveback_from_peak_pct": relative_giveback,
+                "threshold_pnl": threshold_pnl,
+                "start_pnl": start_pnl,
+                "gap_abb_giveback_pp": max_pnl - threshold_pnl if max_pnl is not None and threshold_pnl is not None else None,
+                "persistence_giveback_pp": start_pnl - final_pnl if start_pnl is not None and final_pnl is not None else None,
+                "band_pct": safe_float((start_audit or exit_audit or {}).get("down_band_pct")),
+                "persist_elapsed_seconds": safe_float((exit_audit or {}).get("trailing_persist_elapsed")),
+                "audit_quality": quality,
+            }
+        )
+    return result
+
+
+def giveback_bucket(max_pnl: Optional[float]) -> str:
+    if max_pnl is None or max_pnl < 4:
+        return "< +4%"
+    if max_pnl < 10:
+        return "+4% a <+10%"
+    if max_pnl < 20:
+        return "+10% a <+20%"
+    return "+20% ou mais"
+
+
+def print_giveback_study(rows: List[Dict[str, Any]], audit_file: Path, limit: int) -> None:
+    givebacks = build_giveback_rows(rows, audit_file)
+    total = len(givebacks)
+    exact = [row for row in givebacks if row["audit_quality"] == "exact"]
+    giveback_values = [row["giveback_pp"] for row in givebacks if row["giveback_pp"] is not None]
+    relative_values = [row["giveback_from_peak_pct"] for row in givebacks if row["giveback_from_peak_pct"] is not None]
+    gap_abb_values = [row["gap_abb_giveback_pp"] for row in exact]
+    persistence_values = [row["persistence_giveback_pp"] for row in exact]
+
+    print("\n## Giveback do Trailing")
+    print(f"fonte_audit={audit_file}")
+    print(f"trailing_stop | quantidade={total} | audit_exato={len(exact)} | audit_incompleto_ou_ausente={total - len(exact)}")
+    print("giveback_total | " + values_summary(giveback_values))
+    print("giveback_relativo_ao_pico | " + values_summary(relative_values))
+    print("ate_limiar_gap_mais_abb | " + values_summary(gap_abb_values))
+    print("durante_persistencia | " + values_summary(persistence_values))
+
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for row in givebacks:
+        buckets.setdefault(giveback_bucket(row["max_pnl"]), []).append(row)
+    print("\nfaixas_de_pico")
+    for bucket in ("< +4%", "+4% a <+10%", "+10% a <+20%", "+20% ou mais"):
+        bucket_rows = buckets.get(bucket, [])
+        bucket_givebacks = [row["giveback_pp"] for row in bucket_rows if row["giveback_pp"] is not None]
+        print(f"{bucket} | n={len(bucket_rows)} | {values_summary(bucket_givebacks)}")
+
+    selected = sorted(givebacks, key=lambda row: row["giveback_pp"] if row["giveback_pp"] is not None else float("-inf"), reverse=True)
+    if limit > 0:
+        selected = selected[:limit]
+    headers = [
+        "TOKEN", "MAX", "SAIDA", "DEVOLVEU", "ATE LIMIAR", "DURANTE PERSIST",
+        "LIMIAR", "INICIO PERSIST", "PERSIST", "BANDA", "AUDIT",
+    ]
+    rendered = []
+    for row in selected:
+        trade = row["trade"]
+        rendered.append(
+            [
+                str(trade.get("symbol") or "-"),
+                fmt_pct(row["max_pnl"]),
+                fmt_pct(row["final_pnl"]),
+                f"{row['giveback_pp']:.2f}pp" if row["giveback_pp"] is not None else "-",
+                f"{row['gap_abb_giveback_pp']:.2f}pp" if row["gap_abb_giveback_pp"] is not None else "-",
+                f"{row['persistence_giveback_pp']:.2f}pp" if row["persistence_giveback_pp"] is not None else "-",
+                fmt_pct(row["threshold_pnl"]),
+                fmt_pct(row["start_pnl"]),
+                f"{row['persist_elapsed_seconds']:.1f}s" if row["persist_elapsed_seconds"] is not None else "-",
+                f"{row['band_pct']:.2f}%" if row["band_pct"] is not None else "-",
+                row["audit_quality"],
+            ]
+        )
+    if rendered:
+        print(f"\n## Trailing por trade ({len(rendered)} mostrados, maior devolucao primeiro)")
+        format_table(headers, rendered)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lista trades fechados do Position oficial.")
     parser.add_argument("--file", type=Path, default=DEFAULT_CLOSED_TRADES_FILE)
@@ -245,6 +434,8 @@ def main() -> None:
     parser.add_argument("--until", help="Fim em YYYY-MM-DD ou ISO; filtro pela saida.")
     parser.add_argument("--limit", type=int, default=0, help="0 mostra todos; valor positivo mostra os mais recentes.")
     parser.add_argument("--detail", action="store_true", help="Mostra diagnostico de saidas, protecao e qualidade operacional.")
+    parser.add_argument("--giveback", action="store_true", help="Analisa a devolucao de lucro dos TRAILING_STOP usando o historico auditavel.")
+    parser.add_argument("--audit-file", type=Path, default=DEFAULT_AUDIT_FILE, help="Historico JSONL do Position usado por --giveback.")
     args = parser.parse_args()
 
     since = parse_boundary(args.since)
@@ -254,6 +445,9 @@ def main() -> None:
     print_summary(rows, args.file, detail=args.detail)
     if not rows:
         print("\nNenhum trade fechado no filtro selecionado.")
+        return
+    if args.giveback:
+        print_giveback_study(rows, args.audit_file, args.limit)
         return
     selected = rows[: args.limit] if args.limit > 0 else rows
     print(f"\n## Trades fechados ({len(selected)} mostrados)")
