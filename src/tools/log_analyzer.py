@@ -22,10 +22,15 @@ ENTRY_TICK_RE = re.compile(
 BUY_SIGNAL_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[SINAL\]\s+COMPRA SIMULADA:\s+"
     r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?:\s+\|\s+entry_reason=(?P<entry_reason>\S+))?"
 )
 PAPER_BUY_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
-    r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?P<symbol>.+?)"
+    r"(?:\s+@\s+(?P<price>\S+)|"
+    r"\s+\|\s+signal_price=(?P<signal_price>\S+)\s+\|\s+"
+    r"execution_price=(?P<execution_price>\S+)\s+\|\s+"
+    r"open_slippage=(?P<open_slippage>[-+]?\d*\.?\d+)%)"
 )
 POSITION_TICK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[MONITOR\]\s+"
@@ -83,7 +88,7 @@ def normalize_reason(reason: str) -> str:
         return "historico_insuficiente"
     if "pullback fora da faixa" in lower:
         return "pullback_fora_da_faixa"
-    if "pullback" in lower and ("valido" in lower or "v" in lower):
+    if "pullback" in lower and ("valido" in lower or "válido" in lower or "vÃ¡lido" in lower):
         return "pullback_valido"
     if "codex" in lower and ("nao confirmou" in lower or "n\u00e3o confirmou" in lower or "nÃ£o confirmou" in lower):
         return "codex_nao_confirmou"
@@ -142,6 +147,7 @@ class BuySignal:
     symbol: str
     price: float
     raw: str
+    entry_reason: Optional[str] = None
 
 
 @dataclass
@@ -355,6 +361,7 @@ def parse_log(lines: Iterable[str]) -> list[CycleSummary]:
                 symbol=buy_match.group("symbol").strip(),
                 price=safe_float(buy_match.group("price")),
                 raw=line,
+                entry_reason=buy_match.group("entry_reason"),
             )
             current.add_buy_signal(signal)
             continue
@@ -364,7 +371,7 @@ def parse_log(lines: Iterable[str]) -> list[CycleSummary]:
             signal = BuySignal(
                 timestamp=paper_buy_match.group("timestamp"),
                 symbol=paper_buy_match.group("symbol").strip(),
-                price=safe_float(paper_buy_match.group("price")),
+                price=safe_float(paper_buy_match.group("price") or paper_buy_match.group("signal_price")),
                 raw=line,
             )
             current.add_buy_signal(signal, paper=True)
@@ -462,7 +469,10 @@ def write_compact_log(cycles: list[CycleSummary], output_path: Path, max_events:
         if cycle.buy_signals:
             lines.append("### Sinais De Compra Simulada")
             for signal in cycle.buy_signals:
-                lines.append(f"- {signal.timestamp} | {signal.symbol} @ {signal.price:g}")
+                lines.append(
+                    f"- {signal.timestamp} | {signal.symbol} @ {signal.price:g} | "
+                    f"entry_reason={signal.entry_reason or 'n/a'}"
+                )
             lines.append("")
 
         if cycle.paper_buys:
@@ -603,7 +613,7 @@ def write_analysis(cycles: list[CycleSummary], output_path: Path) -> None:
         "## Contexto",
         "- Projeto: bot de trading automatizado para criptoativos.",
         "- Prioridade: preservacao de capital e gestao de risco.",
-        "- Fonte: log bruto produzido pelo monitor (`rodar_monitor.sh` / `src/app.py`).",
+        "- Fonte: log bruto produzido pelo monitor (`scripts/rodar_monitor.sh` / `src/app.py`).",
         "",
         "## Resumo Quantitativo",
         f"- Ciclos analisados: {len(cycles)}",
@@ -826,6 +836,27 @@ def find_latest_monitor_log() -> Path:
 
 def build_output_paths(input_path: Path, output_dir: Path) -> tuple[Path, Path]:
     stem = input_path.stem
+    if stem.endswith("_analysis"):
+        stem = stem[: -len("_analysis")]
+    return (
+        output_dir / f"{stem}_compact.md",
+        output_dir / f"{stem}_analysis.md",
+    )
+
+
+def build_multi_output_paths(input_paths: list[Path], output_dir: Path) -> tuple[Path, Path]:
+    if len(input_paths) == 1:
+        return build_output_paths(input_paths[0], output_dir)
+
+    dates = []
+    for path in input_paths:
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
+        if match:
+            dates.append(match.group(1))
+    if dates:
+        stem = f"monitor_{min(dates)}_to_{max(dates)}"
+    else:
+        stem = "monitor_multi"
     return (
         output_dir / f"{stem}_compact.md",
         output_dir / f"{stem}_analysis.md",
@@ -843,13 +874,65 @@ def resolve_input_path(path: Path) -> Path:
     return PROJECT_ROOT / path
 
 
+def find_matching_position_log(input_path: Path) -> Optional[Path]:
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", input_path.name)
+    if not match:
+        return None
+    date = match.group(1)
+    candidates = [
+        input_path.with_name(f"position_{date}.txt"),
+        PROJECT_ROOT / "logs" / "cloud" / f"position_{date}.txt",
+        PROJECT_ROOT / "logs" / f"position_{date}.txt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def dates_referenced_by_log(input_path: Path) -> set[str]:
+    dates = set(re.findall(r"\d{4}-\d{2}-\d{2}", input_path.name))
+    try:
+        text = input_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return dates
+    dates.update(re.findall(r"\d{4}-\d{2}-\d{2}", text))
+    return dates
+
+
+def find_matching_position_logs(input_paths: list[Path]) -> list[Path]:
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for input_path in input_paths:
+        dates = dates_referenced_by_log(input_path)
+        if not dates:
+            match = find_matching_position_log(input_path)
+            if match and match not in seen:
+                found.append(match)
+                seen.add(match)
+            continue
+
+        for date in sorted(dates):
+            candidates = [
+                input_path.with_name(f"position_{date}.txt"),
+                PROJECT_ROOT / "logs" / "cloud" / f"position_{date}.txt",
+                PROJECT_ROOT / "logs" / f"position_{date}.txt",
+            ]
+            for candidate in candidates:
+                if candidate.exists() and candidate not in seen:
+                    found.append(candidate)
+                    seen.add(candidate)
+                    break
+    return found
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compacta e analisa logs do monitor KRPTO3.")
     parser.add_argument(
         "log_file",
-        nargs="?",
+        nargs="*",
         type=Path,
-        help="Arquivo de log bruto. Se omitido, usa o monitor_*.txt mais recente em logs/.",
+        help="Arquivo(s) de log bruto ou *_analysis.md. Se omitido, usa o monitor_*.txt mais recente em logs/.",
     )
     parser.add_argument(
         "--output-dir",
@@ -864,49 +947,62 @@ def main() -> None:
         help="Maximo de eventos-chave preservados por token no log compacto.",
     )
     parser.add_argument(
-        "--compare-log",
+        "--position-log",
         type=Path,
+        action="append",
         default=None,
-        help="Log de outro bot para gerar comparacao KRPTO2 vs KRPTO3.",
+        help="Log separado do Position Monitor. Pode repetir. Se omitido, tenta achar position_YYYY-MM-DD.txt.",
     )
     parser.add_argument(
         "--bot-name",
         default="KRPTO3",
         help="Nome do bot principal no relatorio.",
     )
-    parser.add_argument(
-        "--compare-name",
-        default="KRPTO2",
-        help="Nome do bot comparado no relatorio.",
-    )
     args = parser.parse_args()
 
-    input_path = args.log_file or find_latest_monitor_log()
-    input_path = resolve_input_path(input_path)
+    input_paths = [resolve_input_path(path) for path in args.log_file] if args.log_file else [find_latest_monitor_log()]
 
-    if not input_path.exists():
-        raise SystemExit(f"Log nao encontrado: {input_path}")
+    missing = [path for path in input_paths if not path.exists()]
+    if missing:
+        raise SystemExit(f"Log nao encontrado: {missing[0]}")
 
-    text = input_path.read_text(encoding="utf-8", errors="replace")
-    cycles = parse_log(text.splitlines())
-    compact_path, analysis_path = build_output_paths(input_path, args.output_dir)
+    compact_path, analysis_path = build_multi_output_paths(input_paths, args.output_dir)
 
-    write_compact_log(cycles, compact_path, max_events=args.max_events_per_token)
-    compare_path = resolve_input_path(args.compare_log) if args.compare_log else None
+    wrote_compact = False
+    raw_input_paths = [path for path in input_paths if path.suffix.lower() != ".md"]
+    if raw_input_paths:
+        all_lines: list[str] = []
+        for path in raw_input_paths:
+            all_lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            all_lines.append("===============================")
+        cycles = parse_log(all_lines)
+        write_compact_log(cycles, compact_path, max_events=args.max_events_per_token)
+        wrote_compact = True
+
+    position_paths = [resolve_input_path(path) for path in args.position_log] if args.position_log else find_matching_position_logs(input_paths)
+    missing_positions = [path for path in position_paths if not path.exists()]
+    if missing_positions:
+        raise SystemExit(f"Position log nao encontrado: {missing_positions[0]}")
     write_advanced_report(
-        primary_log=input_path,
+        primary_log=input_paths,
         output_path=analysis_path,
         primary_name=args.bot_name,
-        compare_log=compare_path,
-        compare_name=args.compare_name,
+        position_log=position_paths,
     )
 
-    original_size = input_path.stat().st_size
-    compact_size = compact_path.stat().st_size
+    original_size = sum(path.stat().st_size for path in input_paths)
     analysis_size = analysis_path.stat().st_size
 
-    print(f"Log analisado: {input_path}")
-    print(f"Log compacto: {compact_path} ({compact_size} bytes; original {original_size} bytes)")
+    print("Logs analisados:")
+    for path in input_paths:
+        print(f"- {path}")
+    if position_paths:
+        print("Position logs:")
+        for path in position_paths:
+            print(f"- {path}")
+    if wrote_compact:
+        compact_size = compact_path.stat().st_size
+        print(f"Log compacto: {compact_path} ({compact_size} bytes; original total {original_size} bytes)")
     print(f"Analise: {analysis_path} ({analysis_size} bytes)")
 
 

@@ -1,11 +1,19 @@
 import json
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 from typing import Optional
+
+
+DEFAULT_MAX_MONITORING_SECONDS = 15 * 60
+MOMENTUM_CANDIDATE_MIN_RUNUP_PCT = 30.0
+MOMENTUM_RUNUP_TRIGGERS = (10.0, 20.0, 30.0, 50.0)
+MOMENTUM_TP_TARGETS = (0.5, 1.0, 2.0, 3.0, 5.0)
+SHADOW_REAL_GRAIL_MIN_RUNUP_PCT = 20.0
 
 
 ENTRY_TICK_RE = re.compile(
@@ -19,10 +27,15 @@ ENTRY_TICK_RE = re.compile(
 BUY_SIGNAL_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[SINAL\]\s+COMPRA SIMULADA:\s+"
     r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?:\s+\|\s+entry_reason=(?P<entry_reason>\S+))?"
 )
 PAPER_BUY_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PAPER BUY\]\s+posi\S+\s+aberta:\s+"
-    r"(?P<symbol>.+?)\s+@\s+(?P<price>\S+)"
+    r"(?P<symbol>.+?)"
+    r"(?:\s+@\s+(?P<price>\S+)|"
+    r"\s+\|\s+signal_price=(?P<signal_price>\S+)\s+\|\s+"
+    r"execution_price=(?P<execution_price>\S+)\s+\|\s+"
+    r"open_slippage=(?P<open_slippage>[-+]?\d*\.?\d+)%)"
 )
 POSITION_TICK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[MONITOR\]\s+"
@@ -33,6 +46,9 @@ POSITION_TICK_RE = re.compile(
     r"stop=(?P<stop>\S+)\s+\|\s+"
     r"trailing=(?P<trailing>\S+)\s+\|\s+"
     r"bp_persist=(?P<bp_persist>\d+)"
+    r"(?:\s+\|\s+liq=(?P<liquidity>\S+)\s+\|\s+"
+    r"vol=(?P<volume>\S+)\s+\|\s+"
+    r"bp=(?P<buy_pressure>\S+))?"
 )
 PROFIT_LOCK_RE = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\]\s+\[PROFIT LOCK\]\s+(?P<symbol>.+?):"
@@ -51,6 +67,8 @@ TOKEN_ADDRESS_RE = re.compile(
 )
 HEALTH_RE = re.compile(r"health=([0-9.]+)")
 PULLBACK_RE = re.compile(r"pullback(?: fora da faixa)?[:=]\s*([0-9.]+)%", re.IGNORECASE)
+ANALYSIS_TOKEN_RE = re.compile(r"^-\s+(?P<symbol>.+?):\s+(?P<body>.*)$")
+INVALID_PRICE_RE = re.compile(r"\[INVALID PRICE\].*\b(?P<scope>monitor|position)\b", re.IGNORECASE)
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -60,6 +78,15 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def optional_float(value: object) -> Optional[float]:
+    try:
+        if value in (None, "None", "n/a"):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_dt(value: str) -> Optional[datetime]:
@@ -310,6 +337,8 @@ class PositionTick:
     trailing: Optional[float]
     bp_persist: int
     liquidity_usd: Optional[float] = None
+    volume_m5: Optional[float] = None
+    buy_pressure: Optional[float] = None
 
 
 @dataclass
@@ -319,14 +348,36 @@ class LiquidityPoint:
 
 
 @dataclass
+class ShadowResult:
+    token_address: str
+    symbol: str
+    timestamp_inicio: str
+    timestamp_fim: str
+    preco_descarte: float
+    preco_max_pos_descarte: float
+    preco_min_pos_descarte: float
+    runup_pos_descarte_pct: float
+    drawdown_pos_descarte_pct: float
+    liquidity_descarte: float
+    liquidity_max: float
+    liquidity_min: float
+    tempo_ate_topo: float
+    motivo_descarte: str
+    runup_ate_descarte_pct: Optional[float] = None
+
+
+@dataclass
 class TradeMetrics:
     symbol: str
+    session_id: int = 0
     token_address: Optional[str] = None
     h1_at_capture: Optional[float] = None
     first_tick_at: Optional[str] = None
     signal_at: Optional[str] = None
     first_price: Optional[float] = None
     signal_price: Optional[float] = None
+    execution_price: Optional[float] = None
+    open_slippage_pct: Optional[float] = None
     entry_reason: Optional[str] = None
     opened_at: Optional[str] = None
     sold_at: Optional[str] = None
@@ -335,6 +386,7 @@ class TradeMetrics:
     bp_persist_exit: Optional[int] = None
     max_pnl: Optional[float] = None
     min_pnl: Optional[float] = None
+    pnl_giveback_from_max: Optional[float] = None
     position_ticks_count: int = 0
     breakeven_activated: bool = False
     trailing_activated: bool = False
@@ -386,17 +438,23 @@ class TradeMetrics:
     liquidity_volatility_during_position: Optional[float] = None
     liquidity_flags: list[str] = field(default_factory=list)
     possible_liquidity_collapse: bool = False
+    warnings: list[str] = field(default_factory=list)
+    monitor_ticks: list[EntryTick] = field(default_factory=list)
+    position_ticks: list[PositionTick] = field(default_factory=list)
 
 
 @dataclass
 class TokenState:
     symbol: str
+    session_id: int = 0
     token_address: Optional[str] = None
     h1_at_capture: Optional[float] = None
     ticks: list[EntryTick] = field(default_factory=list)
     position_ticks: list[PositionTick] = field(default_factory=list)
     signal_at: Optional[str] = None
     signal_price: Optional[float] = None
+    execution_price: Optional[float] = None
+    open_slippage_pct: Optional[float] = None
     entry_reason: Optional[str] = None
     opened_at: Optional[str] = None
     sold_at: Optional[str] = None
@@ -408,7 +466,7 @@ class TokenState:
     entry_liquidity_points: list[LiquidityPoint] = field(default_factory=list)
     position_liquidity_points: list[LiquidityPoint] = field(default_factory=list)
 
-    def build_metrics(self) -> TradeMetrics:
+    def build_metrics(self, max_monitoring_seconds: int = DEFAULT_MAX_MONITORING_SECONDS) -> TradeMetrics:
         first_tick = self.ticks[0] if self.ticks else None
         signal_ticks = [tick for tick in self.ticks if not self.signal_at or tick.timestamp <= self.signal_at]
         if self.signal_at and signal_ticks:
@@ -422,6 +480,8 @@ class TokenState:
         pullbacks = [tick.pullback for tick in before_signal if tick.pullback is not None]
         reasons = " | ".join(tick.reason.lower() for tick in before_signal)
         pnl_values = [tick.pnl_pct for tick in self.position_ticks]
+        if self.final_pnl is not None:
+            pnl_values.append(self.final_pnl)
         max_price_after_entry = max((tick.price for tick in self.position_ticks if tick.price > 0), default=None)
         before_liquidity = liquidity_window(self.entry_liquidity_points, end=self.signal_at)
         position_liquidity = liquidity_window(
@@ -435,29 +495,53 @@ class TokenState:
             (self.final_pnl is not None and self.final_pnl < -30)
             or (liquidity_drop_position is not None and liquidity_drop_position > 50)
         )
+        time_to_signal_seconds = seconds_between(first_tick.timestamp if first_tick else None, self.signal_at)
+        warnings = []
+        time_before_signal = fmt_duration(first_tick.timestamp if first_tick else None, self.signal_at)
+        if (
+            time_to_signal_seconds is not None
+            and max_monitoring_seconds > 0
+            and time_to_signal_seconds > max_monitoring_seconds
+        ):
+            warnings.append(
+                f"[AVISO] tempo_ate_sinal improvável para {self.symbol} — possível cross-sessão"
+            )
+            time_before_signal = "n/a"
+
+        max_pnl = max(pnl_values) if pnl_values else None
+        min_pnl = min(pnl_values) if pnl_values else None
+        pnl_giveback = (
+            (max_pnl - self.final_pnl)
+            if max_pnl is not None and max_pnl > 0 and self.final_pnl is not None
+            else None
+        )
 
         metrics = TradeMetrics(
             symbol=self.symbol,
+            session_id=self.session_id,
             token_address=self.token_address,
             h1_at_capture=self.h1_at_capture,
             first_tick_at=first_tick.timestamp if first_tick else None,
             signal_at=self.signal_at,
             first_price=first_tick.price if first_tick else None,
             signal_price=self.signal_price,
+            execution_price=self.execution_price,
+            open_slippage_pct=self.open_slippage_pct,
             entry_reason=self.entry_reason,
             opened_at=self.opened_at,
             sold_at=self.sold_at,
             exit_reason=self.exit_reason,
             final_pnl=self.final_pnl,
             bp_persist_exit=self.bp_persist_exit,
-            max_pnl=max(pnl_values) if pnl_values else None,
-            min_pnl=min(pnl_values) if pnl_values else None,
+            max_pnl=max_pnl,
+            min_pnl=min_pnl,
+            pnl_giveback_from_max=pnl_giveback,
             position_ticks_count=len(self.position_ticks),
             breakeven_activated=self.breakeven_activated or any(tick.stop > 0 and tick.trailing is not None for tick in self.position_ticks),
             trailing_activated=self.trailing_activated or any(tick.trailing is not None for tick in self.position_ticks),
             max_price_after_entry=max_price_after_entry,
             ticks_before_signal=len(before_signal),
-            time_before_signal=fmt_duration(first_tick.timestamp if first_tick else None, self.signal_at),
+            time_before_signal=time_before_signal,
             price_change_before_signal=pct_change(first_tick.price if first_tick else None, self.signal_price),
             min_price_before_signal=min(prices) if prices else None,
             max_price_before_signal=max(prices) if prices else None,
@@ -503,6 +587,9 @@ class TokenState:
             liquidity_volatility_during_position=liquidity_volatility_pct(position_liquidity),
             liquidity_flags=liquidity_flags,
             possible_liquidity_collapse=possible_liquidity_collapse,
+            warnings=warnings,
+            monitor_ticks=list(self.ticks),
+            position_ticks=list(self.position_ticks),
         )
         return metrics
 
@@ -554,6 +641,20 @@ def infer_project_root(log_path: Path) -> Path:
     return log_path.parent
 
 
+def max_monitoring_seconds_for(log_path: Path) -> int:
+    project_root = infer_project_root(log_path)
+    config_path = project_root / "config" / "config.yaml"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return DEFAULT_MAX_MONITORING_SECONDS
+
+    match = re.search(r"^\s*max_monitoring_minutes:\s*(?P<minutes>\d+(?:\.\d+)?)\s*$", text, re.MULTILINE)
+    if not match:
+        return DEFAULT_MAX_MONITORING_SECONDS
+    return int(float(match.group("minutes")) * 60)
+
+
 def history_points_from_file(path: Path) -> list[dict]:
     rows = []
     try:
@@ -571,7 +672,11 @@ def history_points_from_file(path: Path) -> list[dict]:
     return rows
 
 
-def attach_history_liquidity(states_by_symbol: dict[str, TokenState], states_by_address: dict[str, TokenState], log_path: Path) -> None:
+def attach_history_liquidity(
+    states_by_symbol: dict[str, TokenState],
+    states_by_address: dict[str, TokenState],
+    log_path: Path,
+) -> None:
     project_root = infer_project_root(log_path)
     history_specs = (
         (project_root / "data" / "token_monitor" / "history", "entry"),
@@ -610,35 +715,155 @@ def attach_history_liquidity(states_by_symbol: dict[str, TokenState], states_by_
         state.position_liquidity_points.sort(key=lambda point: point.timestamp)
 
 
+def load_shadow_results(log_path: Path) -> tuple[list[ShadowResult], int]:
+    project_root = infer_project_root(log_path)
+    shadow_results_path = project_root / "data" / "token_monitor" / "shadow_results.jsonl"
+    shadow_watchlist_path = project_root / "data" / "token_monitor" / "shadow_watchlist.json"
+    monitor_history_dir = project_root / "data" / "token_monitor" / "history"
+
+    active_shadow_count = 0
+    try:
+        shadow_watchlist = json.loads(shadow_watchlist_path.read_text(encoding="utf-8"))
+        if isinstance(shadow_watchlist, dict):
+            active_shadow_count = len(shadow_watchlist)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    pre_discard_prices: dict[str, list[tuple[str, float]]] = {}
+    if monitor_history_dir.exists():
+        for history_path in monitor_history_dir.glob("*.jsonl"):
+            for row in history_points_from_file(history_path):
+                token_address = str(row.get("token_address") or "")
+                timestamp = str(row.get("timestamp") or "")
+                price = safe_float(row.get("price_usd"))
+                if token_address and timestamp and price > 0:
+                    pre_discard_prices.setdefault(token_address, []).append((timestamp, price))
+
+    deduplicated: dict[tuple[str, str], ShadowResult] = {}
+    for row in history_points_from_file(shadow_results_path):
+        token_address = str(row.get("token_address") or "")
+        timestamp_inicio = str(row.get("timestamp_inicio") or "")
+        if not token_address or not timestamp_inicio:
+            continue
+
+        prices = [
+            price
+            for timestamp, price in pre_discard_prices.get(token_address, [])
+            if timestamp <= timestamp_inicio
+        ]
+        discard_price = safe_float(row.get("preco_descarte"))
+        if discard_price > 0:
+            prices.append(discard_price)
+
+        result = ShadowResult(
+            token_address=token_address,
+            symbol=str(row.get("symbol") or token_address[:8]),
+            timestamp_inicio=timestamp_inicio,
+            timestamp_fim=str(row.get("timestamp_fim") or ""),
+            preco_descarte=discard_price,
+            preco_max_pos_descarte=safe_float(row.get("preco_max_pos_descarte")),
+            preco_min_pos_descarte=safe_float(row.get("preco_min_pos_descarte")),
+            runup_pos_descarte_pct=safe_float(row.get("runup_pos_descarte_pct")),
+            drawdown_pos_descarte_pct=safe_float(row.get("drawdown_pos_descarte_pct")),
+            liquidity_descarte=safe_float(row.get("liquidity_descarte")),
+            liquidity_max=safe_float(row.get("liquidity_max")),
+            liquidity_min=safe_float(row.get("liquidity_min")),
+            tempo_ate_topo=safe_float(row.get("tempo_ate_topo")),
+            motivo_descarte=str(row.get("motivo_descarte") or "n/a"),
+            runup_ate_descarte_pct=pct_change(prices[0], max(prices)) if prices else None,
+        )
+        deduplicated[(token_address, timestamp_inicio)] = result
+
+    return list(deduplicated.values()), active_shadow_count
+
+
 def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
+    if log_path.suffix.lower() == ".md":
+        return parse_analysis_metrics(log_path)
+
+    all_states: list[TokenState] = []
     states_by_symbol: dict[str, TokenState] = {}
     states_by_address: dict[str, TokenState] = {}
+    active_trade_by_symbol: dict[str, TokenState] = {}
+    current_session_states: dict[str, TokenState] = {}
     current_final_candidates: dict[str, tuple[Optional[float], Optional[str]]] = {}
     in_final_candidates = False
+    in_monitor_session = False
+    session_id = 0
+    max_monitoring_seconds = max_monitoring_seconds_for(log_path)
 
-    def state_for(symbol: str, address: Optional[str] = None) -> TokenState:
+    def apply_candidate_metadata(state: TokenState, normalized: str) -> None:
+        if normalized not in current_final_candidates:
+            return
+        h1, candidate_address = current_final_candidates[normalized]
+        if state.h1_at_capture is None:
+            state.h1_at_capture = h1
+        if candidate_address and not state.token_address:
+            state.token_address = candidate_address
+            states_by_address[candidate_address] = state
+
+    def create_state(symbol: str, address: Optional[str] = None) -> TokenState:
         normalized = normalize_symbol(symbol)
+        state = TokenState(symbol=symbol, session_id=session_id)
+        all_states.append(state)
+        states_by_symbol[normalized] = state
+        if address:
+            state.token_address = address
+            states_by_address[address] = state
+        apply_candidate_metadata(state, normalized)
+        return state
+
+    def state_for_current_session(symbol: str, address: Optional[str] = None) -> TokenState:
+        normalized = normalize_symbol(symbol)
+        if in_monitor_session:
+            state = current_session_states.get(normalized)
+            if state is None:
+                state = create_state(symbol, address)
+                current_session_states[normalized] = state
+            elif address and not state.token_address:
+                state.token_address = address
+                states_by_address[address] = state
+            apply_candidate_metadata(state, normalized)
+            return state
+
         if address and address in states_by_address:
             return states_by_address[address]
         if normalized in states_by_symbol:
             state = states_by_symbol[normalized]
-        else:
-            state = TokenState(symbol=symbol)
-            states_by_symbol[normalized] = state
-        if address:
-            state.token_address = address
-            states_by_address[address] = state
-        if normalized in current_final_candidates:
-            h1, candidate_address = current_final_candidates[normalized]
-            if state.h1_at_capture is None:
-                state.h1_at_capture = h1
-            if candidate_address and not state.token_address:
-                state.token_address = candidate_address
-                states_by_address[candidate_address] = state
-        return state
+            apply_candidate_metadata(state, normalized)
+            return state
+        return create_state(symbol, address)
+
+    def state_for_trade(symbol: str) -> TokenState:
+        normalized = normalize_symbol(symbol)
+        state = active_trade_by_symbol.get(normalized) or states_by_symbol.get(normalized)
+        if state is not None:
+            return state
+        return state_for_current_session(symbol)
+
+    def add_metric(metrics: dict[str, TradeMetrics], metric: TradeMetrics) -> None:
+        base_key = token_key(metric.symbol, metric.token_address)
+        key = base_key
+        if key in metrics:
+            key = f"{base_key}#session:{metric.session_id}"
+            counter = 2
+            while key in metrics:
+                key = f"{base_key}#session:{metric.session_id}:{counter}"
+                counter += 1
+        metrics[key] = metric
 
     for raw_line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw_line.rstrip("\n")
+
+        if line.strip() == "=== Módulo 2: Token Monitor Buy ===":
+            session_id += 1
+            current_session_states = {}
+            in_monitor_session = True
+            in_final_candidates = False
+            continue
+
+        if line.startswith("[INFO] Monitoramento encerrado.") or line.strip() == "=== Módulo 3: Position Monitor ===":
+            in_monitor_session = False
 
         if line.startswith("Candidatos finais:"):
             in_final_candidates = True
@@ -658,13 +883,13 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
                     safe_float(h1_match.group("h1")) if h1_match else None,
                     address_match.group("address") if address_match else None,
                 )
-                state_for(symbol, address_match.group("address") if address_match else None)
+                state_for_current_session(symbol, address_match.group("address") if address_match else None)
             continue
 
         entry_match = ENTRY_TICK_RE.match(line)
         if entry_match:
             symbol = entry_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_current_session(symbol)
             reason = entry_match.group("reason").strip()
             if state.entry_reason is None and reason_category(reason) == "pullback_valido":
                 state.entry_reason = reason
@@ -684,18 +909,29 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
         signal_match = BUY_SIGNAL_RE.match(line)
         if signal_match:
             symbol = signal_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_current_session(symbol)
             state.signal_at = signal_match.group("timestamp")
             state.signal_price = safe_float(signal_match.group("price"))
-            if state.entry_reason is None and state.ticks:
+            if signal_match.group("entry_reason") and signal_match.group("entry_reason") != "n/a":
+                state.entry_reason = signal_match.group("entry_reason")
+            elif state.entry_reason is None and state.ticks:
                 state.entry_reason = state.ticks[-1].reason
+            active_trade_by_symbol[normalize_symbol(symbol)] = state
             continue
 
         paper_buy_match = PAPER_BUY_RE.match(line)
         if paper_buy_match:
             symbol = paper_buy_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_trade(symbol)
             state.opened_at = paper_buy_match.group("timestamp")
+            signal_price = optional_float(paper_buy_match.group("signal_price"))
+            execution_price = optional_float(paper_buy_match.group("execution_price"))
+            open_slippage_pct = optional_float(paper_buy_match.group("open_slippage"))
+            if signal_price is not None:
+                state.signal_price = signal_price
+            state.execution_price = execution_price
+            state.open_slippage_pct = open_slippage_pct
+            active_trade_by_symbol[normalize_symbol(symbol)] = state
             continue
 
         position_match = POSITION_TICK_RE.match(line)
@@ -710,8 +946,11 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
                 stop=safe_float(position_match.group("stop")),
                 trailing=None if trailing_raw == "None" else safe_float(trailing_raw),
                 bp_persist=int(position_match.group("bp_persist")),
+                liquidity_usd=optional_float(position_match.group("liquidity")),
+                volume_m5=optional_float(position_match.group("volume")),
+                buy_pressure=optional_float(position_match.group("buy_pressure")),
             )
-            state = state_for(symbol)
+            state = state_for_trade(symbol)
             state.position_ticks.append(tick)
             if tick.trailing is not None:
                 state.trailing_activated = True
@@ -719,13 +958,13 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
 
         profit_lock_match = PROFIT_LOCK_RE.match(line)
         if profit_lock_match:
-            state_for(profit_lock_match.group("symbol").strip()).breakeven_activated = True
+            state_for_trade(profit_lock_match.group("symbol").strip()).breakeven_activated = True
             continue
 
         sell_match = SELL_RE.match(line)
         if sell_match:
             symbol = sell_match.group("symbol").strip()
-            state = state_for(symbol)
+            state = state_for_trade(symbol)
             state.sold_at = sell_match.group("timestamp") or state.sold_at
             state.exit_reason = sell_match.group("reason").strip()
             state.final_pnl = safe_float(sell_match.group("pnl"))
@@ -736,15 +975,252 @@ def parse_log_metrics(log_path: Path) -> dict[str, TradeMetrics]:
     attach_history_liquidity(states_by_symbol, states_by_address, log_path)
 
     metrics: dict[str, TradeMetrics] = {}
-    for state in states_by_symbol.values():
-        metric = state.build_metrics()
-        metrics[token_key(metric.symbol, metric.token_address)] = metric
+    for state in all_states:
+        metric = state.build_metrics(max_monitoring_seconds=max_monitoring_seconds)
+        add_metric(metrics, metric)
     return metrics
+
+
+def find_matching_metric(position: TradeMetrics, primary: dict[str, TradeMetrics]) -> Optional[TradeMetrics]:
+    same_symbol = [
+        item for item in primary.values()
+        if normalize_symbol(item.symbol) == normalize_symbol(position.symbol)
+    ]
+    if not same_symbol:
+        return None
+    if not position.opened_at:
+        return same_symbol[0]
+
+    opened_dt = parse_dt(position.opened_at)
+    if not opened_dt:
+        return same_symbol[0]
+
+    def distance(item: TradeMetrics) -> tuple[int, float]:
+        signal_dt = parse_dt(item.signal_at or "")
+        if not signal_dt:
+            return (1, float("inf"))
+        return (0 if signal_dt <= opened_dt else 1, abs((opened_dt - signal_dt).total_seconds()))
+
+    return sorted(same_symbol, key=distance)[0]
+
+
+def merge_position_metrics(primary: dict[str, TradeMetrics], position_metrics: dict[str, TradeMetrics]) -> None:
+    for position in position_metrics.values():
+        if not (position.opened_at or position.sold_at or position.position_ticks_count or position.final_pnl is not None):
+            continue
+        target = find_matching_metric(position, primary)
+        if target is None:
+            primary[token_key(position.symbol, position.token_address)] = position
+            continue
+
+        target.opened_at = position.opened_at or target.opened_at
+        target.signal_price = position.signal_price if position.signal_price is not None else target.signal_price
+        target.execution_price = position.execution_price if position.execution_price is not None else target.execution_price
+        target.open_slippage_pct = position.open_slippage_pct if position.open_slippage_pct is not None else target.open_slippage_pct
+        target.sold_at = position.sold_at or target.sold_at
+        target.exit_reason = position.exit_reason or target.exit_reason
+        target.final_pnl = position.final_pnl if position.final_pnl is not None else target.final_pnl
+        target.bp_persist_exit = position.bp_persist_exit if position.bp_persist_exit is not None else target.bp_persist_exit
+        target.max_pnl = position.max_pnl if position.max_pnl is not None else target.max_pnl
+        target.min_pnl = position.min_pnl if position.min_pnl is not None else target.min_pnl
+        target.pnl_giveback_from_max = (
+            position.pnl_giveback_from_max
+            if position.pnl_giveback_from_max is not None
+            else target.pnl_giveback_from_max
+        )
+        target.position_ticks_count = position.position_ticks_count or target.position_ticks_count
+        target.breakeven_activated = target.breakeven_activated or position.breakeven_activated
+        target.trailing_activated = target.trailing_activated or position.trailing_activated
+        target.max_price_after_entry = position.max_price_after_entry or target.max_price_after_entry
+        target.position_ticks = position.position_ticks or target.position_ticks
+
+
+def merge_metric_sets(metric_sets: list[dict[str, TradeMetrics]]) -> dict[str, TradeMetrics]:
+    merged: dict[str, TradeMetrics] = {}
+    for metrics in metric_sets:
+        for key, metric in metrics.items():
+            target_key = key
+            if target_key in merged:
+                suffix = metric.signal_at or metric.opened_at or metric.first_tick_at or str(len(merged) + 1)
+                target_key = f"{key}#log:{suffix}"
+                counter = 2
+                while target_key in merged:
+                    target_key = f"{key}#log:{suffix}:{counter}"
+                    counter += 1
+            merged[target_key] = metric
+    return merged
+
+
+def ensure_path_list(value: Optional[Path | list[Path]]) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def count_invalid_price_ticks(log_paths: list[Path], scope: str) -> int:
+    total = 0
+    for path in log_paths:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        total += sum(
+            1
+            for line in lines
+            if (match := INVALID_PRICE_RE.search(line)) and match.group("scope").lower() == scope
+        )
+    return total
 
 
 def average(values: list[Optional[float]]) -> Optional[float]:
     clean = [value for value in values if value is not None]
     return mean(clean) if clean else None
+
+
+def first_five_position_metrics(item: TradeMetrics) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    ticks = [tick for tick in item.position_ticks if tick.liquidity_usd is not None][:5]
+    if len(ticks) < 5:
+        return None, None, None, None, None
+
+    liquidity_p0 = ticks[0].liquidity_usd
+    liquidity_p4 = ticks[4].liquidity_usd
+    liquidity_delta = pct_change(liquidity_p0, liquidity_p4)
+    volume_avg = average([tick.volume_m5 for tick in ticks])
+    buy_pressure_avg = average([tick.buy_pressure for tick in ticks])
+    return liquidity_p0, liquidity_p4, liquidity_delta, volume_avg, buy_pressure_avg
+
+
+def parse_analysis_value(body: str, field_name: str) -> Optional[str]:
+    match = re.search(rf"(?:^|\|\s*){re.escape(field_name)}=([^|]+)", body)
+    return match.group(1).strip() if match else None
+
+
+def parse_analysis_float(body: str, field_name: str) -> Optional[float]:
+    value = parse_analysis_value(body, field_name)
+    if value is None or value == "n/a":
+        return None
+    if value.endswith("%"):
+        value = value[:-1]
+    return safe_float(value, default=0.0)
+
+
+def parse_analysis_bool(body: str, field_name: str) -> bool:
+    value = parse_analysis_value(body, field_name)
+    return str(value).strip().lower() == "true"
+
+
+def parse_analysis_metrics(path: Path) -> dict[str, TradeMetrics]:
+    metrics: dict[str, TradeMetrics] = {}
+    metrics_by_symbol: dict[str, list[TradeMetrics]] = {}
+    section_occurrences: dict[tuple[str, str], int] = {}
+    section = ""
+
+    def add_metric(symbol: str) -> TradeMetrics:
+        normalized = normalize_symbol(symbol)
+        items = metrics_by_symbol.setdefault(normalized, [])
+        metric = TradeMetrics(symbol=symbol, session_id=len(items) + 1)
+        items.append(metric)
+        key = token_key(symbol, None)
+        if key in metrics:
+            key = f"{key}#analysis:{len(items)}"
+        metrics[key] = metric
+        return metric
+
+    def get_metric(symbol: str, section_name: str) -> TradeMetrics:
+        normalized = normalize_symbol(symbol)
+        if section_name == "## Metricas Por Token/Sinal":
+            return add_metric(symbol)
+
+        occurrence_key = (section_name, normalized)
+        occurrence = section_occurrences.get(occurrence_key, 0)
+        section_occurrences[occurrence_key] = occurrence + 1
+        items = metrics_by_symbol.get(normalized)
+        if items and occurrence < len(items):
+            return items[occurrence]
+        if items:
+            return items[-1]
+        return add_metric(symbol)
+
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            section = line
+            continue
+        match = ANALYSIS_TOKEN_RE.match(line)
+        if not match:
+            continue
+        if section not in {
+            "## Metricas Por Token/Sinal",
+            "## Health Antes Do Sinal",
+            "## Buy Pressure Antes Do Sinal",
+            "## Metricas Da Posicao",
+        }:
+            continue
+
+        symbol = match.group("symbol").strip()
+        body = match.group("body")
+        metric = get_metric(symbol, section)
+
+        if section == "## Metricas Por Token/Sinal":
+            first_tick = parse_analysis_value(body, "primeiro_tick")
+            signal = parse_analysis_value(body, "sinal")
+            metric.first_tick_at = None if first_tick == "n/a" else first_tick
+            metric.signal_at = None if signal == "n/a" else signal
+            metric.time_before_signal = parse_analysis_value(body, "tempo_ate_sinal") or "n/a"
+            metric.ticks_before_signal = int(parse_analysis_float(body, "ticks_ate_sinal") or 0)
+            metric.h1_at_capture = parse_analysis_float(body, "h1_captura")
+            metric.first_price = parse_analysis_float(body, "preco_primeiro")
+            metric.signal_price = parse_analysis_float(body, "preco_sinal")
+            metric.price_change_before_signal = parse_analysis_float(body, "variacao")
+            metric.runup_before_signal = parse_analysis_float(body, "runup")
+            metric.drawdown_before_signal = parse_analysis_float(body, "drawdown")
+            metric.entry_reason = parse_analysis_value(body, "motivo_entrada")
+            continue
+
+        if section == "## Health Antes Do Sinal":
+            metric.health_max_before_signal = parse_analysis_float(body, "health_max")
+            metric.last_health_before_signal = parse_analysis_float(body, "ultimo_health")
+            metric.health_ge_075_count = int(parse_analysis_float(body, "health>=0.75") or 0)
+            metric.health_ge_087_count = int(parse_analysis_float(body, "health>=0.87") or 0)
+            metric.health_ge_087_max_seq = int(parse_analysis_float(body, "seq_health>=0.87") or 0)
+            metric.queda_forte_vivo_count = int(parse_analysis_float(body, "queda_forte_vivo") or 0)
+            metric.codex_nao_confirmou_count = int(parse_analysis_float(body, "codex_nao_confirmou") or 0)
+            metric.preco_ainda_caindo_count = int(parse_analysis_float(body, "preco_ainda_caindo") or 0)
+            metric.sem_recuperacao_count = int(parse_analysis_float(body, "sem_recuperacao_cascata") or 0)
+            continue
+
+        if section == "## Buy Pressure Antes Do Sinal":
+            metric.buy_pressure_avg = parse_analysis_float(body, "media")
+            metric.buy_pressure_max = parse_analysis_float(body, "max")
+            metric.buy_pressure_min = parse_analysis_float(body, "min")
+            metric.bp_ge_065_count = int(parse_analysis_float(body, "bp>=0.65") or 0)
+            metric.bp_ge_085_count = int(parse_analysis_float(body, "bp>=0.85") or 0)
+            metric.bp_ge_085_max_seq = int(parse_analysis_float(body, "seq_bp>=0.85") or 0)
+            continue
+
+        if section == "## Metricas Da Posicao":
+            opened = parse_analysis_value(body, "abertura")
+            sold = parse_analysis_value(body, "venda")
+            metric.opened_at = None if opened == "n/a" else opened
+            metric.sold_at = None if sold == "n/a" else sold
+            metric.exit_reason = parse_analysis_value(body, "saida")
+            metric.final_pnl = parse_analysis_float(body, "pnl_final")
+            metric.max_pnl = parse_analysis_float(body, "pnl_max")
+            metric.min_pnl = parse_analysis_float(body, "pnl_min")
+            metric.position_ticks_count = int(parse_analysis_float(body, "ticks_posicao") or 0)
+            metric.breakeven_activated = parse_analysis_bool(body, "breakeven")
+            metric.trailing_activated = parse_analysis_bool(body, "trailing")
+            metric.max_price_after_entry = parse_analysis_float(body, "maior_preco_pos_entrada")
+            metric.signal_price = parse_analysis_float(body, "signal_price") or metric.signal_price
+            metric.execution_price = parse_analysis_float(body, "execution_price")
+            metric.open_slippage_pct = parse_analysis_float(body, "open_slippage_pct")
+            if metric.max_pnl is not None and metric.max_pnl > 0 and metric.final_pnl is not None:
+                metric.pnl_giveback_from_max = metric.max_pnl - metric.final_pnl
+            continue
+
+    return metrics
 
 
 def is_operated(item: TradeMetrics) -> bool:
@@ -756,71 +1232,214 @@ def avg_time_to_signal(items: list[TradeMetrics]) -> str:
         seconds_between(item.first_tick_at, item.signal_at)
         for item in items
         if item.first_tick_at and item.signal_at
+        and not item.warnings
     ]
     clean = [value for value in seconds if value is not None and value >= 0]
     return fmt_seconds(mean(clean)) if clean else "n/a"
 
 
-def winner_label(left: TradeMetrics, right: TradeMetrics, left_name: str, right_name: str) -> str:
-    left_pnl = left.final_pnl
-    right_pnl = right.final_pnl
-    if left_pnl is None and right_pnl is None:
-        return "empate"
-    if left_pnl is None:
-        return right_name
-    if right_pnl is None:
-        return left_name
-    if abs(left_pnl - right_pnl) < 0.25:
-        return "empate"
-    return left_name if left_pnl > right_pnl else right_name
+def result_group(item: TradeMetrics) -> str:
+    final_pnl = item.final_pnl
+    max_pnl = item.max_pnl
+    if final_pnl is None:
+        return "SEM_RESULTADO"
+    if final_pnl > 15:
+        return "BIG_WINNER"
+    if final_pnl >= 0:
+        return "WINNER"
+    if max_pnl is not None and max_pnl > 0:
+        return "LOSER_RECUPERAVEL"
+    return "LOSER_IRRECUPERAVEL"
 
 
-def match_shared_tokens(
-    left: dict[str, TradeMetrics],
-    right: dict[str, TradeMetrics],
-) -> tuple[list[tuple[TradeMetrics, TradeMetrics]], list[TradeMetrics], list[TradeMetrics]]:
-    right_by_key = dict(right)
-    right_by_symbol = {normalize_symbol(item.symbol): item for item in right.values()}
-    used_right_keys: set[str] = set()
-    shared: list[tuple[TradeMetrics, TradeMetrics]] = []
-    left_only: list[TradeMetrics] = []
+def pct_of(count: int, total: int) -> Optional[float]:
+    if total <= 0:
+        return None
+    return (count / total) * 100
 
-    for key, left_item in left.items():
-        right_item = right_by_key.get(key)
-        right_key = key if right_item else None
-        if right_item is None:
-            right_item = right_by_symbol.get(normalize_symbol(left_item.symbol))
-            if right_item:
-                right_key = token_key(right_item.symbol, right_item.token_address)
-        if right_item and right_key:
-            shared.append((left_item, right_item))
-            used_right_keys.add(right_key)
-        else:
-            left_only.append(left_item)
 
-    right_only = [item for key, item in right.items() if key not in used_right_keys]
-    return shared, left_only, right_only
+def winrate(items: list[TradeMetrics]) -> Optional[float]:
+    if not items:
+        return None
+    return pct_of(sum(1 for item in items if item.final_pnl is not None and item.final_pnl > 0), len(items))
+
+
+def median_value(values: list[Optional[float]]) -> Optional[float]:
+    clean = [value for value in values if value is not None]
+    return median(clean) if clean else None
+
+
+def time_to_signal_seconds(item: TradeMetrics) -> Optional[int]:
+    return seconds_between(item.first_tick_at, item.signal_at)
+
+
+def bucket_label(value: Optional[float], buckets: list[tuple[str, Optional[float], Optional[float]]]) -> Optional[str]:
+    if value is None:
+        return None
+    for label, lower, upper in buckets:
+        if lower is not None and value < lower:
+            continue
+        if upper is not None and value >= upper:
+            continue
+        return label
+    return None
+
+
+def build_metric_labels(metrics: list[TradeMetrics]) -> dict[int, str]:
+    by_symbol: dict[str, list[TradeMetrics]] = {}
+    for item in metrics:
+        by_symbol.setdefault(normalize_symbol(item.symbol), []).append(item)
+
+    labels: dict[int, str] = {}
+    for items in by_symbol.values():
+        ordered = sorted(items, key=lambda item: item.signal_at or item.first_tick_at or item.opened_at or "")
+        if len(ordered) == 1:
+            labels[id(ordered[0])] = ordered[0].symbol
+            continue
+        for index, item in enumerate(ordered, start=1):
+            labels[id(item)] = f"{item.symbol}#{index}"
+    return labels
+
+
+def max_runup_pct(ticks: list[EntryTick]) -> Optional[float]:
+    prices = [tick.price for tick in ticks if tick.price > 0]
+    if not prices:
+        return None
+    return pct_change(prices[0], max(prices))
+
+
+def max_drawdown_pct(ticks: list[EntryTick]) -> Optional[float]:
+    prices = [tick.price for tick in ticks if tick.price > 0]
+    if len(prices) < 2:
+        return None
+    peak = prices[0]
+    max_drawdown = 0.0
+    for price in prices:
+        peak = max(peak, price)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, ((peak - price) / peak) * 100)
+    return max_drawdown
+
+
+def first_momentum_entry(ticks: list[EntryTick], trigger_pct: float) -> Optional[tuple[int, EntryTick]]:
+    if not ticks or ticks[0].price <= 0:
+        return None
+    first_price = ticks[0].price
+    for index, tick in enumerate(ticks):
+        if pct_change(first_price, tick.price) is not None and pct_change(first_price, tick.price) >= trigger_pct:
+            return index, tick
+    return None
+
+
+def simulate_momentum_tp(
+    ticks: list[EntryTick],
+    entry_index: int,
+    tp_pct: float,
+) -> tuple[bool, Optional[int], Optional[float], Optional[float]]:
+    entry_tick = ticks[entry_index]
+    if entry_tick.price <= 0:
+        return False, None, None, None
+
+    observed_returns = [
+        pct_change(entry_tick.price, tick.price)
+        for tick in ticks[entry_index:]
+        if tick.price > 0
+    ]
+    clean_returns = [value for value in observed_returns if value is not None]
+    if not clean_returns:
+        return False, None, None, None
+
+    for tick in ticks[entry_index:]:
+        current_return = pct_change(entry_tick.price, tick.price)
+        if current_return is not None and current_return >= tp_pct:
+            return True, seconds_between(entry_tick.timestamp, tick.timestamp), max(clean_returns), clean_returns[-1]
+    return False, None, max(clean_returns), clean_returns[-1]
+
+
+def append_shadow_grail_analysis(lines: list[str], results: list[ShadowResult], active_count: int) -> None:
+    real_grails = [
+        item for item in results
+        if item.runup_pos_descarte_pct >= SHADOW_REAL_GRAIL_MIN_RUNUP_PCT
+    ]
+    false_grails = [
+        item for item in results
+        if item.runup_pos_descarte_pct < SHADOW_REAL_GRAIL_MIN_RUNUP_PCT
+    ]
+
+    lines.extend(["", "### Shadow Summary"])
+    lines.append(
+        f"- Total observados: {len(results)} | shadows ainda ativos: {active_count}"
+    )
+    lines.append(f"- Criterio exploratorio Grail real: runup pos-descarte >= {SHADOW_REAL_GRAIL_MIN_RUNUP_PCT:.0f}%.")
+    lines.append(f"- Runup > 20%: {sum(1 for item in results if item.runup_pos_descarte_pct > 20)}")
+    lines.append(f"- Runup > 50%: {sum(1 for item in results if item.runup_pos_descarte_pct > 50)}")
+    lines.append(f"- Runup > 100%: {sum(1 for item in results if item.runup_pos_descarte_pct > 100)}")
+    lines.append(f"- Runup > 200%: {sum(1 for item in results if item.runup_pos_descarte_pct > 200)}")
+    lines.append(f"- Colapso > 50%: {sum(1 for item in results if item.drawdown_pos_descarte_pct > 50)}")
+    lines.append(f"- Colapso > 90%: {sum(1 for item in results if item.drawdown_pos_descarte_pct > 90)}")
+
+    lines.extend(["", "### Top Shadow Winners"])
+    lines.append("| Token | runup_pos_descarte | drawdown_pos_descarte | liquidity_descarte | tempo_ate_topo | motivo_descarte |")
+    lines.append("|---|---:|---:|---:|---:|---|")
+    for item in sorted(results, key=lambda result: result.runup_pos_descarte_pct, reverse=True)[:15]:
+        lines.append(
+            f"| {item.symbol} | {fmt_pct(item.runup_pos_descarte_pct)} | "
+            f"{fmt_pct(item.drawdown_pos_descarte_pct)} | {fmt_num(item.liquidity_descarte, 2)} | "
+            f"{fmt_seconds(item.tempo_ate_topo)} | {item.motivo_descarte} |"
+        )
+    if not results:
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a |")
+
+    lines.extend(["", "### Grails Reais Vs Falsos Grails"])
+    lines.append(
+        "- `runup_ate_descarte` usa o primeiro preco observado no monitor principal ate o maior preco observado antes do descarte."
+    )
+    lines.append("| Grupo | n | runup_ate_descarte_avg | liquidity_descarte_avg | liquidity_max_pos_avg | liquidity_min_pos_avg | tempo_ate_topo_avg |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for label, items in (("GRAILS_REAIS", real_grails), ("FALSOS_GRAILS", false_grails)):
+        lines.append(
+            f"| {label} | {len(items)} | {fmt_pct(average([item.runup_ate_descarte_pct for item in items]))} | "
+            f"{fmt_num(average([item.liquidity_descarte for item in items]), 2)} | "
+            f"{fmt_num(average([item.liquidity_max for item in items]), 2)} | "
+            f"{fmt_num(average([item.liquidity_min for item in items]), 2)} | "
+            f"{fmt_seconds(average([item.tempo_ate_topo for item in items]))} |"
+        )
 
 
 def write_advanced_report(
-    primary_log: Path,
+    primary_log: Path | list[Path],
     output_path: Path,
     primary_name: str,
-    compare_log: Optional[Path] = None,
-    compare_name: str = "comparado",
+    position_log: Optional[Path | list[Path]] = None,
 ) -> None:
-    primary = parse_log_metrics(primary_log)
-    compare = parse_log_metrics(compare_log) if compare_log else {}
+    primary_logs = ensure_path_list(primary_log)
+    position_logs = ensure_path_list(position_log)
+
+    primary = merge_metric_sets([parse_log_metrics(log_path) for log_path in primary_logs])
+    shadow_results, active_shadow_count = load_shadow_results(primary_logs[0])
+    for log_path in position_logs:
+        merge_position_metrics(primary, parse_log_metrics(log_path))
     closed = [item for item in primary.values() if item.final_pnl is not None]
     winners = [item for item in closed if (item.final_pnl or 0) > 0]
     losers = [item for item in closed if (item.final_pnl or 0) <= 0]
+    labels = build_metric_labels(list(primary.values()))
+    invalid_monitor_ticks = count_invalid_price_ticks(primary_logs, "monitor")
+    invalid_position_ticks = count_invalid_price_ticks(position_logs, "position")
+    slippage_items = [
+        item for item in primary.values()
+        if item.open_slippage_pct is not None
+    ]
+
+    def display_name(item: TradeMetrics) -> str:
+        return labels.get(id(item), item.symbol)
 
     lines: list[str] = [
         "# Relatorio De Timing E Qualidade De Entrada",
         "",
         "## Resumo Quantitativo Geral",
         f"- Bot analisado: {primary_name}",
-        f"- Log analisado: {primary_log}",
+        f"- Logs analisados: {', '.join(str(path) for path in primary_logs)}",
+        f"- Position logs: {', '.join(str(path) for path in position_logs) if position_logs else 'n/a'}",
         f"- Tokens com dados: {len(primary)}",
         f"- Trades fechados: {len(closed)}",
         f"- Winners/losers: {len(winners)}/{len(losers)}",
@@ -829,12 +1448,34 @@ def write_advanced_report(
         f"- Buy pressure medio antes do sinal: {fmt_num(average([item.buy_pressure_avg for item in primary.values()]), 2)}",
         f"- Tempo ate sinal medio: {avg_time_to_signal(list(primary.values()))}",
         "",
+        "=== AUDITORIA DE PREÇO ===",
+        f"- Ticks invalidos no monitor: {invalid_monitor_ticks}",
+        f"- Ticks invalidos no position: {invalid_position_ticks}",
+        f"- Media open_slippage_pct: {fmt_pct(average([item.open_slippage_pct for item in slippage_items]))}",
+        f"- Maior open_slippage_pct positivo: {fmt_pct(max((item.open_slippage_pct for item in slippage_items if (item.open_slippage_pct or 0) > 0), default=None))}",
+        f"- Maior open_slippage_pct negativo: {fmt_pct(min((item.open_slippage_pct for item in slippage_items if (item.open_slippage_pct or 0) < 0), default=None))}",
+        "- Top tokens por open_slippage_pct absoluto:",
+        *[
+            f"  - {display_name(item)}: open_slippage_pct={fmt_pct(item.open_slippage_pct)}"
+            for item in sorted(slippage_items, key=lambda metric: abs(metric.open_slippage_pct or 0), reverse=True)[:10]
+        ],
+        *([] if slippage_items else ["  - n/a"]),
+        "",
         "## Metricas Por Token/Sinal",
     ]
 
+    warnings = [warning for item in primary.values() for warning in item.warnings]
+    if warnings:
+        metric_section_index = lines.index("## Metricas Por Token/Sinal")
+        lines[metric_section_index:metric_section_index] = [
+            "## Avisos Do Analisador",
+            *[f"- {warning}" for warning in warnings],
+            "",
+        ]
+
     for item in sorted(primary.values(), key=lambda metric: metric.signal_at or metric.first_tick_at or ""):
         lines.append(
-            f"- {item.symbol}: primeiro_tick={fmt_dt(item.first_tick_at)} | sinal={fmt_dt(item.signal_at)} | "
+            f"- {display_name(item)}: primeiro_tick={fmt_dt(item.first_tick_at)} | sinal={fmt_dt(item.signal_at)} | "
             f"tempo_ate_sinal={item.time_before_signal} | ticks_ate_sinal={item.ticks_before_signal} | "
             f"h1_captura={fmt_pct(item.h1_at_capture)} | preco_primeiro={fmt_num(item.first_price, 10)} | "
             f"preco_sinal={fmt_num(item.signal_price, 10)} | variacao={fmt_pct(item.price_change_before_signal)} | "
@@ -846,7 +1487,7 @@ def write_advanced_report(
     lines.extend(["", "## Health Antes Do Sinal"])
     for item in primary.values():
         lines.append(
-            f"- {item.symbol}: health_max={fmt_num(item.health_max_before_signal, 2)} | "
+            f"- {display_name(item)}: health_max={fmt_num(item.health_max_before_signal, 2)} | "
             f"ultimo_health={fmt_num(item.last_health_before_signal, 2)} | "
             f"health>=0.75={item.health_ge_075_count} | health>=0.87={item.health_ge_087_count} | "
             f"seq_health>=0.87={item.health_ge_087_max_seq} | queda_forte_vivo={item.queda_forte_vivo_count} | "
@@ -857,7 +1498,7 @@ def write_advanced_report(
     lines.extend(["", "## Buy Pressure Antes Do Sinal"])
     for item in primary.values():
         lines.append(
-            f"- {item.symbol}: media={fmt_num(item.buy_pressure_avg, 2)} | max={fmt_num(item.buy_pressure_max, 2)} | "
+            f"- {display_name(item)}: media={fmt_num(item.buy_pressure_avg, 2)} | max={fmt_num(item.buy_pressure_max, 2)} | "
             f"min={fmt_num(item.buy_pressure_min, 2)} | bp>=0.65={item.bp_ge_065_count} | "
             f"bp>=0.85={item.bp_ge_085_count} | seq_bp>=0.85={item.bp_ge_085_max_seq}"
         )
@@ -865,7 +1506,7 @@ def write_advanced_report(
     lines.extend(["", "## Pullback E Codex"])
     for item in primary.values():
         lines.append(
-            f"- {item.symbol}: pullback_max={fmt_pct(item.pullback_max_before_signal)} | "
+            f"- {display_name(item)}: pullback_max={fmt_pct(item.pullback_max_before_signal)} | "
             f"pullback_no_sinal={fmt_pct(item.pullback_at_signal)} | pullback_fora={item.pullback_fora_count} | "
             f"pullback_valido={item.pullback_valido_count} | cenario_exaustao={item.cenario_exaustao_count} | "
             f"volume_minguando={item.volume_minguando_count} | motivo_entrada={item.entry_reason or 'n/a'}"
@@ -875,18 +1516,169 @@ def write_advanced_report(
     for item in primary.values():
         if item.opened_at or item.sold_at or item.position_ticks_count or item.final_pnl is not None:
             lines.append(
-                f"- {item.symbol}: abertura={fmt_dt(item.opened_at)} | venda={fmt_dt(item.sold_at)} | "
+                f"- {display_name(item)}: abertura={fmt_dt(item.opened_at)} | venda={fmt_dt(item.sold_at)} | "
                 f"duracao={fmt_duration(item.opened_at, item.sold_at)} | saida={item.exit_reason or 'n/a'} | "
                 f"pnl_final={fmt_pct(item.final_pnl)} | pnl_max={fmt_pct(item.max_pnl)} | pnl_min={fmt_pct(item.min_pnl)} | "
+                f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
                 f"ticks_posicao={item.position_ticks_count} | bp_persist_saida={item.bp_persist_exit if item.bp_persist_exit is not None else 'n/a'} | "
                 f"breakeven={item.breakeven_activated} | trailing={item.trailing_activated} | "
-                f"maior_preco_pos_entrada={fmt_num(item.max_price_after_entry, 10)}"
+                f"maior_preco_pos_entrada={fmt_num(item.max_price_after_entry, 10)} | "
+                f"signal_price={fmt_num(item.signal_price, 10)} | execution_price={fmt_num(item.execution_price, 10)} | "
+                f"open_slippage_pct={fmt_pct(item.open_slippage_pct)}"
             )
+
+    lines.extend(["", "## Entradas E Saidas Por Tipo"])
+    entry_reason_counts = Counter(item.entry_reason or "n/a" for item in primary.values() if item.signal_at)
+    exit_reason_counts = Counter(item.exit_reason or "n/a" for item in closed)
+    lines.append("### Entradas")
+    if entry_reason_counts:
+        for reason, count in entry_reason_counts.most_common():
+            items = [item for item in primary.values() if item.signal_at and (item.entry_reason or "n/a") == reason]
+            lines.append(
+                f"- {reason}: {count} | pnl_fechado_medio={fmt_pct(average([item.final_pnl for item in items]))}"
+            )
+    else:
+        lines.append("- n/a")
+    lines.append("### Saidas")
+    if exit_reason_counts:
+        for reason, count in exit_reason_counts.most_common():
+            items = [item for item in closed if (item.exit_reason or "n/a") == reason]
+            lines.append(
+                f"- {reason}: {count} | pnl_medio={fmt_pct(average([item.final_pnl for item in items]))}"
+            )
+    else:
+        lines.append("- n/a")
+
+    lines.extend(["", "## Diagnostico Position: Topo Vs Saida"])
+    position_items = [
+        item for item in primary.values()
+        if item.opened_at or item.position_ticks_count or item.final_pnl is not None
+    ]
+    if closed:
+        lines.append("| Token | pnl_min | pnl_max | devolucao_do_topo | pnl_final | motivo |")
+        lines.append("|---|---:|---:|---:|---:|---|")
+        for item in sorted(closed, key=lambda metric: metric.max_pnl if metric.max_pnl is not None else -999, reverse=True):
+            lines.append(
+                f"| {display_name(item)} | {fmt_pct(item.min_pnl)} | {fmt_pct(item.max_pnl)} | "
+                f"{fmt_pct(item.pnl_giveback_from_max)} | {fmt_pct(item.final_pnl)} | {item.exit_reason or 'n/a'} |"
+            )
+    else:
+        lines.append("- Nenhum dado de position encontrado. Use --position-log para logs desacoplados.")
+
+    lines.extend(["", "## Candidatos A Big Winner"])
+    big_winner_candidates = [
+        item for item in position_items
+        if item.max_pnl is not None and item.max_pnl >= 10
+    ]
+    if big_winner_candidates:
+        for item in sorted(big_winner_candidates, key=lambda metric: metric.max_pnl or 0, reverse=True)[:20]:
+            lines.append(
+                f"- {display_name(item)}: pnl_max={fmt_pct(item.max_pnl)} | pnl_final={fmt_pct(item.final_pnl)} | "
+                f"devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
+                f"liq_signal={fmt_num(item.liquidity_at_signal, 2)} | liq_open={fmt_num(item.liquidity_at_position_open, 2)} | "
+                f"liq_growth_pre={fmt_pct(item.liquidity_growth_pct_before_signal)} | liq_growth_pos={fmt_pct(item.liquidity_growth_pct_during_position)} | "
+                f"bp_media={fmt_num(item.buy_pressure_avg, 2)} | health_max={fmt_num(item.health_max_before_signal, 2)} | "
+                f"runup_pre_sinal={fmt_pct(item.runup_before_signal)} | motivo_entrada={item.entry_reason or 'n/a'}"
+            )
+    else:
+        lines.append("- Nenhum token atingiu pnl_max >= 10% pelos dados de position disponíveis.")
+
+    lines.extend(["", "## Grupos Por Resultado"])
+    groups = (
+        ("BIG_WINNERS", [item for item in position_items if item.max_pnl is not None and item.max_pnl >= 10]),
+        ("WINNERS", [item for item in position_items if item.final_pnl is not None and item.final_pnl > 0 and (item.max_pnl or 0) < 10]),
+        ("LOSERS", [item for item in position_items if item.final_pnl is not None and item.final_pnl <= 0]),
+    )
+    for label, items in groups:
+        lines.append(f"### {label}")
+        lines.append(
+            f"- quantidade={len(items)} | pnl_final_medio={fmt_pct(average([item.final_pnl for item in items]))} | "
+            f"pnl_min_medio={fmt_pct(average([item.min_pnl for item in items]))} | "
+            f"pnl_max_medio={fmt_pct(average([item.max_pnl for item in items]))} | "
+            f"devolucao_media={fmt_pct(average([item.pnl_giveback_from_max for item in items]))} | "
+            f"liquidez_entrada_media={fmt_num(average([item.liquidity_at_signal or item.liquidity_at_position_open for item in items]), 2)} | "
+            f"crescimento_liq_pre_medio={fmt_pct(average([item.liquidity_growth_pct_before_signal for item in items]))} | "
+            f"crescimento_liq_pos_medio={fmt_pct(average([item.liquidity_growth_pct_during_position for item in items]))}"
+        )
+
+    lines.extend(["", "## Ticks Ate Sinal Por Grupo De Resultado"])
+    grouped_closed = {
+        label: [item for item in closed if result_group(item) == label]
+        for label in ("BIG_WINNER", "WINNER", "LOSER_RECUPERAVEL", "LOSER_IRRECUPERAVEL")
+    }
+    lines.append("| Grupo | n | avg | median | pnl_min_avg | % <20 ticks | % >60 ticks | % >100 ticks |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for label, items in grouped_closed.items():
+        ticks = [item.ticks_before_signal for item in items if item.ticks_before_signal is not None]
+        total = len(ticks)
+        lines.append(
+            f"| {label} | {len(items)} | {fmt_num(mean(ticks) if ticks else None, 2)} | "
+            f"{fmt_num(median(ticks) if ticks else None, 2)} | "
+            f"{fmt_pct(average([item.min_pnl for item in items]))} | "
+            f"{fmt_pct(pct_of(sum(1 for value in ticks if value < 20), total))} | "
+            f"{fmt_pct(pct_of(sum(1 for value in ticks if value > 60), total))} | "
+            f"{fmt_pct(pct_of(sum(1 for value in ticks if value > 100), total))} |"
+        )
+
+    lines.extend(["", "## Tempo Ate Sinal Por Faixa Resultado"])
+    time_buckets = [
+        ("0-2 min", 0, 120),
+        ("2-5 min", 120, 300),
+        ("5-10 min", 300, 600),
+        ("10-15 min", 600, 900),
+        (">15 min", 900, None),
+    ]
+    lines.append("| Faixa | n | winrate | pnl_avg | big_winners |")
+    lines.append("|---|---:|---:|---:|---:|")
+    for label, lower, upper in time_buckets:
+        items = [
+            item for item in closed
+            if bucket_label(time_to_signal_seconds(item), [(label, lower, upper)]) == label
+        ]
+        lines.append(
+            f"| {label} | {len(items)} | {fmt_pct(winrate(items))} | "
+            f"{fmt_pct(average([item.final_pnl for item in items]))} | "
+            f"{sum(1 for item in items if result_group(item) == 'BIG_WINNER')} |"
+        )
+
+    lines.extend(["", "## Runup Pre-Sinal Resultado"])
+    runup_buckets = [
+        ("0-10%", 0, 10),
+        ("10-30%", 10, 30),
+        ("30-50%", 30, 50),
+        (">50%", 50, None),
+    ]
+    lines.append("| Faixa runup | n | winrate | pnl_avg | big_winners | irrecuperaveis |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for label, lower, upper in runup_buckets:
+        items = [
+            item for item in closed
+            if bucket_label(item.runup_before_signal, [(label, lower, upper)]) == label
+        ]
+        lines.append(
+            f"| {label} | {len(items)} | {fmt_pct(winrate(items))} | "
+            f"{fmt_pct(average([item.final_pnl for item in items]))} | "
+            f"{sum(1 for item in items if result_group(item) == 'BIG_WINNER')} | "
+            f"{sum(1 for item in items if result_group(item) == 'LOSER_IRRECUPERAVEL')} |"
+        )
+
+    lines.extend(["", "## Simulacao Min Ticks Before Decision"])
+    lines.append("| min_ticks | trades | bloqueados | winrate | pnl_avg | big_win perdidos |")
+    lines.append("|---:|---:|---:|---:|---:|---:|")
+    for min_ticks in (12, 24, 36, 48, 60):
+        allowed = [item for item in closed if item.ticks_before_signal >= min_ticks]
+        blocked = [item for item in closed if item.ticks_before_signal < min_ticks]
+        lost_big_wins = sum(1 for item in blocked if result_group(item) == "BIG_WINNER")
+        lines.append(
+            f"| {min_ticks} | {len(allowed)} | {len(blocked)} | "
+            f"{fmt_pct(winrate(allowed))} | {fmt_pct(average([item.final_pnl for item in allowed]))} | "
+            f"{lost_big_wins} |"
+        )
 
     lines.extend(["", "## Liquidez Estrutural Por Token"])
     for item in primary.values():
         lines.append(
-            f"- {item.symbol}: liq_first={fmt_num(item.liquidity_at_first_tick, 2)} | "
+            f"- {display_name(item)}: liq_first={fmt_num(item.liquidity_at_first_tick, 2)} | "
             f"liq_signal={fmt_num(item.liquidity_at_signal, 2)} | "
             f"liq_open={fmt_num(item.liquidity_at_position_open, 2)} | "
             f"liq_last_before_sell={fmt_num(item.liquidity_last_before_sell, 2)} | "
@@ -911,6 +1703,76 @@ def write_advanced_report(
             f"drenagem_liquidez_media={fmt_pct(average([item.liquidity_drop_pct_during_position for item in items]))}"
         )
 
+    lines.extend(["", "## Liquidez E Volume Nos Primeiros Ticks Da Posicao"])
+    first_ticks_metrics = {
+        id(item): first_five_position_metrics(item)
+        for item in closed
+    }
+    first_ticks_groups = (
+        ("BIG WINNERS", [item for item in closed if result_group(item) == "BIG_WINNER"]),
+        ("WINNERS", [item for item in closed if result_group(item) == "WINNER"]),
+        ("LOSERS RECUPERAVEIS", [item for item in closed if result_group(item) == "LOSER_RECUPERAVEL"]),
+        ("LOSERS IRRECUPERAVEIS", [item for item in closed if result_group(item) == "LOSER_IRRECUPERAVEL"]),
+    )
+    lines.append("| Grupo | liq_delta_avg | crescendo | drenando | vol_avg | bp_avg |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for label, items in first_ticks_groups:
+        metrics = [first_ticks_metrics[id(item)] for item in items]
+        deltas = [metric[2] for metric in metrics if metric[2] is not None]
+        lines.append(
+            f"| {label} | {fmt_pct(average(deltas))} | "
+            f"{sum(1 for delta in deltas if delta > 0)} | {sum(1 for delta in deltas if delta < 0)} | "
+            f"{fmt_num(average([metric[3] for metric in metrics]), 2)} | "
+            f"{fmt_num(average([metric[4] for metric in metrics]), 4)} |"
+        )
+
+    def append_first_ticks_table(title: str, items: list[TradeMetrics], reverse: bool) -> None:
+        lines.extend(["", f"### {title}"])
+        lines.append("| Token | liq_p0 | liq_p4 | liq_delta | vol_avg | bp_avg | pnl_final |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                first_ticks_metrics[id(item)][2] is None,
+                -(first_ticks_metrics[id(item)][2] or 0) if reverse else (first_ticks_metrics[id(item)][2] or 0),
+            ),
+        )
+        for item in ordered:
+            liquidity_p0, liquidity_p4, liquidity_delta, volume_avg, buy_pressure_avg = first_ticks_metrics[id(item)]
+            lines.append(
+                f"| {display_name(item)} | {fmt_num(liquidity_p0, 2)} | {fmt_num(liquidity_p4, 2)} | "
+                f"{fmt_pct(liquidity_delta)} | {fmt_num(volume_avg, 2)} | {fmt_num(buy_pressure_avg, 4)} | "
+                f"{fmt_pct(item.final_pnl)} |"
+            )
+
+    irrecoverable = [item for item in closed if result_group(item) == "LOSER_IRRECUPERAVEL"]
+    big_winners = [item for item in closed if result_group(item) == "BIG_WINNER"]
+    append_first_ticks_table("Losers Irrecuperaveis", irrecoverable, reverse=False)
+    append_first_ticks_table("Big Winners", big_winners, reverse=True)
+
+    winner_deltas = [
+        first_ticks_metrics[id(item)][2]
+        for item in closed
+        if result_group(item) in {"BIG_WINNER", "WINNER"}
+        and first_ticks_metrics[id(item)][2] is not None
+    ]
+    irrecoverable_deltas = [
+        first_ticks_metrics[id(item)][2]
+        for item in irrecoverable
+        if first_ticks_metrics[id(item)][2] is not None
+    ]
+    avg_winner_delta = average(winner_deltas)
+    avg_irrecoverable_delta = average(irrecoverable_deltas)
+    lines.extend(["", "### Conclusao Automatica"])
+    if (
+        avg_winner_delta is not None
+        and avg_irrecoverable_delta is not None
+        and avg_irrecoverable_delta < avg_winner_delta - 5
+    ):
+        lines.append("- Padrao confirmado: irrecuperaveis drenam liquidez mais rapido.")
+    else:
+        lines.append("- Padrao nao confirmado com a amostra atual.")
+
     collapse_events = [
         item for item in closed
         if item.possible_liquidity_collapse
@@ -919,7 +1781,7 @@ def write_advanced_report(
     if collapse_events:
         for item in collapse_events:
             lines.append(
-                f"- {item.symbol}: pnl={fmt_pct(item.final_pnl)} | "
+                f"- {display_name(item)}: pnl={fmt_pct(item.final_pnl)} | "
                 f"liquidity_at_entry={fmt_num(item.liquidity_at_signal or item.liquidity_at_position_open, 2)} | "
                 f"liquidity_min_during_position={fmt_num(item.liquidity_min_during_position, 2)} | "
                 f"liquidity_drop_pct={fmt_pct(item.liquidity_drop_pct_during_position)} | "
@@ -929,70 +1791,19 @@ def write_advanced_report(
     else:
         lines.append("- Nenhum evento detectado pelos criterios atuais.")
 
-    if compare_log:
-        shared, primary_only, compare_only = match_shared_tokens(primary, compare)
-        shared_operated = [(left, right) for left, right in shared if is_operated(left) and is_operated(right)]
-        primary_matched_operated_keys = {
-            token_key(left.symbol, left.token_address)
-            for left, right in shared
-            if is_operated(left) and is_operated(right)
-        }
-        compare_matched_operated_keys = {
-            token_key(right.symbol, right.token_address)
-            for left, right in shared
-            if is_operated(left) and is_operated(right)
-        }
-        primary_operated = [item for item in primary.values() if is_operated(item)]
-        compare_operated = [item for item in compare.values() if is_operated(item)]
-        primary_only_operated = [
-            item for item in primary_operated
-            if token_key(item.symbol, item.token_address) not in primary_matched_operated_keys
-        ]
-        compare_only_operated = [
-            item for item in compare_operated
-            if token_key(item.symbol, item.token_address) not in compare_matched_operated_keys
-        ]
-        lines.extend(["", f"## Comparacao {primary_name} vs {compare_name}"])
-        if shared_operated:
-            for left, right in shared_operated:
-                lines.append(
-                    f"- {left.symbol}: sinal_{primary_name}={fmt_dt(left.signal_at)} | sinal_{compare_name}={fmt_dt(right.signal_at)} | "
-                    f"dif_tempo={fmt_seconds(seconds_between(left.signal_at, right.signal_at))} | entrada_{primary_name}={fmt_num(left.signal_price, 10)} | "
-                    f"entrada_{compare_name}={fmt_num(right.signal_price, 10)} | dif_preco={fmt_pct(pct_change(left.signal_price, right.signal_price))} | "
-                    f"liq_entrada_{primary_name}={fmt_num(left.liquidity_at_signal, 2)} | liq_entrada_{compare_name}={fmt_num(right.liquidity_at_signal, 2)} | "
-                    f"dif_liq_entrada={fmt_pct(pct_change(left.liquidity_at_signal, right.liquidity_at_signal))} | "
-                    f"saida_{primary_name}={left.exit_reason or 'n/a'} | saida_{compare_name}={right.exit_reason or 'n/a'} | "
-                    f"pnl_{primary_name}={fmt_pct(left.final_pnl)} | pnl_{compare_name}={fmt_pct(right.final_pnl)} | "
-                    f"vantagem={winner_label(left, right, primary_name, compare_name)}"
-                )
-        else:
-            lines.append("- Nenhum token operado pelos dois bots encontrado por address ou simbolo normalizado.")
-
-        lines.extend(["", "## Tokens Exclusivos"])
-        for name, items in ((primary_name, primary_only_operated), (compare_name, compare_only_operated)):
-            closed_items = [item for item in items if item.final_pnl is not None]
-            item_winners = [item for item in closed_items if (item.final_pnl or 0) > 0]
-            item_losers = [item for item in closed_items if (item.final_pnl or 0) <= 0]
-            lines.append(
-                f"- Exclusivos {name}: {', '.join(item.symbol for item in items) or 'nenhum'} | "
-                f"resultado_medio={fmt_pct(average([item.final_pnl for item in closed_items]))} | "
-                f"winners/losers={len(item_winners)}/{len(item_losers)} | "
-                f"health_max_medio={fmt_num(average([item.health_max_before_signal for item in items]), 2)} | "
-                f"buy_pressure_medio={fmt_num(average([item.buy_pressure_avg for item in items]), 2)} | "
-                f"tempo_ate_sinal_medio={avg_time_to_signal(items)}"
-            )
-
     lines.extend(["", "## Ranking Dos Maiores Winners"])
     for item in sorted(closed, key=lambda metric: metric.final_pnl or 0, reverse=True)[:10]:
         lines.append(
-            f"- {item.symbol}: pnl={fmt_pct(item.final_pnl)} | saida={item.exit_reason or 'n/a'} | "
+            f"- {display_name(item)}: pnl={fmt_pct(item.final_pnl)} | saida={item.exit_reason or 'n/a'} | "
+            f"pnl_max={fmt_pct(item.max_pnl)} | devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
             f"h1={fmt_pct(item.h1_at_capture)} | liquidity_at_entry={fmt_num(item.liquidity_at_signal or item.liquidity_at_position_open, 2)}"
         )
 
     lines.extend(["", "## Ranking Dos Maiores Losers"])
     for item in sorted(closed, key=lambda metric: metric.final_pnl or 0)[:10]:
         lines.append(
-            f"- {item.symbol}: pnl={fmt_pct(item.final_pnl)} | saida={item.exit_reason or 'n/a'} | "
+            f"- {display_name(item)}: pnl={fmt_pct(item.final_pnl)} | saida={item.exit_reason or 'n/a'} | "
+            f"pnl_max={fmt_pct(item.max_pnl)} | devolucao_do_topo={fmt_pct(item.pnl_giveback_from_max)} | "
             f"h1={fmt_pct(item.h1_at_capture)} | liquidity_at_entry={fmt_num(item.liquidity_at_signal or item.liquidity_at_position_open, 2)}"
         )
 
@@ -1004,7 +1815,7 @@ def write_advanced_report(
     ]
     for item in sorted(late_items, key=lambda metric: metric.runup_before_signal or 0, reverse=True)[:15]:
         lines.append(
-            f"- {item.symbol}: runup_pre_sinal={fmt_pct(item.runup_before_signal)} | h1={fmt_pct(item.h1_at_capture)} | "
+            f"- {display_name(item)}: runup_pre_sinal={fmt_pct(item.runup_before_signal)} | h1={fmt_pct(item.h1_at_capture)} | "
             f"pnl={fmt_pct(item.final_pnl)}"
         )
     if not late_items:
@@ -1019,11 +1830,102 @@ def write_advanced_report(
     ]
     for item in early_items[:15]:
         lines.append(
-            f"- {item.symbol}: ticks_ate_sinal={item.ticks_before_signal} | pnl_max={fmt_pct(item.max_pnl)} | "
+            f"- {display_name(item)}: ticks_ate_sinal={item.ticks_before_signal} | pnl_max={fmt_pct(item.max_pnl)} | "
             f"pnl_final={fmt_pct(item.final_pnl)} | motivo={item.entry_reason or 'n/a'}"
         )
     if not early_items:
         lines.append("- Nenhum sinal claro de entrada precoce pelas regras de medicao.")
+
+    lines.extend(["", "## Analise Grail / Momentum Continuo"])
+    lines.append(
+        "- Simulacao retrospectiva isolada. Nao altera sinais reais, estrategia ou resultados registrados."
+    )
+    append_shadow_grail_analysis(lines, shadow_results, active_shadow_count)
+    momentum_candidates = [
+        item for item in primary.values()
+        if item.monitor_ticks
+        and max_runup_pct(item.monitor_ticks) is not None
+        and (max_runup_pct(item.monitor_ticks) or 0) >= MOMENTUM_CANDIDATE_MIN_RUNUP_PCT
+    ]
+    momentum_candidates.sort(key=lambda item: max_runup_pct(item.monitor_ticks) or 0, reverse=True)
+
+    lines.extend(["", "### Parte 1 - Identificacao De Candidatos"])
+    lines.append(
+        f"- Criterio exploratorio atual: runup maximo monitorado >= {MOMENTUM_CANDIDATE_MIN_RUNUP_PCT:.0f}%."
+    )
+    if momentum_candidates:
+        lines.append("| Token | ticks | tempo_monitoramento | preco_primeiro_tick | preco_maximo | runup_pct | drawdown_max_pct | houve_sinal | resultado_final |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---|---:|")
+        for item in momentum_candidates:
+            prices = [tick.price for tick in item.monitor_ticks if tick.price > 0]
+            lines.append(
+                f"| {display_name(item)} | {len(item.monitor_ticks)} | "
+                f"{fmt_duration(item.monitor_ticks[0].timestamp, item.monitor_ticks[-1].timestamp)} | "
+                f"{fmt_num(prices[0] if prices else None, 10)} | {fmt_num(max(prices) if prices else None, 10)} | "
+                f"{fmt_pct(max_runup_pct(item.monitor_ticks))} | {fmt_pct(max_drawdown_pct(item.monitor_ticks))} | "
+                f"{'sim' if item.signal_at else 'nao'} | {fmt_pct(item.final_pnl)} |"
+            )
+    else:
+        lines.append("- Nenhum candidato encontrado nos ticks brutos disponiveis.")
+
+    lines.extend(["", "### Parte 2 - Simulacao De Entrada Por Momentum"])
+    lines.append("| Token | runup_trigger | tick_entrada | tempo_desde_primeiro_tick | preco_entrada_hipotetica |")
+    lines.append("|---|---:|---:|---:|---:|")
+    momentum_entries: list[tuple[TradeMetrics, float, int, EntryTick]] = []
+    for item in momentum_candidates:
+        for trigger in MOMENTUM_RUNUP_TRIGGERS:
+            entry = first_momentum_entry(item.monitor_ticks, trigger)
+            if entry is None:
+                continue
+            entry_index, entry_tick = entry
+            momentum_entries.append((item, trigger, entry_index, entry_tick))
+            lines.append(
+                f"| {display_name(item)} | {fmt_pct(trigger)} | {entry_index + 1} | "
+                f"{fmt_seconds(seconds_between(item.monitor_ticks[0].timestamp, entry_tick.timestamp))} | "
+                f"{fmt_num(entry_tick.price, 10)} |"
+            )
+    if not momentum_entries:
+        lines.append("| n/a | n/a | n/a | n/a | n/a |")
+
+    lines.extend(["", "### Parte 3 - Simulacao De Saida"])
+    lines.append("| Token | runup_trigger | TP | atingido | tempo_ate_TP | retorno_max_observado | retorno_final_observado |")
+    lines.append("|---|---:|---:|---|---:|---:|---:|")
+    momentum_results: list[tuple[float, float, bool, Optional[float]]] = []
+    for item, trigger, entry_index, _entry_tick in momentum_entries:
+        for tp in MOMENTUM_TP_TARGETS:
+            reached, seconds_to_tp, max_return, final_return = simulate_momentum_tp(item.monitor_ticks, entry_index, tp)
+            simulated_return = tp if reached else final_return
+            momentum_results.append((trigger, tp, reached, simulated_return))
+            lines.append(
+                f"| {display_name(item)} | {fmt_pct(trigger)} | {fmt_pct(tp)} | {'sim' if reached else 'nao'} | "
+                f"{fmt_seconds(seconds_to_tp)} | {fmt_pct(max_return)} | {fmt_pct(final_return)} |"
+            )
+    if not momentum_results:
+        lines.append("| n/a | n/a | n/a | n/a | n/a | n/a | n/a |")
+
+    lines.extend(["", "### Parte 4 - Estatisticas Consolidadas"])
+    lines.append("| Runup Trigger | TP | Trades | Winrate TP | Retorno Medio Simulado |")
+    lines.append("|---:|---:|---:|---:|---:|")
+    for trigger in MOMENTUM_RUNUP_TRIGGERS:
+        for tp in MOMENTUM_TP_TARGETS:
+            results = [
+                (reached, simulated_return)
+                for result_trigger, result_tp, reached, simulated_return in momentum_results
+                if result_trigger == trigger and result_tp == tp
+            ]
+            lines.append(
+                f"| {fmt_pct(trigger)} | {fmt_pct(tp)} | {len(results)} | "
+                f"{fmt_pct(pct_of(sum(1 for reached, _return in results if reached), len(results)))} | "
+                f"{fmt_pct(average([simulated_return for _reached, simulated_return in results]))} |"
+            )
+
+    lines.extend(["", "### Campos Adicionais Para Evolucao"])
+    lines.append(
+        "- O Shadow Monitor preserva preco, liquidez, volume e buy pressure apos o descarte sem interferir no fluxo principal."
+    )
+    lines.append(
+        "- As estatisticas Shadow consideram somente janelas concluidas. Tokens ainda ativos aparecem separados no resumo."
+    )
 
     lines.extend(["", "## Candidatos A Estudo Manual"])
     manual = sorted(
@@ -1038,7 +1940,7 @@ def write_advanced_report(
     )[:15]
     for item in manual:
         lines.append(
-            f"- {item.symbol}: pnl={fmt_pct(item.final_pnl)} | bp>=0.85={item.bp_ge_085_count} | "
+            f"- {display_name(item)}: pnl={fmt_pct(item.final_pnl)} | bp>=0.85={item.bp_ge_085_count} | "
             f"codex_nao_confirmou={item.codex_nao_confirmou_count} | pullback_max={fmt_pct(item.pullback_max_before_signal)} | "
             f"h1={fmt_pct(item.h1_at_capture)}"
         )

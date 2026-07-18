@@ -8,17 +8,27 @@ A cada chamada:
   3. Grava candidatos aprovados em final_monitoring_candidates.json
   4. Mantém watchlist.json com ciclo de vida e status de cada token
 
-O loop de execução fica fora do Python, em rodar_scanner.sh. Isso permite
+O loop de execução fica fora do Python, em scripts/rodar_scanner.sh. Isso permite
 rodar este módulo uma única vez durante testes.
 """
 
 import json
+import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.project_env import load_project_env
+
+load_project_env()
 
 
 # ============================================================
@@ -29,6 +39,8 @@ TOKEN_SCANNER_VERSION = "token-scanner-watchlist-v1-krpto3-2026-05-24"
 
 DEXSCREENER_LATEST_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEXSCREENER_TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chain_id}/{token_address}"
+DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS = 10
+DEXSCREENER_RATE_LIMIT_COUNTS = {}
 
 SOLANA_BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
@@ -38,8 +50,7 @@ SOLANA_BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqr
 # ============================================================
 
 def load_config():
-    base_dir = Path(__file__).resolve().parents[2]
-    config_path = base_dir / "config" / "config.yaml"
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -90,6 +101,17 @@ def is_valid_solana_address(address: str) -> bool:
     if len(address) < 32 or len(address) > 44:
         return False
     return all(char in SOLANA_BASE58_ALPHABET for char in address)
+
+
+def log_dexscreener_rate_limit(endpoint: str, token_address: str | None = None) -> None:
+    key = token_address or endpoint
+    DEXSCREENER_RATE_LIMIT_COUNTS[key] = DEXSCREENER_RATE_LIMIT_COUNTS.get(key, 0) + 1
+    token_part = f" token={token_address}" if token_address else ""
+    print(
+        f"[RATE_LIMIT] source=scanner{token_part} endpoint={endpoint} "
+        f"backoff={DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS}s "
+        f"count={DEXSCREENER_RATE_LIMIT_COUNTS[key]}"
+    )
 
 
 # ============================================================
@@ -169,6 +191,11 @@ def add_to_watchlist(watchlist: dict, candidates: list) -> tuple[dict, int]:
         watchlist[token_address] = {
             "token_address": token_address,
             "symbol": candidate.get("symbol", token_address[:6]),
+            "dex_id": candidate.get("dex_id"),
+            "pair_address": candidate.get("pair_address"),
+            "base_mint": candidate.get("base_mint"),
+            "quote_mint": candidate.get("quote_mint"),
+            "liquidity_usd": candidate.get("liquidity_usd"),
             "discovered_at": now_iso(),
             "discovered_at_utc": now_utc().isoformat(),
             "status": "novo",
@@ -193,9 +220,17 @@ def get_known_token_addresses(watchlist: dict) -> set:
 # ============================================================
 
 def fetch_latest_token_profiles():
-    response = requests.get(DEXSCREENER_LATEST_PROFILES_URL, timeout=20)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(DEXSCREENER_LATEST_PROFILES_URL, timeout=20)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            log_dexscreener_rate_limit(DEXSCREENER_LATEST_PROFILES_URL)
+            time.sleep(DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS)
+            return []
+        raise
 
 
 def filter_initial_tokens(tokens, scanner_config, known_addresses: set) -> list:
@@ -240,9 +275,17 @@ def fetch_token_pairs(chain_id, token_address):
         chain_id=chain_id,
         token_address=token_address,
     )
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            log_dexscreener_rate_limit(url, token_address)
+            time.sleep(DEXSCREENER_RATE_LIMIT_BACKOFF_SECONDS)
+            return []
+        raise
 
 
 def enrich_tokens_with_pairs(tokens) -> list:
@@ -482,13 +525,29 @@ def get_final_filter_rejection_reasons(jupiter_validation, config):
     return reasons
 
 
+def build_pool_metadata(pair):
+    base_token = pair.get("baseToken") or {}
+    quote_token = pair.get("quoteToken") or {}
+    return {
+        "dex_id": pair.get("dexId"),
+        "pair_address": pair.get("pairAddress"),
+        "base_mint": base_token.get("address"),
+        "quote_mint": quote_token.get("address"),
+        "liquidity_usd": get_nested_number(pair, ["liquidity", "usd"]),
+    }
+
+
 def build_final_candidate(item):
     validation = item["jupiter_validation"]
     token_info = validation["token_info"]["data"]
+    selected_pair = item["candidate"].get("selected_pair", {})
+    pool_metadata = build_pool_metadata(selected_pair)
     return {
         "token_address": validation["token_address"],
         "symbol": token_info.get("symbol"),
         "name": token_info.get("name"),
+        **pool_metadata,
+        "pool_metadata": pool_metadata,
         "candidate": item["candidate"],
         "jupiter_validation_summary": {
             "approved_by_jupiter": validation.get("approved_by_jupiter"),
@@ -575,7 +634,15 @@ def run_scanner_cycle(config: dict, watchlist: dict) -> tuple[dict, list]:
             print(f"[Filtro Final] REPROVADO {symbol} | " + " | ".join(reasons))
             continue
 
-        print(f"[Filtro Final] APROVADO {symbol}")
+        pool_metadata = build_pool_metadata(candidate.get("selected_pair", {}))
+        print(
+            f"[Filtro Final] APROVADO {symbol} | "
+            f"dex_id={pool_metadata.get('dex_id')} | "
+            f"pair_address={pool_metadata.get('pair_address')} | "
+            f"base_mint={pool_metadata.get('base_mint')} | "
+            f"quote_mint={pool_metadata.get('quote_mint')} | "
+            f"liquidity_usd={pool_metadata.get('liquidity_usd')}"
+        )
         item = {"candidate": candidate, "jupiter_validation": validation}
         final_candidates.append(build_final_candidate(item))
 

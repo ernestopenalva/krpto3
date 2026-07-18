@@ -51,11 +51,26 @@ token_monitor_buy:
   poll_interval_seconds: 5
   max_monitoring_minutes: 15
   max_monitored_tokens: 5
+  backoff_on_rate_limit_seconds: 10
 
   decision_window_minutes: 5
   min_ticks_before_decision: 12
 
+  momentum_entry:
+    enabled: true
+    min_ticks_before_decision: 3
+    min_momentum_pct: 4.0
+    max_runup_pct: 12.0
+    max_pullback_from_peak_pct: 3.0
+    min_liquidity_growth_pct: 0.0
+    max_liquidity_drop_pct: 5.0
+    health_min_score: 0.60
+    min_buy_pressure: 0.52
+    block_if_price_falling: true
+    price_falling_window_ticks: 3
+
   entry:
+    min_ticks_before_decision: 12
     min_pullback_pct: 2.0
     max_pullback_pct: 8.0
     max_drawdown_discard_pct: 10.0
@@ -72,29 +87,40 @@ token_monitor_buy:
 position_monitor:
   enabled: true
   mode: PAPER
+  source: onchain_usd
+  provider: pumpswap
+  sol_usd_provider: alchemy_prices
   input_file: "data/token_monitor/buy_signals.json"
   output_dir: "data/position_monitor"
 
-  poll_interval_seconds: 2
+  poll_interval_seconds: 1
   max_open_positions: 2
-
+  timeout_seconds: 15
+  sol_usd_cache_seconds: 60
+  sol_usd_max_staleness_seconds: 120
   stop_loss_pct: 5
-  breakeven_trigger_pct: 3
-  breakeven_profit_pct: 1
-  trailing_stop_pct: 4
+  breakeven_trigger_pct: 5
+  trailing_gap_pct: 4
+  persist_stop_seconds: 3
+  persist_seconds: 3
+  arm_persist_seconds: 0
+  profit_lock_enabled: true
 
-  profit_lock_steps:
-    - trigger_pct: 3
-      lock_pct: 1
-    - trigger_pct: 6
-      lock_pct: 3
-    - trigger_pct: 10
-      lock_pct: 5
+  adaptive_breathing_band:
+    enabled: true
+    candle_seconds: 3
+    lookback_candles: 5
+    band_fraction: 0.5
+    band_min_pct: 2.0
+    band_max_pct: 8.0
+    trailing_persist_seconds: 3
+    initial_breathing_pct:
 
-  collect_metrics:
-    volume_m5: true
-    liquidity_usd: true
-    buy_pressure: true
+  abb_window_seconds: 120
+  abb_multiplier: 0.5
+  abb_min_pct: 2.0
+  abb_max_pct: 8.0
+  abb_fallback: reserve_ratio
 
 position_sizing:
   mode: fixed_fake_usd

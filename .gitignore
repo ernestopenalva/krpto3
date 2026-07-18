@@ -4,6 +4,7 @@ __pycache__/
 !requirements.txt
 *.log
 *.zip
+.env
 
 .vscode/
 src/.vscode/

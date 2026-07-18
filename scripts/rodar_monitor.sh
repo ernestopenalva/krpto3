@@ -1,0 +1,51 @@
+#!/bin/bash
+# KRPTO3 - Monitor (token_monitor_buy + position_monitor)
+# Roda em ciclos de 60s, lendo final_monitoring_candidates.json
+# que e alimentado pelo scanner continuo (rodar_scanner.sh).
+# Execute em janela tmux separada da janela do scanner.
+
+cd "$(dirname "$0")/.."
+
+mkdir -p logs
+
+LOGFILE="logs/monitor_$(date +%Y-%m-%d).txt"
+
+source venv/bin/activate
+
+stop_requested=false
+
+shutdown() {
+    stop_requested=true
+    echo ""
+    echo "Encerramento solicitado. Finalizando monitor apos o ciclo atual..."
+}
+
+trap shutdown INT TERM
+
+while true; do
+    echo ""
+    echo "==============================="
+    echo "Rodando ciclo em $(date)"
+
+    echo "===============================" >> "$LOGFILE"
+    echo "$(date)" >> "$LOGFILE"
+
+    python -u src/app.py >> "$LOGFILE" 2>&1
+
+    echo "Ciclo finalizado em $(date)"
+
+    if [ "$stop_requested" = true ]; then
+        echo "Monitor encerrado em $(date)"
+        exit 0
+    fi
+
+    echo "Aguardando 60 segundos..."
+
+    sleep 60 &
+    wait $!
+
+    if [ "$stop_requested" = true ]; then
+        echo "Monitor encerrado em $(date)"
+        exit 0
+    fi
+done

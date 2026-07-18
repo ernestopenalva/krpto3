@@ -1,17 +1,29 @@
+import atexit
 import json
+import math
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from pathlib import Path
 import yaml
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.project_env import load_project_env
+from src.modules.position_monitor_abb import AbbPositionMonitor
+
+load_project_env()
 
 
 def load_config():
-    base_dir = Path(__file__).resolve().parents[2]
-    config_path = base_dir / "config" / "config.yaml"
+    config_path = PROJECT_ROOT / "config" / "config.yaml"
 
     with config_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -20,6 +32,8 @@ def load_config():
 CONFIG = load_config()
 CFG = CONFIG.get("token_monitor_buy", {})
 ENTRY_CFG = CFG.get("entry", {})
+MOMENTUM_CFG = CFG.get("momentum_entry", {})
+POSITION_CFG = CONFIG.get("position_monitor", {})
 
 
 # =========================
@@ -33,13 +47,22 @@ HISTORY_DIR = OUTPUT_DIR / "history"
 BUY_SIGNALS_FILE = OUTPUT_DIR / "buy_signals.json"
 STATUS_FILE = OUTPUT_DIR / "monitor_status.json"
 PROCESSED_TOKENS_FILE = OUTPUT_DIR / "processed_tokens.json"
+WATCHLIST_FILE = Path("data/watchlist/watchlist.json")
+OPEN_POSITIONS_FILE = Path(POSITION_CFG.get("output_dir", "data/position_monitor")) / "open_positions.json"
+POSITION_MONITOR_SCRIPT = PROJECT_ROOT / "src" / "modules" / "position_monitor_abb.py"
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 POLL_INTERVAL_SECONDS = CFG.get("poll_interval_seconds", 15)
 MAX_MONITORING_MINUTES = CFG.get("max_monitoring_minutes", 15)
 MAX_MONITORED_TOKENS = CFG.get("max_monitored_tokens", 5)
+RATE_LIMIT_BACKOFF_SECONDS = CFG.get("backoff_on_rate_limit_seconds", 10)
 
 DECISION_WINDOW_MINUTES = CFG.get("decision_window_minutes", 5)
-MIN_TICKS_BEFORE_DECISION = CFG.get("min_ticks_before_decision", 4)
+MIN_TICKS_BEFORE_DECISION = int(CFG.get("min_ticks_before_decision", 4))
+PULLBACK_MIN_TICKS_BEFORE_DECISION = max(2, int(ENTRY_CFG.get(
+    "min_ticks_before_decision",
+    MIN_TICKS_BEFORE_DECISION,
+)))
 
 MIN_PULLBACK_PCT = ENTRY_CFG.get("min_pullback_pct", 2.0)
 MAX_PULLBACK_PCT = ENTRY_CFG.get("max_pullback_pct", 6.0)
@@ -55,12 +78,27 @@ HEALTH_MAX_LIQUIDITY_DROP_PCT = ENTRY_CFG.get("health_max_liquidity_drop_pct", 3
 HEALTH_RECENT_TICKS = ENTRY_CFG.get("health_recent_ticks", 6)
 PULLBACK_RECENT_TICKS = ENTRY_CFG.get("pullback_recent_ticks", 24)
 
+MOMENTUM_ENTRY_ENABLED = MOMENTUM_CFG.get("enabled", False)
+MOMENTUM_MIN_TICKS_BEFORE_DECISION = max(2, int(MOMENTUM_CFG.get(
+    "min_ticks_before_decision",
+    MIN_TICKS_BEFORE_DECISION,
+)))
+MOMENTUM_MIN_MOMENTUM_PCT = MOMENTUM_CFG.get("min_momentum_pct", 15.0)
+MOMENTUM_MAX_RUNUP_PCT = float(MOMENTUM_CFG.get("max_runup_pct", 12.0))
+MOMENTUM_MAX_PULLBACK_FROM_PEAK_PCT = MOMENTUM_CFG.get("max_pullback_from_peak_pct", 3.0)
+MOMENTUM_MIN_LIQUIDITY_GROWTH_PCT = MOMENTUM_CFG.get("min_liquidity_growth_pct", 0.0)
+MOMENTUM_MAX_LIQUIDITY_DROP_PCT = MOMENTUM_CFG.get("max_liquidity_drop_pct", 5.0)
+MOMENTUM_HEALTH_MIN_SCORE = MOMENTUM_CFG.get("health_min_score", 0.60)
+MOMENTUM_MIN_BUY_PRESSURE = MOMENTUM_CFG.get("min_buy_pressure", 0.52)
+MOMENTUM_BLOCK_IF_PRICE_FALLING = MOMENTUM_CFG.get("block_if_price_falling", True)
+MOMENTUM_PRICE_FALLING_WINDOW_TICKS = MOMENTUM_CFG.get("price_falling_window_ticks", 3)
+RATE_LIMIT_COUNTS: Dict[str, int] = {}
+
 
 # =========================
 # UTILITÁRIOS
 # =========================
 
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 def now_iso() -> str:
@@ -80,6 +118,16 @@ def save_json(path: Path, data: Any) -> None:
 
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def save_json_atomic(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    os.replace(tmp, path)
 
 def load_processed_tokens() -> set[str]:
     rows = load_json(PROCESSED_TOKENS_FILE, default=[])
@@ -105,6 +153,67 @@ def register_processed_token(candidate: Dict[str, Any], status: str, reason: Opt
     })
 
     save_json(PROCESSED_TOKENS_FILE, rows)
+
+
+def load_watchlist() -> Dict[str, Any]:
+    payload = load_json(WATCHLIST_FILE, default={})
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return {
+            item["token_address"]: item
+            for item in payload
+            if isinstance(item, dict) and item.get("token_address")
+        }
+    return {}
+
+
+def update_watchlist_status(token_address: str, status: str, reason: Optional[str] = None) -> None:
+    watchlist = load_watchlist()
+    entry = watchlist.get(token_address)
+    if not entry:
+        return
+
+    entry["status"] = status
+
+    if status == "comprado":
+        entry["bought_at"] = now_iso()
+    elif status == "descartado_monitor":
+        entry["discarded_at"] = now_iso()
+        entry["discarded_reason"] = reason
+
+    save_json_atomic(WATCHLIST_FILE, watchlist)
+
+
+def can_open_position(max_positions: int) -> bool:
+    open_positions = load_json(OPEN_POSITIONS_FILE, default=[])
+    if not isinstance(open_positions, list):
+        return False
+    return len(open_positions) < max_positions
+
+
+def dispatch_position_monitor(token_address: str) -> bool:
+    position_monitor = AbbPositionMonitor()
+    if not position_monitor.open_position_for_token(token_address):
+        return False
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOGS_DIR / f"position_{datetime.now().strftime('%Y-%m-%d')}.txt"
+    with log_file.open("a", encoding="utf-8") as log_handle:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                str(POSITION_MONITOR_SCRIPT),
+                "--token",
+                token_address,
+            ],
+            cwd=PROJECT_ROOT,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return True
+
 
 def append_jsonl(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +245,37 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def is_valid_price(value: Any) -> bool:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(price) and price > 0
+
+
+def log_rate_limit(source: str, endpoint: str, backoff_seconds: int, token: Optional[str] = None) -> None:
+    key = token or source
+    RATE_LIMIT_COUNTS[key] = RATE_LIMIT_COUNTS.get(key, 0) + 1
+    token_part = f" token={token}" if token else ""
+    print(
+        f"[RATE_LIMIT] source={source}{token_part} endpoint={endpoint} "
+        f"backoff={backoff_seconds}s count={RATE_LIMIT_COUNTS[key]}"
+    )
+
+
+def log_invalid_price_summary(invalid_price_ticks: Dict[str, int]) -> None:
+    total = sum(invalid_price_ticks.values())
+    print(
+        f"[INFO] invalid_price_ticks={total} | "
+        f"skipped_invalid_price_ticks={total}"
+    )
+    for token_address, count in sorted(invalid_price_ticks.items()):
+        print(
+            f"[INFO] invalid_price_token={token_address} | "
+            f"invalid_price_ticks={count} | skipped_invalid_price_ticks={count}"
+        )
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -156,8 +296,18 @@ def load_candidates() -> List[Dict[str, Any]]:
     candidates = []
 
     processed_tokens = load_processed_tokens()
+    watchlist = load_watchlist()
 
-    for item in raw_candidates[:MAX_MONITORED_TOKENS]:
+    new_candidates = []
+    for item in raw_candidates:
+        token_address = item.get("token_address")
+        watchlist_entry = watchlist.get(token_address, {})
+        if watchlist_entry.get("status") == "novo":
+            new_candidates.append((item, watchlist_entry.get("discovered_at_utc", "")))
+
+    new_candidates.sort(key=lambda row: row[1], reverse=True)
+
+    for item, _discovered_at in new_candidates[:1]:
         selected_pair = item.get("candidate", {}).get("selected_pair", {})
 
         token_address = item.get("token_address")
@@ -177,6 +327,9 @@ def load_candidates() -> List[Dict[str, Any]]:
             "symbol": symbol or token_address[:6],
             "chain_id": chain_id,
             "pair_address": pair_address,
+            "dex_id": selected_pair.get("dexId") or item.get("dex_id"),
+            "base_mint": (selected_pair.get("baseToken") or {}).get("address") or item.get("base_mint"),
+            "quote_mint": (selected_pair.get("quoteToken") or {}).get("address") or item.get("quote_mint"),
             "started_at": now_iso(),
             "status": "monitoring",
             "signal_emitted": False,
@@ -198,22 +351,36 @@ def fetch_pair_snapshot(chain_id: str, pair_address: str) -> Optional[Dict[str, 
         response.raise_for_status()
         payload = response.json()
 
-        pairs = payload.get("pairs") or []
-        if not pairs:
+        pairs = payload.get("pairs") or [] if isinstance(payload, dict) else []
+        if not isinstance(pairs, list) or not pairs or not isinstance(pairs[0], dict):
             return None
 
         return pairs[0]
 
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            backoff_seconds = int(RATE_LIMIT_BACKOFF_SECONDS)
+            log_rate_limit(
+                source="token_monitor_buy",
+                endpoint=url,
+                backoff_seconds=backoff_seconds,
+                token=pair_address,
+            )
+            time.sleep(backoff_seconds)
+            return None
+        print(f"[ERRO] Falha ao consultar Dexscreener: {exc}")
+        return None
     except requests.RequestException as exc:
         print(f"[ERRO] Falha ao consultar Dexscreener: {exc}")
         return None
 
 
 def build_tick(candidate: Dict[str, Any], pair: Dict[str, Any]) -> Dict[str, Any]:
-    txns_m5 = pair.get("txns", {}).get("m5", {})
-    volume_m5 = pair.get("volume", {}).get("m5")
-    liquidity_usd = pair.get("liquidity", {}).get("usd")
-    price_change_m5 = pair.get("priceChange", {}).get("m5")
+    txns_m5 = (pair.get("txns") or {}).get("m5") or {}
+    volume_m5 = (pair.get("volume") or {}).get("m5")
+    liquidity_usd = (pair.get("liquidity") or {}).get("usd")
+    price_change_m5 = (pair.get("priceChange") or {}).get("m5")
 
     buys = safe_int(txns_m5.get("buys"))
     sells = safe_int(txns_m5.get("sells"))
@@ -227,7 +394,11 @@ def build_tick(candidate: Dict[str, Any], pair: Dict[str, Any]) -> Dict[str, Any
         "symbol": candidate["symbol"],
         "chain_id": candidate["chain_id"],
         "pair_address": candidate["pair_address"],
+        "dex_id": candidate.get("dex_id"),
+        "base_mint": candidate.get("base_mint"),
+        "quote_mint": candidate.get("quote_mint"),
         "price_usd": safe_float(pair.get("priceUsd")),
+        "price_native": safe_float(pair.get("priceNative")),
         "volume_m5": safe_float(volume_m5),
         "buys_m5": buys,
         "sells_m5": sells,
@@ -247,10 +418,14 @@ def get_recent_ticks(history: List[Dict[str, Any]], max_minutes: int) -> List[Di
     max_ticks = int((max_minutes * 60) / POLL_INTERVAL_SECONDS)
     return history[-max_ticks:]
 
-def compute_token_health_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compute_token_health_score(
+    history: List[Dict[str, Any]],
+    min_ticks_before_decision: Optional[int] = None,
+) -> Dict[str, Any]:
     window = get_recent_ticks(history, DECISION_WINDOW_MINUTES)
+    required_ticks = int(min_ticks_before_decision or MIN_TICKS_BEFORE_DECISION)
 
-    if len(window) < MIN_TICKS_BEFORE_DECISION:
+    if len(window) < required_ticks:
         return {
             "score": 0.0,
             "alive": True,
@@ -391,8 +566,103 @@ def compute_token_health_score(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def evaluate_momentum_continuation(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not MOMENTUM_ENTRY_ENABLED:
+        return {"entry": False, "reason": "momentum_continuation desabilitado"}
+
+    if len(history) < MOMENTUM_MIN_TICKS_BEFORE_DECISION:
+        return {"entry": False, "reason": "histórico insuficiente para momentum_continuation"}
+
+    prices = [tick["price_usd"] for tick in history if tick.get("price_usd", 0) > 0]
+    if len(prices) < MOMENTUM_MIN_TICKS_BEFORE_DECISION:
+        return {"entry": False, "reason": "preços insuficientes para momentum_continuation"}
+
+    current = history[-1]
+    current_price = current["price_usd"]
+    first_price = prices[0]
+    peak_price = max(prices)
+
+    runup_since_first_tick_pct = ((current_price / first_price) - 1) * 100 if first_price > 0 else 0.0
+    pullback_from_peak_pct = ((peak_price - current_price) / peak_price) * 100 if peak_price > 0 else 0.0
+
+    liquidities = [tick["liquidity_usd"] for tick in history if tick.get("liquidity_usd", 0) > 0]
+    first_liquidity = liquidities[0] if liquidities else 0.0
+    current_liquidity = current.get("liquidity_usd", 0.0)
+    peak_liquidity = max(liquidities) if liquidities else 0.0
+    if first_liquidity <= 0 or current_liquidity <= 0 or peak_liquidity <= 0:
+        return {"entry": False, "reason": "liquidez insuficiente para momentum_continuation"}
+
+    liquidity_growth_pct = (
+        ((current_liquidity / first_liquidity) - 1) * 100
+    )
+    liquidity_drop_pct = (
+        ((peak_liquidity - current_liquidity) / peak_liquidity) * 100
+    )
+
+    health = compute_token_health_score(history, MOMENTUM_MIN_TICKS_BEFORE_DECISION)
+    buy_pressure = current.get("buy_pressure", 0.0)
+
+    window_ticks = max(1, int(MOMENTUM_PRICE_FALLING_WINDOW_TICKS))
+    recent_prices = prices[-window_ticks:]
+    recent_avg_price = sum(recent_prices) / len(recent_prices) if recent_prices else current_price
+    price_falling_blocked = MOMENTUM_BLOCK_IF_PRICE_FALLING and current_price < recent_avg_price
+
+    metrics = {
+        "entry_reason": "MOMENTUM_CONTINUATION",
+        "motivo_entrada": "momentum_continuation",
+        "runup_since_first_tick_pct": runup_since_first_tick_pct,
+        "runup_start_to_entry_pct": runup_since_first_tick_pct,
+        "price_start_monitor": first_price,
+        "price_entry_candidate": current_price,
+        "pullback_from_peak_pct": pullback_from_peak_pct,
+        "liquidity_growth_pct": liquidity_growth_pct,
+        "liquidity_drop_pct": liquidity_drop_pct,
+        "health_score": health.get("score", 0.0),
+        "buy_pressure": buy_pressure,
+        "price_falling_window_ticks": window_ticks,
+        "recent_avg_price": recent_avg_price,
+    }
+
+    if runup_since_first_tick_pct < MOMENTUM_MIN_MOMENTUM_PCT:
+        return {"entry": False, "reason": "momentum insuficiente", "metrics": metrics}
+    if pullback_from_peak_pct > MOMENTUM_MAX_PULLBACK_FROM_PEAK_PCT:
+        return {"entry": False, "reason": "momentum longe do topo", "metrics": metrics}
+    if not (
+        liquidity_growth_pct >= MOMENTUM_MIN_LIQUIDITY_GROWTH_PCT
+        or liquidity_drop_pct <= MOMENTUM_MAX_LIQUIDITY_DROP_PCT
+    ):
+        return {"entry": False, "reason": "liquidez drenando no momentum", "metrics": metrics}
+    if health.get("score", 0.0) < MOMENTUM_HEALTH_MIN_SCORE:
+        return {"entry": False, "reason": "health insuficiente para momentum", "metrics": metrics}
+    if buy_pressure < MOMENTUM_MIN_BUY_PRESSURE:
+        return {"entry": False, "reason": "buy pressure insuficiente para momentum", "metrics": metrics}
+    if price_falling_blocked:
+        return {"entry": False, "reason": "preço caindo na janela de momentum", "metrics": metrics}
+    if runup_since_first_tick_pct > MOMENTUM_MAX_RUNUP_PCT:
+        return {
+            "entry": False,
+            "blocked": True,
+            "block_reason": "MC_RUNUP_TOO_EXTENDED",
+            "reason": "MC_RUNUP_TOO_EXTENDED",
+            "entry_reason": "MOMENTUM_CONTINUATION",
+            "metrics": metrics,
+        }
+
+    return {
+        "entry": True,
+        "entry_reason": "MOMENTUM_CONTINUATION",
+        "reason": "momentum_continuation",
+        "metrics": metrics,
+    }
+
+
 def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if len(history) < MIN_TICKS_BEFORE_DECISION:
+    if len(history) < PULLBACK_MIN_TICKS_BEFORE_DECISION:
+        momentum = evaluate_momentum_continuation(history)
+        if momentum.get("entry"):
+            return momentum
+        if momentum.get("blocked"):
+            return momentum
         return {
             "entry": False,
             "reason": "histórico insuficiente"
@@ -403,7 +673,12 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     prices = [tick["price_usd"] for tick in window if tick["price_usd"] > 0]
     volumes = [tick["volume_m5"] for tick in window if tick["volume_m5"] > 0]
 
-    if len(prices) < MIN_TICKS_BEFORE_DECISION:
+    if len(prices) < PULLBACK_MIN_TICKS_BEFORE_DECISION:
+        momentum = evaluate_momentum_continuation(history)
+        if momentum.get("entry"):
+            return momentum
+        if momentum.get("blocked"):
+            return momentum
         return {
             "entry": False,
             "reason": "preços insuficientes"
@@ -463,6 +738,11 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
     if not pullback_ok:
+        momentum = evaluate_momentum_continuation(history)
+        if momentum.get("entry"):
+            return momentum
+        if momentum.get("blocked"):
+            return momentum
         return {
             "entry": False,
             "reason": (
@@ -567,7 +847,10 @@ def evaluate_entry_signal(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "entry": True,
         "reason": "pullback válido + cenário ok + confirmação Codex",
+        "entry_reason": "PULLBACK_RECOVERY",
         "metrics": {
+            "entry_reason": "PULLBACK_RECOVERY",
+            "motivo_entrada": "pullback_recovery",
             "current_price": current_price,
             "recent_top": recent_top,
             "recent_bottom": recent_bottom,
@@ -593,20 +876,27 @@ def register_buy_signal(candidate: Dict[str, Any], tick: Dict[str, Any], evaluat
         "symbol": candidate["symbol"],
         "chain_id": candidate["chain_id"],
         "pair_address": candidate["pair_address"],
+        "dex_id": candidate.get("dex_id"),
+        "base_mint": candidate.get("base_mint"),
+        "quote_mint": candidate.get("quote_mint"),
         "entry_price_usd": tick["price_usd"],
+        "entry_price_native": tick.get("price_native"),
+        "entry_reason": evaluation.get("entry_reason") or evaluation.get("metrics", {}).get("entry_reason"),
+        "motivo_entrada": evaluation.get("metrics", {}).get("motivo_entrada"),
         "reason": evaluation["reason"],
         "metrics": evaluation.get("metrics", {}),
         "snapshot": tick
     }
 
     signals.append(signal)
-    save_json(BUY_SIGNALS_FILE, signals)
+    save_json_atomic(BUY_SIGNALS_FILE, signals)
 
     signal_time = signal["timestamp"]
 
     print(
         f"[{signal_time}] [SINAL] COMPRA SIMULADA: "
-        f"{candidate['symbol']} @ {tick['price_usd']}"
+        f"{candidate['symbol']} @ {tick['price_usd']} | "
+        f"entry_reason={signal.get('entry_reason') or 'n/a'}"
     )
 
 
@@ -624,19 +914,40 @@ def monitor() -> None:
     candidates = load_candidates()
 
     if not candidates:
-        print("[INFO] Nenhum candidato encontrado.")
+        print("[INFO] Nenhum candidato novo encontrado.")
         return
 
-    print(f"[INFO] Monitorando {len(candidates)} candidato(s).")
+    print(f"[INFO] Monitorando 1 candidato por ciclo: {candidates[0]['symbol']}.")
     print("[INFO] Modo: PAPER / sem compra real.")
 
     started_at = time.time()
+    invalid_price_ticks: Dict[str, int] = {}
+
+    def persist_monitor_status() -> None:
+        save_json(STATUS_FILE, {
+            "updated_at": now_iso(),
+            "mode": "paper",
+            "invalid_price_ticks": sum(invalid_price_ticks.values()),
+            "skipped_invalid_price_ticks": sum(invalid_price_ticks.values()),
+            "invalid_price_ticks_by_token": invalid_price_ticks,
+            "candidates": candidates
+        })
+
+    atexit.register(persist_monitor_status)
 
     while True:
         elapsed_minutes = (time.time() - started_at) / 60
 
         if elapsed_minutes >= MAX_MONITORING_MINUTES:
             print("[INFO] Tempo máximo de monitoramento atingido.")
+            for candidate in candidates:
+                if candidate["status"] == "monitoring":
+                    reason = "tempo maximo de monitoramento atingido sem sinal"
+                    candidate["status"] = "discarded"
+                    candidate["discard_reason"] = reason
+                    update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
+                    register_processed_token(candidate, "descartado_monitor", reason)
+                    print(f"[DESCARTE] {candidate['symbol']}: {reason}")
             break
 
         for candidate in candidates:
@@ -652,11 +963,25 @@ def monitor() -> None:
                 continue
 
             tick = build_tick(candidate, pair)
+            if not is_valid_price(tick.get("price_usd")):
+                token_address = candidate["token_address"]
+                invalid_price_ticks[token_address] = invalid_price_ticks.get(token_address, 0) + 1
+                print(
+                    f"[WARN] [INVALID PRICE] monitor token={candidate['symbol']} "
+                    f"token_address={token_address} price={tick.get('price_usd')!r} "
+                    f"invalid_price_ticks={invalid_price_ticks[token_address]} "
+                    f"skipped_invalid_price_ticks={invalid_price_ticks[token_address]}"
+                )
+                continue
 
             history_file = HISTORY_DIR / f"{candidate['symbol']}_{candidate['token_address'][:8]}.jsonl"
             append_jsonl(history_file, tick)
 
-            history = read_jsonl(history_file)
+            history = [
+                item
+                for item in read_jsonl(history_file)
+                if is_valid_price(item.get("price_usd"))
+            ]
             evaluation = evaluate_entry_signal(history)
 
             print(
@@ -667,24 +992,68 @@ def monitor() -> None:
                 f"{evaluation.get('reason')}"
             )
 
+            if evaluation.get("blocked"):
+                metrics = evaluation.get("metrics") or {}
+                print(
+                    f"[{tick['timestamp']}] [ENTRY BLOCK] "
+                    f"symbol={candidate['symbol']} | token_address={candidate['token_address']} | "
+                    f"block_reason={evaluation.get('block_reason')} | "
+                    f"feature=runup_start_to_entry_pct | "
+                    f"value={metrics.get('runup_start_to_entry_pct')} | limit={MOMENTUM_MAX_RUNUP_PCT} | "
+                    f"price_start_monitor={metrics.get('price_start_monitor')} | "
+                    f"price_entry_candidate={metrics.get('price_entry_candidate')}"
+                )
+                continue
+
             if evaluation.get("discard"):
                 candidate["status"] = "discarded"
                 candidate["discard_reason"] = evaluation.get("reason")
-                register_processed_token(candidate, "discarded", candidate["discard_reason"])
+                update_watchlist_status(candidate["token_address"], "descartado_monitor", candidate["discard_reason"])
+                register_processed_token(candidate, "descartado_monitor", candidate["discard_reason"])
                 print(f"[DESCARTE] {candidate['symbol']}: {candidate['discard_reason']}")
                 continue
 
             if evaluation.get("entry") and not candidate["signal_emitted"]:
+                metrics = evaluation.setdefault("metrics", {})
+                valid_prices = [item.get("price_usd") for item in history if is_valid_price(item.get("price_usd"))]
+                if valid_prices:
+                    metrics.setdefault("price_start_monitor", valid_prices[0])
+                    metrics.setdefault("price_entry_candidate", tick["price_usd"])
+                    metrics.setdefault(
+                        "runup_start_to_entry_pct",
+                        ((tick["price_usd"] / valid_prices[0]) - 1) * 100,
+                    )
+                max_open_positions = int(POSITION_CFG.get("max_open_positions", 2))
+                if not can_open_position(max_open_positions):
+                    reason = f"limite de posições abertas atingido ({max_open_positions})"
+                    candidate["status"] = "discarded"
+                    candidate["discard_reason"] = reason
+                    update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
+                    register_processed_token(candidate, "descartado_monitor", reason)
+                    print(
+                        f"[SINAL DESCARTADO] {candidate['symbol']} — "
+                        f"limite de posições abertas atingido ({max_open_positions})"
+                    )
+                    continue
+
                 register_buy_signal(candidate, tick, evaluation)
-                register_processed_token(candidate, "signal_emitted", evaluation.get("reason"))
+                if not dispatch_position_monitor(candidate["token_address"]):
+                    reason = "POSITION_ONCHAIN_ENTRY_UNAVAILABLE"
+                    candidate["status"] = "discarded"
+                    candidate["discard_reason"] = reason
+                    update_watchlist_status(candidate["token_address"], "descartado_monitor", reason)
+                    register_processed_token(candidate, "descartado_monitor", reason)
+                    print(
+                        f"[SINAL SEM POSICAO] {candidate['symbol']} | token_address={candidate['token_address']} | "
+                        f"block_reason={reason} | provider=onchain_pumpswap+alchemy_prices"
+                    )
+                    continue
+                update_watchlist_status(candidate["token_address"], "comprado", evaluation.get("reason"))
+                register_processed_token(candidate, "comprado", evaluation.get("reason"))
                 candidate["signal_emitted"] = True
                 candidate["status"] = "signal_emitted"
 
-        save_json(STATUS_FILE, {
-            "updated_at": now_iso(),
-            "mode": "paper",
-            "candidates": candidates
-        })
+        persist_monitor_status()
 
         active = [c for c in candidates if c["status"] == "monitoring"]
 
@@ -694,8 +1063,14 @@ def monitor() -> None:
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
+    persist_monitor_status()
+
+    log_invalid_price_summary(invalid_price_ticks)
     print("[INFO] Monitoramento encerrado.")
 
 
 if __name__ == "__main__":
-    monitor()
+    try:
+        monitor()
+    except KeyboardInterrupt:
+        print("[INFO] Interrupcao recebida. Monitor encerrado com status salvo.")
