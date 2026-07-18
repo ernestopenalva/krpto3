@@ -128,6 +128,13 @@ def entry_type(row: Dict[str, Any]) -> str:
     )
 
 
+def display_exit_reason(row: Dict[str, Any]) -> str:
+    reason = str(row.get("exit_reason") or "UNKNOWN")
+    if reason == "TRAILING_STOP" and not bool(row.get("breakeven_activated")):
+        return "EARLY_TRAILING_PROTECTION"
+    return reason
+
+
 def price_usd(row: Dict[str, Any], name: str) -> Optional[float]:
     return safe_float(row.get(name))
 
@@ -163,7 +170,7 @@ def display_table(rows: List[Dict[str, Any]]) -> None:
                 fmt_pct(safe_float(row.get("pnl_pct"))),
                 fmt_pct(safe_float(row.get("min_profit_pct"))),
                 fmt_pct(safe_float(row.get("max_profit_pct"))),
-                str(row.get("exit_reason") or "-"),
+                display_exit_reason(row),
                 str(row.get("symbol") or "-"),
                 str(row.get("token_address") or "-"),
             ]
@@ -212,7 +219,7 @@ def pnl_summary(rows: List[Dict[str, Any]]) -> str:
 
 def print_detail(rows: List[Dict[str, Any]]) -> None:
     pnls = pnl_values(rows)
-    exits = Counter(str(row.get("exit_reason") or "UNKNOWN") for row in rows)
+    exits = Counter(display_exit_reason(row) for row in rows)
     providers = Counter(str(row.get("provider") or "UNKNOWN") for row in rows)
     durations = [value for row in rows if (value := safe_float(row.get("time_in_position_seconds"))) is not None]
     ticks = [value for row in rows if (value := safe_float(row.get("ticks"))) is not None]
@@ -234,7 +241,7 @@ def print_detail(rows: List[Dict[str, Any]]) -> None:
     )
     exit_parts = []
     for reason, count in sorted(exits.items()):
-        matching = [row for row in rows if str(row.get("exit_reason") or "UNKNOWN") == reason]
+        matching = [row for row in rows if display_exit_reason(row) == reason]
         exit_parts.append(f"{reason}: n={count}, pnl_total={fmt_pct(sum(pnl_values(matching)))}")
     print("saidas | " + " | ".join(exit_parts))
     print(

@@ -3,10 +3,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.tools.closed_position_report import build_giveback_rows
+from src.tools.closed_position_report import build_giveback_rows, display_exit_reason
 
 
 class GivebackStudyTests(unittest.TestCase):
+    def test_pre_breakeven_trailing_is_labeled_as_early_protection(self):
+        self.assertEqual(
+            display_exit_reason({"exit_reason": "TRAILING_STOP", "breakeven_activated": False}),
+            "EARLY_TRAILING_PROTECTION",
+        )
+        self.assertEqual(
+            display_exit_reason({"exit_reason": "TRAILING_STOP", "breakeven_activated": True}),
+            "TRAILING_STOP",
+        )
+
     def test_separates_abb_threshold_from_persistence_giveback(self):
         trade = {
             "token_address": "token-a",
