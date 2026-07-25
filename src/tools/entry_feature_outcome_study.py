@@ -486,6 +486,7 @@ def build_trade_row(
     if not source_signal and isinstance(signal, dict):
         source_signal = signal
     entry_tick = source_signal.get("abb_entry_tick") if isinstance(source_signal.get("abb_entry_tick"), dict) else {}
+    signal_metrics = source_signal.get("metrics") if isinstance(source_signal.get("metrics"), dict) else {}
 
     entry_time = parse_time(trade.get("entry_time"))
     if rows and entry_time is None:
@@ -509,19 +510,30 @@ def build_trade_row(
     giveback = safe_float(getattr(replay, "giveback_pct", None))
 
     entry_price = first_float(
-        history_entry_usd(entry_snapshot, source, source_signal),
-        history_entry_usd(rows[0], source, source_signal) if rows else None,
+        # The closed trade is the authoritative record of the price actually used
+        # by Position. History files are only a fallback for older records.
         trade.get("entry_price_usd"),
+        entry_tick.get("onchain_price_usd"),
         source_signal.get("entry_price_usd"),
         source_signal.get("price_usd"),
+        history_entry_usd(entry_snapshot, source, source_signal),
+        history_entry_usd(rows[0], source, source_signal) if rows else None,
         price_in_usd(first_float(trade.get("entry_price_onchain"), trade.get("entry_price")), source, source_signal),
     )
-    monitor_price = first_float(monitor_first.get("price_usd"), candidate_price(scanner), watch.get("scanner_price_usd"), watch.get("price_usd"))
+    monitor_price = first_float(
+        signal_metrics.get("price_start_monitor"),
+        monitor_first.get("price_usd"),
+        candidate_price(scanner),
+        watch.get("scanner_price_usd"),
+        watch.get("price_usd"),
+    )
     price_at_entry_row = history_price_usd(entry_snapshot, source, source_signal)
     runup = first_float(
+        signal_metrics.get("runup_start_to_entry_pct"),
+        signal_metrics.get("runup_since_first_tick_pct"),
         source_signal.get("runup_start_to_entry_pct"),
         source_signal.get("runup_since_first_tick_pct"),
-        pct_change(monitor_price, price_at_entry_row or entry_price),
+        pct_change(monitor_price, entry_price or price_at_entry_row),
     )
 
     tick_frequency, avg_tick_interval, tick_count = tick_stats_before(rows, entry_time)
@@ -568,33 +580,34 @@ def build_trade_row(
         quote_reserve,
     )
     fdv = first_float(entry_tick.get("fdv"), entry_snapshot.get("fdv"), source_signal.get("fdv"), nested(source_signal, ("snapshot", "fdv")))
-    min_pnl = None
+    position_entry_price = entry_price
+    min_pnl = safe_float(trade.get("min_profit_pct"))
     if position_entry_price is not None and position_entry_price > 0:
         pnls = []
         for row in rows:
-            price = row_price(row, source)
+            price = history_price_usd(row, source, source_signal)
             if price is not None and price > 0:
                 pnls.append(((price / position_entry_price) - 1.0) * 100.0)
-        min_pnl = min(pnls) if pnls else None
+        min_pnl = min_pnl if min_pnl is not None else (min(pnls) if pnls else None)
 
     signal_reason_raw = first_value(signal.get("entry_reason"), signal.get("reason"), signal.get("tipo_entrada"))
     monitor_reason_raw = first_value(monitor_first.get("entry_reason"), monitor_first.get("reason"), monitor_first.get("tipo_entrada"))
     source_signal_reason_raw = first_value(source_signal.get("entry_reason"), source_signal.get("reason"), source_signal.get("tipo_entrada"))
     trade_reason_raw = first_value(trade.get("entry_reason"), trade.get("tipo_entrada"), trade.get("reason"))
-    entry_reason = first_value(signal_reason_raw, source_signal_reason_raw, trade_reason_raw, monitor_reason_raw)
+    entry_reason = first_value(source_signal_reason_raw, signal_reason_raw, trade_reason_raw, monitor_reason_raw)
     entry_type_audit = classify_entry_type(
         [
-            {
-                "value": signal_reason_raw,
-                "field": "signals.entry_reason",
-                "source_file": signal.get("_source_file"),
-                "source_line": signal.get("_source_line"),
-            },
             {
                 "value": source_signal_reason_raw,
                 "field": "closed_trade.source_signal.entry_reason",
                 "source_file": str(closed_trades_file),
                 "source_line": None,
+            },
+            {
+                "value": signal_reason_raw,
+                "field": "signals.entry_reason",
+                "source_file": signal.get("_source_file"),
+                "source_line": signal.get("_source_line"),
             },
             {
                 "value": trade_reason_raw,
