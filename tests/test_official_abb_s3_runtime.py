@@ -66,13 +66,14 @@ class MomentumRunupTests(unittest.TestCase):
         with patch.object(token_monitor_buy, "compute_token_health_score", return_value=health):
             return token_monitor_buy.evaluate_momentum_continuation(history)
 
-    def test_mc_at_four_percent_can_enter(self) -> None:
+    def test_mc_is_disabled_in_this_runtime_version(self) -> None:
         result = self.evaluate([100.0, 102.0, 104.0])
-        self.assertTrue(result["entry"])
-        self.assertEqual(result["entry_reason"], "MOMENTUM_CONTINUATION")
+        self.assertFalse(result["entry"])
+        self.assertEqual(result["reason"], "momentum_continuation desabilitado")
 
     def test_mc_above_twelve_percent_is_blocked(self) -> None:
-        result = self.evaluate([100.0, 106.0, 112.01])
+        with patch.object(token_monitor_buy, "MOMENTUM_ENTRY_ENABLED", True):
+            result = self.evaluate([100.0, 106.0, 112.01])
         self.assertFalse(result["entry"])
         self.assertTrue(result["blocked"])
         self.assertEqual(result["block_reason"], "MC_RUNUP_TOO_EXTENDED")
