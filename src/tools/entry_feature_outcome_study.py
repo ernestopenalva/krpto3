@@ -24,8 +24,6 @@ from src.tools.trailing_ladder_replay import (  # noqa: E402
     Arm,
     CURRENT_LADDER,
     BRASILIA,
-    DEFAULT_ABB_CLOSED_TRADES_FILE,
-    DEFAULT_ABB_HISTORY_DIR,
     DEFAULT_SHADOW_HISTORY_DIR,
     find_history_files,
     iter_jsonl,
@@ -45,6 +43,8 @@ DEFAULT_WATCHLIST_FILE = PROJECT_ROOT / "data" / "watchlist" / "watchlist.json"
 DEFAULT_SCANNER_CANDIDATES_FILE = PROJECT_ROOT / "data" / "token_scanner" / "final_monitoring_candidates.json"
 DEFAULT_MONITOR_HISTORY_DIR = PROJECT_ROOT / "data" / "token_monitor" / "history"
 DEFAULT_SIGNALS_FILE = PROJECT_ROOT / "data" / "token_monitor" / "buy_signals.json"
+DEFAULT_OFFICIAL_CLOSED_TRADES_FILE = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
+DEFAULT_OFFICIAL_HISTORY_DIR = PROJECT_ROOT / "data" / "position_monitor" / "history"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "studies" / "entry_feature_outcome"
 DEFAULT_TRADES_CSV = DEFAULT_OUTPUT_DIR / "trades.csv"
 DEFAULT_THRESHOLDS_CSV = DEFAULT_OUTPUT_DIR / "thresholds.csv"
@@ -1533,8 +1533,8 @@ def print_outcome_comparison_by_window(rows: List[Dict[str, Any]], args: argpars
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Estudo offline de features de entrada versus outcomes do ABB/S3.")
-    parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_ABB_CLOSED_TRADES_FILE)
-    parser.add_argument("--abb-history-dir", type=Path, default=DEFAULT_ABB_HISTORY_DIR)
+    parser.add_argument("--closed-trades-file", type=Path, default=DEFAULT_OFFICIAL_CLOSED_TRADES_FILE)
+    parser.add_argument("--abb-history-dir", type=Path, default=DEFAULT_OFFICIAL_HISTORY_DIR)
     parser.add_argument("--shadow-history-dir", type=Path, default=DEFAULT_SHADOW_HISTORY_DIR)
     parser.add_argument("--no-shadow", action="store_true")
     parser.add_argument("--watchlist-file", type=Path, default=DEFAULT_WATCHLIST_FILE)

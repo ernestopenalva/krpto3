@@ -166,13 +166,13 @@ def find_history_files(history_dir: Path, token: str, symbol: str) -> List[Path]
 
 def row_price(row: Dict[str, Any], source: str) -> Optional[float]:
     if source == "abb":
-        return safe_float(row.get("price_onchain"))
+        return safe_float(row.get("price_usd")) or safe_float(row.get("price_onchain"))
     return safe_float(row.get("shadow_price")) or safe_float(row.get("price"))
 
 
 def row_entry(row: Dict[str, Any], source: str) -> Optional[float]:
     if source == "abb":
-        return safe_float(row.get("entry_price_onchain"))
+        return safe_float(row.get("entry_price_usd")) or safe_float(row.get("entry_price_onchain"))
     return safe_float(row.get("shadow_entry_price")) or safe_float(row.get("entry_price"))
 
 
