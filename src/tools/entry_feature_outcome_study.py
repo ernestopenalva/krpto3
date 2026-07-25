@@ -453,6 +453,22 @@ def price_in_usd(native_or_usd_price: Optional[float], source: str, source_signa
     return native_or_usd_price * ratio
 
 
+def history_price_usd(row: Dict[str, Any], source: str, source_signal: Dict[str, Any]) -> Optional[float]:
+    if source == "abb":
+        direct_usd = safe_float(row.get("price_usd"))
+        if direct_usd is not None:
+            return direct_usd
+    return price_in_usd(row_price(row, source), source, source_signal)
+
+
+def history_entry_usd(row: Dict[str, Any], source: str, source_signal: Dict[str, Any]) -> Optional[float]:
+    if source == "abb":
+        direct_usd = safe_float(row.get("entry_price_usd"))
+        if direct_usd is not None:
+            return direct_usd
+    return price_in_usd(row_entry(row, source), source, source_signal)
+
+
 def build_trade_row(
     trade: Dict[str, Any],
     replay: Any,
@@ -492,21 +508,21 @@ def build_trade_row(
     max_pnl = safe_float(getattr(replay, "max_pnl_pct", None))
     giveback = safe_float(getattr(replay, "giveback_pct", None))
 
-    position_entry_price = first_float(
-        row_entry(entry_snapshot, source),
-        row_entry(rows[0], source) if rows else None,
-        trade.get("entry_price_onchain"),
-        trade.get("entry_price"),
-    )
     entry_price = first_float(
-        price_in_usd(position_entry_price, source, source_signal),
+        history_entry_usd(entry_snapshot, source, source_signal),
+        history_entry_usd(rows[0], source, source_signal) if rows else None,
+        trade.get("entry_price_usd"),
         source_signal.get("entry_price_usd"),
         source_signal.get("price_usd"),
-        position_entry_price,
+        price_in_usd(first_float(trade.get("entry_price_onchain"), trade.get("entry_price")), source, source_signal),
     )
     monitor_price = first_float(monitor_first.get("price_usd"), candidate_price(scanner), watch.get("scanner_price_usd"), watch.get("price_usd"))
-    price_at_entry_row = price_in_usd(row_price(entry_snapshot, source), source, source_signal)
-    runup = pct_change(monitor_price, price_at_entry_row or entry_price)
+    price_at_entry_row = history_price_usd(entry_snapshot, source, source_signal)
+    runup = first_float(
+        source_signal.get("runup_start_to_entry_pct"),
+        source_signal.get("runup_since_first_tick_pct"),
+        pct_change(monitor_price, price_at_entry_row or entry_price),
+    )
 
     tick_frequency, avg_tick_interval, tick_count = tick_stats_before(rows, entry_time)
     buy_pressure = first_float(
