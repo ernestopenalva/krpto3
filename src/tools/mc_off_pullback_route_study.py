@@ -25,6 +25,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.tools.trailing_ladder_replay import Arm, CURRENT_LADDER, replay_trade
+
 DEFAULT_CLOSED_TRADES = PROJECT_ROOT / "data" / "position_monitor" / "closed_trades.json"
 DEFAULT_MONITOR_HISTORY = PROJECT_ROOT / "data" / "token_monitor" / "history"
 DEFAULT_START_FILE = PROJECT_ROOT / "logs" / "mc_off_experiment_started.txt"
@@ -49,6 +51,17 @@ HISTORICAL_MC_SETTINGS = {
     "HEALTH_MAX_LIQUIDITY_DROP_PCT": 35.0,
     "HEALTH_RECENT_TICKS": 6,
 }
+
+# Same nominal S3 parameters. Monitor history has no ABB/on-chain band fields,
+# so the reusable replay intentionally falls back to its documented 2% band.
+S3_DEX_PRE_PB_PROXY_ARM = Arm(
+    "S3_dex_pre_pb_proxy",
+    "current",
+    CURRENT_LADDER,
+    trailing_gap_pct=4.0,
+    trailing_persist_seconds=3.0,
+    stop_persist_seconds=3.0,
+)
 
 
 def parse_time(value: Any) -> Optional[datetime]:
@@ -165,6 +178,64 @@ def classify_route(signal: Optional[Dict[str, Any]], history_status: str, active
     return "PB_POS_MC"
 
 
+def build_mc_pre_pb_proxy_rows(
+    rows: List[Dict[str, Any]],
+    mc_time: datetime,
+    pb_entry: datetime,
+    mc_price: Optional[float],
+) -> List[Dict[str, Any]]:
+    if mc_price is None or mc_price <= 0:
+        return []
+    proxy_rows = []
+    for row in rows:
+        timestamp = parse_time(row.get("timestamp"))
+        price = safe_float(row.get("price_usd"))
+        if timestamp is None or price is None or price <= 0:
+            continue
+        if mc_time <= timestamp <= pb_entry:
+            proxy_rows.append(
+                {
+                    "timestamp": row.get("timestamp"),
+                    "price_usd": price,
+                    "entry_price_usd": mc_price,
+                }
+            )
+    return proxy_rows
+
+
+def replay_mc_until_pb(
+    trade: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    mc_time: Optional[datetime],
+    pb_entry: datetime,
+    mc_price: Optional[float],
+) -> Dict[str, Any]:
+    if mc_time is None:
+        return {"status": "NO_MC_SIGNAL"}
+    proxy_rows = build_mc_pre_pb_proxy_rows(rows, mc_time, pb_entry, mc_price)
+    if len(proxy_rows) < 2:
+        return {"status": "NO_PROXY_DATA", "rows": len(proxy_rows)}
+    proxy_trade = {**trade, "entry_price_usd": mc_price}
+    replay = replay_trade(proxy_trade, proxy_rows, "abb", S3_DEX_PRE_PB_PROXY_ARM)
+    if replay.censored:
+        return {
+            "status": "SURVIVED_TO_PB",
+            "rows": len(proxy_rows),
+            "exit_reason": "",
+            "exit_time": "",
+            "exit_pnl": replay.exit_pnl_pct,
+            "max_pnl": replay.max_pnl_pct,
+        }
+    return {
+        "status": "EXIT_BEFORE_PB",
+        "rows": len(proxy_rows),
+        "exit_reason": replay.exit_reason,
+        "exit_time": replay.exit_time or "",
+        "exit_pnl": replay.exit_pnl_pct,
+        "max_pnl": replay.max_pnl_pct,
+    }
+
+
 def fmt_pct(value: Optional[float]) -> str:
     return "-" if value is None else f"{value:+.2f}%"
 
@@ -188,6 +259,16 @@ def print_summary(rows: List[Dict[str, Any]], start: datetime) -> None:
             f"pnl_med={fmt_pct(median(pnls) if pnls else None)} | runners={runners} | crashes={crashes}"
         )
 
+    mc_prior = grouped.get("PB_POS_MC", []) + grouped.get("MC_SLOT_BLOCKED", [])
+    if mc_prior:
+        replay_status = Counter(str(item.get("mc_pre_pb_replay_status") or "NO_MC_SIGNAL") for item in mc_prior)
+        print("\n## Replay S3 DS antes do Pullback")
+        print(
+            "fonte=historico_dexscreener_do_monitor | S3_nominal=gap4,persist3,stop_persist3 | "
+            "ABB=band_fallback_2pct | escopo=apenas MC ate a entrada Pullback"
+        )
+        print("status=" + ", ".join(f"{key}:{value}" for key, value in sorted(replay_status.items())))
+
     focus = [row for row in rows if str(row.get("symbol", "")).casefold() == "boss"]
     if focus:
         print("\n## Boss")
@@ -196,7 +277,9 @@ def print_summary(rows: List[Dict[str, Any]], start: datetime) -> None:
                 f"entry={row['pb_entry_time']} | pnl={fmt_pct(safe_float(row['pnl_final']))} | "
                 f"class={row['route_classification']} | first_mc={row.get('first_mc_time') or '-'} | "
                 f"mc_runup={fmt_pct(safe_float(row.get('first_mc_runup_pct')))} | "
-                f"slots_active={row.get('actual_open_positions_at_mc') if row.get('actual_open_positions_at_mc') is not None else '-'}"
+                f"slots_active={row.get('actual_open_positions_at_mc') if row.get('actual_open_positions_at_mc') is not None else '-'} | "
+                f"replay_pre_pb={row.get('mc_pre_pb_replay_status')} | "
+                f"replay_exit={row.get('mc_pre_pb_exit_reason') or '-'}"
             )
 
 
@@ -232,6 +315,13 @@ def main() -> None:
         mc_time = parse_time(first_tick.get("timestamp")) if first_tick else None
         active = active_positions_at(all_trades, mc_time) if mc_time else None
         classification = classify_route(signal, history_status, active, args.max_open_positions)
+        proxy = replay_mc_until_pb(
+            trade,
+            histories.get(token, []),
+            mc_time,
+            pb_entry,
+            safe_float(metrics.get("price_entry_candidate")) if metrics else None,
+        )
         output.append({
             "symbol": trade.get("symbol") or "",
             "token_address": token,
@@ -252,6 +342,12 @@ def main() -> None:
             "actual_open_positions_at_mc": active,
             "max_open_positions": args.max_open_positions,
             "history_status": history_status,
+            "mc_pre_pb_replay_status": proxy.get("status"),
+            "mc_pre_pb_replay_rows": proxy.get("rows"),
+            "mc_pre_pb_exit_reason": proxy.get("exit_reason", ""),
+            "mc_pre_pb_exit_time": proxy.get("exit_time", ""),
+            "mc_pre_pb_exit_pnl": proxy.get("exit_pnl"),
+            "mc_pre_pb_max_pnl": proxy.get("max_pnl"),
         })
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
