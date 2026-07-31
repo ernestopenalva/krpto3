@@ -1,12 +1,38 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
-from src.tools.closed_position_report import build_giveback_rows, display_exit_reason
+from src.tools.closed_position_report import build_giveback_rows, display_exit_reason, display_table
 
 
 class GivebackStudyTests(unittest.TestCase):
+    def test_trade_table_shows_entry_strategy_before_exit_reason(self):
+        output = StringIO()
+        row = {
+            "entry_time": "2026-07-17T10:00:00-03:00",
+            "exit_time": "2026-07-17T10:00:05-03:00",
+            "entry_price_usd": 1.0,
+            "exit_price_usd": 1.1,
+            "pnl_pct": 10.0,
+            "min_profit_pct": -1.0,
+            "max_profit_pct": 12.0,
+            "source_signal": {"entry_reason": "PULLBACK_RECOVERY"},
+            "exit_reason": "TRAILING_STOP",
+            "breakeven_activated": True,
+            "symbol": "TOKEN",
+            "token_address": "token-a",
+        }
+
+        with redirect_stdout(output):
+            display_table([row])
+
+        header, _separator, trade = output.getvalue().splitlines()
+        self.assertLess(header.index("ESTRAT"), header.index("EXIT"))
+        self.assertLess(trade.index("PULLBACK_RECOVERY"), trade.index("TRAILING_STOP"))
+
     def test_pre_breakeven_trailing_is_labeled_as_early_protection(self):
         self.assertEqual(
             display_exit_reason({"exit_reason": "TRAILING_STOP", "breakeven_activated": False}),
