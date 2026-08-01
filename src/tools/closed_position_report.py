@@ -79,8 +79,18 @@ def parse_boundary(value: Optional[str], *, end_of_day: bool = False) -> Optiona
         return None
     parsed = parse_time(value)
     if parsed is None:
-        raise SystemExit(f"data invalida: {value}")
-    if len(value) == 10 and end_of_day:
+        for format_string in ("%d/%m", "%d/%m %H:%M", "%d/%m %H:%M:%S"):
+            try:
+                short_date = datetime.strptime(value, format_string)
+            except ValueError:
+                continue
+            parsed = short_date.replace(year=datetime.now(BRASILIA).year, tzinfo=BRASILIA)
+            break
+    if parsed is None:
+        raise SystemExit(
+            f"data invalida: {value}. Use YYYY-MM-DD, ISO ou DD/MM [HH:MM[:SS]]."
+        )
+    if end_of_day and len(value) in (5, 10):
         return parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
     return parsed
 
@@ -443,8 +453,8 @@ def print_giveback_study(rows: List[Dict[str, Any]], audit_file: Path, limit: in
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lista trades fechados do Position oficial.")
     parser.add_argument("--file", type=Path, default=DEFAULT_CLOSED_TRADES_FILE)
-    parser.add_argument("--since", help="Inicio em YYYY-MM-DD ou ISO; filtro pela saida.")
-    parser.add_argument("--until", help="Fim em YYYY-MM-DD ou ISO; filtro pela saida.")
+    parser.add_argument("--since", help="Inicio em YYYY-MM-DD, ISO ou DD/MM [HH:MM[:SS]]; filtro pela saida.")
+    parser.add_argument("--until", help="Fim em YYYY-MM-DD, ISO ou DD/MM [HH:MM[:SS]]; filtro pela saida.")
     parser.add_argument("--limit", type=int, default=0, help="0 mostra todos; valor positivo mostra os mais recentes.")
     parser.add_argument("--detail", action="store_true", help="Mostra diagnostico de saidas, protecao e qualidade operacional.")
     parser.add_argument("--giveback", action="store_true", help="Analisa a devolucao de lucro dos TRAILING_STOP usando o historico auditavel.")

@@ -5,10 +5,16 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from src.tools.closed_position_report import build_giveback_rows, display_exit_reason, display_table
+from src.tools.closed_position_report import build_giveback_rows, display_exit_reason, display_table, parse_boundary
 
 
 class GivebackStudyTests(unittest.TestCase):
+    def test_parse_boundary_accepts_short_brazilian_date_with_time(self):
+        parsed = parse_boundary("25/07 17:39:27")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual((parsed.month, parsed.day, parsed.hour, parsed.minute, parsed.second), (7, 25, 17, 39, 27))
+
     def test_trade_table_shows_entry_strategy_before_exit_reason(self):
         output = StringIO()
         row = {

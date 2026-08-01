@@ -57,7 +57,7 @@ token_monitor_buy:
   min_ticks_before_decision: 12
 
   momentum_entry:
-    enabled: false
+    enabled: true
     min_ticks_before_decision: 3
     min_momentum_pct: 4.0
     max_runup_pct: 12.0
