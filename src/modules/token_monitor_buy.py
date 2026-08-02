@@ -34,6 +34,7 @@ CFG = CONFIG.get("token_monitor_buy", {})
 ENTRY_CFG = CFG.get("entry", {})
 MOMENTUM_CFG = CFG.get("momentum_entry", {})
 POSITION_CFG = CONFIG.get("position_monitor", {})
+SHADOW_CFG = CONFIG.get("observational_shadows", {})
 
 
 # =========================
@@ -309,6 +310,10 @@ def load_candidates() -> List[Dict[str, Any]]:
 
     for item, _discovered_at in new_candidates[:1]:
         selected_pair = item.get("candidate", {}).get("selected_pair", {})
+        scanner_txns_m5 = (selected_pair.get("txns") or {}).get("m5") or {}
+        scanner_buys_m5 = safe_int(scanner_txns_m5.get("buys"))
+        scanner_sells_m5 = safe_int(scanner_txns_m5.get("sells"))
+        scanner_txns_total_m5 = scanner_buys_m5 + scanner_sells_m5
 
         token_address = item.get("token_address")
         symbol = item.get("symbol")
@@ -330,6 +335,21 @@ def load_candidates() -> List[Dict[str, Any]]:
             "dex_id": selected_pair.get("dexId") or item.get("dex_id"),
             "base_mint": (selected_pair.get("baseToken") or {}).get("address") or item.get("base_mint"),
             "quote_mint": (selected_pair.get("quoteToken") or {}).get("address") or item.get("quote_mint"),
+            "scanner_snapshot": {
+                "captured_at": payload.get("generated_at"),
+                "price_usd": safe_float(selected_pair.get("priceUsd")),
+                "liquidity_usd": safe_float((selected_pair.get("liquidity") or {}).get("usd")),
+                "volume_m5": safe_float((selected_pair.get("volume") or {}).get("m5")),
+                "buys_m5": scanner_buys_m5,
+                "sells_m5": scanner_sells_m5,
+                "buy_pressure": (
+                    scanner_buys_m5 / scanner_txns_total_m5
+                    if scanner_txns_total_m5 > 0
+                    else None
+                ),
+                "price_change_m5": safe_float((selected_pair.get("priceChange") or {}).get("m5")),
+                "jupiter_validation_summary": item.get("jupiter_validation_summary") or {},
+            },
             "started_at": now_iso(),
             "status": "monitoring",
             "signal_emitted": False,
@@ -337,6 +357,66 @@ def load_candidates() -> List[Dict[str, Any]]:
         })
 
     return candidates
+
+
+def build_observational_shadows(
+    candidate: Dict[str, Any],
+    tick: Dict[str, Any],
+    evaluation: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Calcula hipoteses sem alterar a decisao oficial do Monitor."""
+    entry_reason = evaluation.get("entry_reason") or (evaluation.get("metrics") or {}).get("entry_reason")
+    is_pb = entry_reason == "PULLBACK_RECOVERY"
+    metrics = evaluation.get("metrics") or {}
+    scanner_snapshot = candidate.get("scanner_snapshot") or {}
+
+    runup_cfg = SHADOW_CFG.get("pb_runup_cap") or {}
+    shadows_enabled = bool(SHADOW_CFG.get("enabled", False))
+    runup_enabled = bool(shadows_enabled and runup_cfg.get("enabled", True))
+    runup = safe_float(
+        metrics.get("runup_start_to_entry_pct", metrics.get("runup_since_first_tick_pct"))
+    )
+    runup_threshold = safe_float(runup_cfg.get("threshold_pct")) or 15.0
+
+    pressure_cfg = SHADOW_CFG.get("pb_buy_pressure_delta") or {}
+    pressure_enabled = bool(shadows_enabled and pressure_cfg.get("enabled", True))
+    scanner_pressure = safe_float(scanner_snapshot.get("buy_pressure"))
+    entry_pressure = safe_float(tick.get("buy_pressure", metrics.get("buy_pressure")))
+    delta_pp = (
+        (entry_pressure - scanner_pressure) * 100
+        if scanner_pressure is not None and entry_pressure is not None
+        else None
+    )
+    raw_thresholds = pressure_cfg.get("candidate_thresholds_pp", [-4, -5, -6])
+    thresholds = [value for value in (safe_float(item) for item in raw_thresholds) if value is not None]
+
+    return {
+        "observational_only": True,
+        "scanner_snapshot": scanner_snapshot,
+        "pb_runup_cap_15_shadow": {
+            "enabled": runup_enabled,
+            "eligible": is_pb,
+            "runup_start_to_entry_pct": runup,
+            "threshold_pct": runup_threshold,
+            "hypothetical_block": bool(
+                runup_enabled and is_pb and runup is not None and runup > runup_threshold
+            ),
+        },
+        "pb_buy_pressure_delta_shadow": {
+            "enabled": pressure_enabled,
+            "eligible": is_pb,
+            "scanner_buy_pressure": scanner_pressure,
+            "entry_buy_pressure": entry_pressure,
+            "delta_percentage_points": delta_pp,
+            "candidate_thresholds_pp": thresholds,
+            "hypothetical_block_by_threshold": {
+                str(threshold): bool(
+                    pressure_enabled and is_pb and delta_pp is not None and delta_pp <= threshold
+                )
+                for threshold in thresholds
+            },
+        },
+    }
 
 
 # =========================
@@ -885,7 +965,8 @@ def register_buy_signal(candidate: Dict[str, Any], tick: Dict[str, Any], evaluat
         "motivo_entrada": evaluation.get("metrics", {}).get("motivo_entrada"),
         "reason": evaluation["reason"],
         "metrics": evaluation.get("metrics", {}),
-        "snapshot": tick
+        "snapshot": tick,
+        "observational_shadows": build_observational_shadows(candidate, tick, evaluation),
     }
 
     signals.append(signal)

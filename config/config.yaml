@@ -44,6 +44,23 @@ jupiter_filters:
   min_num_traders_1h: 100
   max_price_impact_pct: 5
 
+# Somente observacao: nenhuma destas regras bloqueia entrada, saida ou slot.
+observational_shadows:
+  enabled: true
+  output_file: "data/position_monitor/entry_exit_shadows.jsonl"
+  jupiter_revalidation:
+    enabled: true
+    timeout_seconds: 5
+  pb_runup_cap:
+    enabled: true
+    threshold_pct: 15
+  pb_buy_pressure_delta:
+    enabled: true
+    candidate_thresholds_pp:
+      - -4
+      - -5
+      - -6
+
 token_monitor_buy:
   input_file: "data/token_scanner/final_monitoring_candidates.json"
   output_dir: "data/token_monitor"

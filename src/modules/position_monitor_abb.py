@@ -28,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.market_data.alchemy_prices_provider import AlchemyPricesProvider
 from src.market_data.pumpswap_provider import OnChainPumpSwapProvider
 from src.market_data.types import MarketContext, MarketDataUnavailableError
+from src.modules.jupiter_revalidation_shadow import JupiterRevalidationShadow
 from src.project_env import load_project_env
 
 
@@ -164,6 +165,33 @@ class AbbPositionMonitor:
 
         self.fake_amount_usd = float(self.sizing_cfg.get("amount_usd", 10))
         self.provider = self._build_provider()
+        self.revalidation_shadow = JupiterRevalidationShadow(PROJECT_ROOT, self.config)
+
+    @staticmethod
+    def _shadow_context(
+        position: AbbPosition,
+        checkpoint: str,
+        trade: Optional[AbbClosedTrade] = None,
+    ) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "token_address": position.token_address,
+            "symbol": position.symbol,
+            "entry_type": position.source_signal.get("entry_reason"),
+            "position_entry_time": position.entry_time,
+            "position_entry_price_usd": position.entry_price_usd,
+            "entry_divergence_pct": position.entry_divergence_pct,
+            "monitor_shadows": position.source_signal.get("observational_shadows") or {},
+        }
+        if checkpoint == "EXIT" and trade is not None:
+            context.update({
+                "position_exit_time": trade.exit_time,
+                "position_exit_price_usd": trade.exit_price_usd,
+                "pnl_pct": trade.pnl_pct,
+                "max_profit_pct": trade.max_profit_pct,
+                "min_profit_pct": trade.min_profit_pct,
+                "exit_reason": trade.exit_reason,
+            })
+        return context
 
     @staticmethod
     def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -479,6 +507,7 @@ class AbbPositionMonitor:
             last_tick=tick,
         )
         self._replace_open_position(token_address, position)
+        self.revalidation_shadow.schedule_entry(self._shadow_context(position, "ENTRY"))
         entry_down_band_pct = self._clip_down_band_pct(
             (self.cfg.initial_breathing_pct * self.cfg.breathing_band_fraction)
             if self.cfg.initial_breathing_pct is not None
@@ -880,6 +909,7 @@ class AbbPositionMonitor:
                 timestamp=now,
             )
             self._replace_open_position(token_address, None)
+            self.revalidation_shadow.record("EXIT", self._shadow_context(position, "EXIT", trade))
             return False
 
         self._replace_open_position(token_address, position)
