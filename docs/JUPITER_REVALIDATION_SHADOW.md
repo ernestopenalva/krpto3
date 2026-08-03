@@ -97,6 +97,10 @@ movimentacao normal da autoridade.
   antes da consulta observacional.
 - Falha, timeout ou indisponibilidade Jupiter sao gravados para auditoria e nao
   alteram entrada, saida, slots, stop, trailing ou PnL.
+- Correcao em 2026-08-03: removido o arquivo `.lock`, que podia ficar orfao se
+  o processo encerrasse uma thread de entrada. O JSONL agora usa append atomico
+  do sistema operacional, e o fechamento aguarda de forma limitada a coleta
+  `ENTRY` antes de registrar `EXIT`.
 - O inicio efetivo da coleta na VPS deve ser registrado separadamente somente
   depois do deploy e reinicio do runtime.
 

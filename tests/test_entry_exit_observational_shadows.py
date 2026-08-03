@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -116,6 +117,28 @@ class JupiterRevalidationShadowTests(unittest.TestCase):
             self.assertEqual(row["jupiter"]["status"], "unavailable")
             self.assertFalse(row["jupiter"]["buy_quote"]["ok"])
             self.assertIn("offline", row["jupiter"]["buy_quote"]["error"])
+
+    def test_atomic_append_does_not_depend_on_persistent_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shadow = JupiterRevalidationShadow(root, self.config("shadow.jsonl"))
+            orphan = root / "shadow.jsonl.lock"
+            orphan.touch()
+            threads = [
+                threading.Thread(target=shadow._append_jsonl, args=({"index": index},))
+                for index in range(20)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            rows = [
+                json.loads(line)
+                for line in (root / "shadow.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 20)
+            self.assertEqual({row["index"] for row in rows}, set(range(20)))
 
 
 if __name__ == "__main__":

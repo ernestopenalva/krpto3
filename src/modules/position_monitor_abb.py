@@ -909,7 +909,7 @@ class AbbPositionMonitor:
                 timestamp=now,
             )
             self._replace_open_position(token_address, None)
-            self.revalidation_shadow.record("EXIT", self._shadow_context(position, "EXIT", trade))
+            self.revalidation_shadow.record_exit(self._shadow_context(position, "EXIT", trade))
             return False
 
         self._replace_open_position(token_address, position)

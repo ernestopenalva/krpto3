@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +28,7 @@ class JupiterRevalidationShadow:
         output = Path(shadow_cfg.get("output_file", "data/position_monitor/entry_exit_shadows.jsonl"))
         self.output_file = output if output.is_absolute() else project_root / output
         self.timeout_seconds = max(1.0, float(jupiter_shadow.get("timeout_seconds", 5)))
+        self._entry_thread: Optional[threading.Thread] = None
 
     @staticmethod
     def _now_brasilia() -> str:
@@ -37,12 +37,22 @@ class JupiterRevalidationShadow:
     def schedule_entry(self, context: Dict[str, Any]) -> None:
         if not self.enabled:
             return
-        threading.Thread(
+        self._entry_thread = threading.Thread(
             target=self.record,
             args=("ENTRY", context),
             name=f"jupiter-shadow-{str(context.get('token_address', ''))[:8]}",
             daemon=True,
-        ).start()
+        )
+        self._entry_thread.start()
+
+    def record_exit(self, context: Dict[str, Any]) -> None:
+        """Fecha a coleta ENTRY antes de gravar EXIT, sem afetar o fechamento oficial."""
+        if not self.enabled:
+            return
+        entry_thread = self._entry_thread
+        if entry_thread is not None and entry_thread.is_alive():
+            entry_thread.join(timeout=self.timeout_seconds + 2)
+        self.record("EXIT", context)
 
     def record(self, checkpoint: str, context: Dict[str, Any]) -> None:
         if not self.enabled:
@@ -55,10 +65,10 @@ class JupiterRevalidationShadow:
                 **context,
                 "jupiter": self._capture_jupiter(str(context.get("token_address") or "")),
             }
-            self._append_jsonl_locked(payload)
+            self._append_jsonl(payload)
         except Exception as exc:  # fail-open por contrato
             try:
-                self._append_jsonl_locked({
+                self._append_jsonl({
                     "observed_at": self._now_brasilia(),
                     "checkpoint": checkpoint,
                     "observational_only": True,
@@ -162,24 +172,18 @@ class JupiterRevalidationShadow:
                 "token_info": token_info,
             }
 
-    def _append_jsonl_locked(self, payload: Dict[str, Any]) -> None:
+    def _append_jsonl(self, payload: Dict[str, Any]) -> None:
+        """Faz um unico append atomico; descritores do SO nao deixam lock orfao."""
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = self.output_file.with_suffix(self.output_file.suffix + ".lock")
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"shadow lock ocupado: {lock_path}")
-                time.sleep(0.05)
+        encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(
+            str(self.output_file),
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+            0o644,
+        )
         try:
-            os.close(fd)
-            with self.output_file.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            written = os.write(fd, encoded)
+            if written != len(encoded):
+                raise OSError(f"append JSONL parcial: {written}/{len(encoded)} bytes")
         finally:
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
+            os.close(fd)
