@@ -28,7 +28,17 @@ class SolanaRpcClient:
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as exc:
-            raise MarketDataUnavailableError(str(exc)) from exc
+            # requests includes the complete request URL in many exception
+            # messages. RPC URLs commonly embed the API key in their path, so
+            # never propagate the original exception text to logs or records.
+            response = exc.response
+            if response is not None:
+                detail = f"HTTP {response.status_code}"
+            else:
+                detail = type(exc).__name__
+            raise MarketDataUnavailableError(
+                f"Solana RPC {detail} calling {method}"
+            ) from None
         except ValueError as exc:
             raise MarketDataUnavailableError(f"invalid rpc json response: {exc}") from exc
 
